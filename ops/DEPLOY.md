@@ -1,0 +1,176 @@
+# Deploying it, in order
+
+Do these in this order. Steps 1 and 2 are where a first deploy actually goes wrong, and
+neither of them is something the service can tell you about in advance.
+
+---
+
+## 1. The Azure app registration
+
+**`ops/AZURE.md`, all of it.** The part people skip is the admin-consent button: application
+permissions on Microsoft Graph always need a tenant administrator to approve them, and until
+the API permissions page shows a green *"Granted for \<tenant\>"* every single call comes back
+403 and the service stops saying the credentials were refused.
+
+You come out of it with: `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET`,
+`GRAPH_USER_ID`, and the three folder ids.
+
+---
+
+## 2. The three folders
+
+In the OneDrive that holds the recordings, three **separate, non-nested** folders:
+
+```
+/CALLS                  the phone drops recordings here          SOURCE_FOLDER_ID
+/CALLS-TRANSCRIPTS      the .md files are written here           OUTPUT_FOLDER_ID
+/CALLS-ARCHIVE          originals older than 60 days move here   ARCHIVE_FOLDER_ID
+```
+
+Optionally a fourth, `/CALLS-ORPHANS`, for `ORPHAN_FOLDER_ID` — where a half-written set of
+outputs is moved aside if an upload fails part-way through.
+
+They must not be the same folder as each other and the output and archive folders must not
+sit **inside** the recordings folder — the change feed walks the whole subtree, and the
+service would then be watching its own output. It refuses to start if any two ids match, but
+it cannot see nesting, so that one is on you.
+
+---
+
+## 3. Fill in the environment
+
+Copy `.env.example` to `.env` and work through it. Every variable is explained in
+`README.md`. Three that are easy to get wrong:
+
+- **`LEDGER_PATH`** has no default on purpose — two ledgers is the same as none. Put it
+  somewhere backed up.
+- **`WORK_DIR`** must not be in a shared `/tmp`. It holds the raw audio of confidential
+  conversations while a recording is in flight, and the transcript of any recording that
+  failed. The service creates it `0700`, but a world-writable parent is still the wrong
+  neighbourhood. Use `/var/cache/transcriber`.
+- **`GRAPH_SECRET_EXPIRES_ON`** is optional and you want it. It is the difference between a
+  countdown in the morning email and the service stopping dead in two years' time with no
+  warning at all.
+
+Three variables were added after `.env.example` was first written and may not be in your
+copy — all optional, all defaulting to empty:
+
+```
+ORPHAN_FOLDER_ID=                 # where a half-written output set is moved aside
+GRAPH_SECRET_EXPIRES_ON=          # YYYY-MM-DD, the date on GRAPH_CLIENT_SECRET
+ENGINE_KEY_EXPIRES_ON=            # YYYY-MM-DD, if the transcription key expires
+ANALYSIS_KEY_EXPIRES_ON=          # YYYY-MM-DD, if the analysis key expires
+```
+
+The file holds every credential the service has. `chmod 640`, owned by root, group-readable
+by the service account. Never commit it.
+
+---
+
+## 4. Prove it offline, before it touches anything
+
+```
+make check       # every module compiles, then the whole test suite
+make selftest    # the service proving its own parsing, state machine, quote checking and
+                 # markdown format — with no credential and no network
+```
+
+Both must pass. Neither needs the internet, and neither can be affected by a wrong
+credential — which is exactly why they are worth running first: if they fail, the problem is
+the build, not the configuration.
+
+---
+
+## 5. One real pass, watched
+
+```
+transcriber status     # should print an empty ledger and no cursors set
+transcriber once       # one poll, one pass
+transcriber status     # should now show the recordings it found
+```
+
+If `once` finds nothing, look at what it printed. `polled 1 page(s), 14 item(s), 0 new,
+14 skipped as our own output` means the output folder is pointed at the recordings folder,
+or is nested inside it.
+
+Then check the output folder in OneDrive: three files per recording, one of them without a
+leading underscore.
+
+---
+
+## 6. Start it properly
+
+**Systemd**, on a machine:
+
+```
+sudo cp ops/transcriber.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now transcriber
+journalctl -u transcriber -f
+```
+
+The unit file's header has the full set-up commands — the service account, the directories,
+and the permissions on the environment file.
+
+**Docker**, if you would rather:
+
+```
+docker build -f ops/Dockerfile -t transcriber .
+docker run -d --name transcriber --restart unless-stopped \
+  --env-file .env \
+  -v transcriber-ledger:/var/lib/transcriber \
+  -v transcriber-work:/var/cache/transcriber \
+  transcriber
+```
+
+The ledger volume is not optional. It is the only proof a recording ever existed.
+
+---
+
+## 7. The parts outside this service
+
+- **The external monitor** (`HEARTBEAT_URL`). Create the check with a period of one day and
+  a grace of a few hours. It is told the morning was fine only when the email went out
+  **and** the news in it was good. Point its alert somewhere that reaches a phone.
+- **The Power Automate flow** that carries the `.md` files from OneDrive into the record.
+  It is described in `kbc-site-memory/transcripts/README.md`. It triggers on a file being
+  created in `OUTPUT_FOLDER_ID` and PUTs it to the repository. It holds a fine-grained GitHub
+  token scoped to that one repository, *Contents: read and write*, and **that token expires
+  too** — when it does, the record stops receiving transcripts while this service keeps
+  reporting perfect mornings, because from here everything genuinely did work.
+- **An existing pile of recordings.** `transcriber backfill` walks history newest-first in
+  its own lane, yielding whenever the live path has work waiting. Start it after the live
+  path has been running cleanly for a day.
+
+---
+
+## 8. The first morning
+
+The email arrives at 06:00 local. Read the subject line. If it says
+`Recordings: all N done`, you are finished.
+
+If it does not arrive at all, the service is not running — that is what the email's daily
+arrival is for, and it is the one failure the service cannot report on its own behalf.
+
+---
+
+## When you change something
+
+```
+make check && make selftest
+```
+
+Then restart. A restart is safe at any moment: stopping hands back every claim the worker
+holds, so the queue is left exactly as it was found rather than with recordings stranded
+behind a lease. Nothing is ever processed twice and nothing is lost across a restart — the
+ledger records every step *before* the work that follows it.
+
+## Backing up
+
+One file: whatever `LEDGER_PATH` points at. It is SQLite in WAL mode, so copy
+`ledger.sqlite`, `ledger.sqlite-wal` and `ledger.sqlite-shm` together, or use
+`sqlite3 ledger.sqlite ".backup /somewhere/ledger-backup.sqlite"` which is safe while the
+service is running.
+
+The recordings and the transcripts are in OneDrive and in the record's git history. The
+ledger is the only thing that lives solely here.

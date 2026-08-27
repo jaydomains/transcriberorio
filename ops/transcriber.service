@@ -1,0 +1,105 @@
+# transcriber — systemd unit for running the service directly on a machine.
+#
+#   sudo useradd --system --home-dir /var/lib/transcriber --shell /usr/sbin/nologin transcriber
+#   sudo mkdir -p /opt/transcriber /var/lib/transcriber /var/cache/transcriber /etc/transcriber
+#   sudo cp -r src ARCHITECTURE.md README.md /opt/transcriber/
+#   sudo cp .env /etc/transcriber/transcriber.env
+#   sudo chown -R transcriber:transcriber /var/lib/transcriber /var/cache/transcriber
+#   sudo chmod 700 /var/lib/transcriber /var/cache/transcriber
+#   sudo chown root:transcriber /etc/transcriber/transcriber.env
+#   sudo chmod 640 /etc/transcriber/transcriber.env      # it holds every credential
+#   sudo cp ops/transcriber.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now transcriber
+#
+# Then, and this is the step worth not skipping:
+#   sudo -u transcriber PYTHONPATH=/opt/transcriber/src python3 -m transcriber selftest
+#   sudo systemctl status transcriber
+#   journalctl -u transcriber -f
+
+[Unit]
+Description=transcriber — voice notes from OneDrive into the site-memory record
+Documentation=file:/opt/transcriber/README.md
+# Wants=, not Requires=: a DNS blip at boot must not stop the service starting. It polls
+# every two minutes and its own retries are what handle a network that is not up yet.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=transcriber
+Group=transcriber
+
+WorkingDirectory=/opt/transcriber
+Environment=PYTHONPATH=/opt/transcriber/src
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/transcriber/transcriber.env
+
+ExecStart=/usr/bin/python3 -m transcriber run
+
+# SIGTERM stops new work being taken up, waits for whatever is mid-flight, and hands back
+# every claim this worker holds — so a restart leaves the queue exactly as it found it
+# instead of stranding recordings behind a lease that has to expire. 120s is longer than any
+# single step but shorter than a hung engine call, after which SIGKILL is correct: the leases
+# expire on their own, which is what they are for.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+# Restart on any exit, including a clean one. The service exits non-zero on a *service*
+# fault — a rejected credential, an unusable configuration — and coming straight back up is
+# right: it will fail identically, say so identically in the log, and the moment the
+# credential is fixed it carries on. RestartSec spaces that out so a permanently broken
+# credential is a line a minute rather than a busy loop.
+Restart=always
+RestartSec=30s
+# But do not restart forever in a tight loop if something is badly wrong: five failures
+# inside ten minutes stops the unit, which shows up as `failed` in `systemctl status` and is
+# a state a person can actually see.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# --- what it may touch ---------------------------------------------------------------
+# The ledger is the only proof a recording ever existed; the scratch directory holds the raw
+# audio of confidential conversations while a recording is in flight. Both are the service's
+# own and nothing else's.
+StateDirectory=transcriber
+StateDirectoryMode=0700
+CacheDirectory=transcriber
+CacheDirectoryMode=0700
+ReadWritePaths=/var/lib/transcriber /var/cache/transcriber
+
+# --- hardening -----------------------------------------------------------------------
+# It reads files from OneDrive over HTTPS and writes two directories. It has no business
+# doing anything else, and a service that runs unattended for years is exactly the one to
+# fence in.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# 0077 so anything it creates is readable only by itself, whatever the ambient umask is.
+UMask=0077
+
+# --- logging -------------------------------------------------------------------------
+# stdout to the journal. There is deliberately no file handler and no rotation in the
+# service itself: whatever runs it decides where the log goes.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=transcriber
+
+[Install]
+WantedBy=multi-user.target

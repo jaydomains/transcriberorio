@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "transcriber"
+version = "1.0.0"
+description = "Voice notes from OneDrive into the site-memory record. Decides nothing."
+readme = "ARCHITECTURE.md"
+requires-python = ">=3.11"
+
+# No runtime dependencies, and this empty list is the point rather than an oversight.
+# A service that must run unattended for years should have nothing underneath it that can
+# rot: every import in src/transcriber is from the standard library, and adding one that
+# is not would be a decision to review, not a convenience.
+dependencies = []
+
+[project.scripts]
+transcriber = "transcriber.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["transcriber*"]
+
+# `python3 -m unittest discover -s tests` runs offline, with no credential. Nothing here
+# installs a test runner: unittest is in the standard library too.
