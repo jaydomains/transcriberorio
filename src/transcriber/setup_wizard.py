@@ -336,6 +336,15 @@ def routes_to_values(values: dict[str, str], routes: Sequence[Route]) -> dict[st
     completely, and a file that still lists them is a file that invites somebody to edit
     the setting that does nothing.
     """
+    # Who reviews each route's held passages is a route setting, but it is not one the
+    # folder pickers ask for — it is set with `transcriber config` or by hand. Clearing
+    # every ROUTE_ variable would delete it on the next wizard run, and a reviewer that
+    # quietly reverts to the service owner is exactly the kind of silent change this
+    # service exists to stop, so it is carried across for the routes that survive.
+    reviewers = {
+        key: value for key, value in values.items()
+        if key.startswith("ROUTE_") and key.endswith("_REVIEWER") and str(value or "").strip()
+    }
     for key in [k for k in values if k.startswith("ROUTE_")]:
         del values[key]
     for key in ("SOURCE_FOLDER_ID", "OUTPUT_FOLDER_ID", "ARCHIVE_FOLDER_ID"):
@@ -349,6 +358,9 @@ def routes_to_values(values: dict[str, str], routes: Sequence[Route]) -> dict[st
         values[route_env_var(route.name, "ARCHIVE")] = route.archive_folder_id
         values[route_env_var(route.name, "ENGINE")] = route.engine
         values[route_env_var(route.name, "ENABLED")] = "true" if route.enabled else "false"
+        kept = reviewers.get(route_env_var(route.name, "REVIEWER"))
+        if kept:
+            values[route_env_var(route.name, "REVIEWER")] = kept
     return values
 
 
@@ -1123,7 +1135,61 @@ def _add_route(ctx: _Ctx, routes: Sequence[Route], folders: _Folders) -> Route:
         f"{label}: which service should transcribe them?",
         _engine_options(ctx), current=route.engine,
     ))
+    _ask_route_reviewer(ctx, route)
     return _settle_route(ctx, routes, route, folders)
+
+
+def _ask_route_reviewer(ctx: _Ctx, route: Route) -> None:
+    """Who approves the passages held back from this folder.
+
+    Asked here rather than left to a hand-edit, because the answer to "nobody said" is not
+    "nobody sees it" — it is "the service owner sees all of it", and that is the one routing
+    the design says must not happen by default. A staff member reviews their own held
+    passages; only a staff disciplinary matter is the principal's. Staff record voluntarily,
+    and one who works out that the boss reads the held text from their calls stops keeping a
+    folder — which loses the recordings entirely.
+
+    Written straight into the values rather than onto :class:`Route`, because it is an
+    address: the ledger carries a route on every row and no address may ever go there.
+    """
+    variable = route_env_var(route.name, "REVIEWER")
+    current = str(ctx.values.get(variable, "") or "").strip()
+
+    def check(raw: str) -> str:
+        text = raw.strip()
+        if not text:
+            return ""
+        if text.count("@") != 1 or " " in text:
+            return "That does not look like an email address."
+        _local, _at, domain = text.partition("@")
+        if "." not in domain or domain.startswith(".") or domain.endswith("."):
+            return "That does not look like an email address."
+        return ""
+
+    answer = ctx.ask_free(
+        f"{route.label}: who approves anything held back from these recordings?",
+        default=current,
+        required=False,
+        help_text=(
+            "The email address of whoever records into this folder — usually themselves. "
+            "They see their own held passages; you see only how many are waiting and which "
+            "site, except for staff disciplinary matters, which come to you. Leave it empty "
+            "and everything held here comes to the service owner instead, including "
+            "somebody's health and family circumstances — and the service will refuse to "
+            "start once holding is switched on."
+        ),
+        validate=check,
+    ).strip()
+    if answer:
+        ctx.values[variable] = answer
+        ctx.remember_secret(answer)
+    else:
+        ctx.values.pop(variable, None)
+        ctx.notes.append(
+            f"No one is named to approve the passages held back from {_phrase(route)}. "
+            f"Nothing is being held yet, so nothing is going anywhere — but set "
+            f"{variable} before switching holding on."
+        )
 
 
 def _edit_route(ctx: _Ctx, routes: list[Route], folders: _Folders) -> list[Route]:
@@ -1145,6 +1211,7 @@ def _edit_route(ctx: _Ctx, routes: list[Route], folders: _Folders) -> list[Route
                 ("label", "what it is called"),
                 ("folders", "its folders"),
                 ("engine", "which service transcribes it"),
+                ("reviewer", "who approves anything held back from it"),
                 ("enabled", "switch it back on" if not route.enabled
                             else "pause it — stop watching, keep everything"),
             ],
@@ -1158,6 +1225,8 @@ def _edit_route(ctx: _Ctx, routes: list[Route], folders: _Folders) -> list[Route
                 help_text="Only the name people read. Nothing else changes."))
         elif what == "folders":
             route = _ask_route_folders(ctx, folders, route)
+        elif what == "reviewer":
+            _ask_route_reviewer(ctx, route)
         elif what == "engine":
             route = replace(route, engine=ctx.choose(
                 f"{route.display}: which service should transcribe them?",

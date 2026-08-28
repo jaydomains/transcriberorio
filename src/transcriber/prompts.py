@@ -21,6 +21,7 @@ Everything in this module is data: strings, dicts and pure formatting helpers. N
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Sequence
 
 __all__ = [
@@ -34,6 +35,11 @@ __all__ = [
     "EXTRACTION_SCHEMA",
     "EXTRACTION_SCHEMA_NAME",
     "EXTRACTION_CATEGORIES",
+    "SENSITIVITY_CATEGORIES",
+    "SENSITIVITY_NOTE",
+    "SENSITIVE_PASSAGE_SCHEMA",
+    "extraction_schema",
+    "extraction_system",
     "build_classifier_user",
     "build_extraction_user",
     "context_block",
@@ -415,6 +421,240 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
     ],
     "additionalProperties": False,
 }
+
+
+# ------------------------------------------------------------------- the sensitivity gate
+
+#: The taxonomy, exactly as he settled it on 2026-08-28 (``docs/GATE-DECISIONS.md`` §5).
+#: The first six are the held band — the same six names, spelled the same way, as
+#: :data:`transcriber.withheld.CATEGORIES`, which is what the store validates against and
+#: what the marker's wording is keyed on — and the last two are let through with a label. **What
+#: each one means for the record is decided in code**, not here — :mod:`transcriber.sensitivity`
+#: owns the category-to-disposition table, so a model cannot widen the held band by
+#: inventing a disposition. This tuple is only the vocabulary the model is allowed to use.
+SENSITIVITY_CATEGORIES: tuple[str, ...] = (
+    # held
+    "do_not_write_down",
+    "staff_matter",
+    "personal_circumstances",
+    "legal_exposure",
+    "bare_identifier",
+    "own_margin",
+    # let through, labelled
+    "commercial_figure",
+    "conduct_or_quality",
+)
+
+#: The wording of the gate, and the most carefully tuned text in this module. Two failures
+#: are possible and they are not symmetrical: a passage wrongly held costs an approval he
+#: has to clear on a phone on a roof, and ten of those a day is a gate he stops opening —
+#: which loses the record. A passage wrongly let through costs a leak. He has decided which
+#: risk he is taking on which content, and this block states that decision rather than
+#: inviting the model to re-derive it.
+SENSITIVITY_NOTE = (
+    "SENSITIVE PASSAGES — a separate job, done on the same reading.\n\n"
+    "Alongside everything above, list the passages of this transcript that would harm "
+    "somebody if they were repeated. Put them in sensitive_passages.\n\n"
+    "The question is 'WHO IS HARMED IF THIS IS REPEATED?' — never 'does this mention "
+    "money'. Most recordings harm nobody. **An empty list is the right answer most of the "
+    "time and is a good answer.** These are voice notes about roofs, deliveries and dates.\n\n"
+    "This is a South African building consultancy. The firm is KBC. Its people record while "
+    "they walk sites, with clients, contractors and staff on the line.\n\n"
+    "HELD — the words are cut out of the record until a person approves them. Six things, "
+    "and only these six:\n"
+    "- do_not_write_down: somebody asks that something not be written down, not be minuted, "
+    "not go in the report, or says it is off the record or just between us. **In any "
+    "language.** This outranks every other judgement here: if you hear it, return it, "
+    "whatever the passage is about. Quote the instruction and the words it is about.\n"
+    "- staff_matter: a KBC employee's warning, hearing, pay, performance, dismissal, or a "
+    "complaint about one of their own people as an employee.\n"
+    "- personal_circumstances: an identifiable person's health, illness, bereavement, "
+    "family or money troubles — anything about their life rather than their work.\n"
+    "- legal_exposure: an admission that KBC itself is liable or at fault, what its "
+    "attorney or insurer is planning, or a statement that something must not leave the "
+    "firm.\n"
+    "- bare_identifier: an identity number, bank or card details, or a home address. Quote "
+    "the identifier itself and nothing around it.\n"
+    "- own_margin: KBC's OWN cost set against its OWN charge, in one breath — what it "
+    "raised or charged next to what it will actually spend or land at. This is the one "
+    "money case that is held.\n\n"
+    "LET THROUGH, LABELLED — these are published; the label rides with them so that a "
+    "later client-facing check can see what they are. Two:\n"
+    "- commercial_figure: a price quoted to or by a client, a supplier's rate, an invoice, "
+    "a fee, a contract sum, a payment certificate, retention.\n"
+    "- conduct_or_quality: a defect, poor workmanship, a complaint about a company, work "
+    "being criticised.\n\n"
+    "NOT SENSITIVE AT ALL — return NOTHING for these. Materials, deliveries, programme "
+    "dates, building defects with nobody blamed, and a named person straightforwardly doing "
+    "their job. **PRICES FLOW.** A rand figure on its own is ordinary business and is not a "
+    "reason to return anything: about one line in sixteen of this record carries one. Only "
+    "return a commercial_figure when the figure is genuinely the point of the passage, and "
+    "never return one merely because a number was said.\n\n"
+    "How to judge, and it matters more than the categories:\n"
+    "- Precision over completeness, deliberately. Return a passage only if you would defend "
+    "holding it to the man who has to approve it on his phone on a roof. If you are "
+    "reaching for a reason, there is no reason.\n"
+    "- One entry per passage. If two categories fit, return the single entry whose category "
+    "is the more serious one.\n"
+    "- Quote the SMALLEST span that carries the sensitive fact. The words you quote are the "
+    "words that get cut out.\n"
+    "- The quote is located mechanically, character for character. A passage whose words "
+    "cannot be found in the transcript is NOT withheld — so an inexact copy is a leak, not "
+    "a rejected item.\n"
+    "- confidence: how sure you are that this genuinely harms somebody. Below 0.75 the "
+    "passage is not withheld, so do not use a low confidence as a way of raising a "
+    "possibility — either it is one of these six things or it is not.\n"
+    "- what_it_is is PUBLISHED IN PLACE OF THE WORDS, on a page a client may read. It names "
+    "the KIND of thing and carries none of the detail: 'a rate', 'a staff matter', 'a "
+    "person's health', 'our own cost against what we charged'. No names, no figures, no "
+    "dates, no company names.\n"
+    "- reason is one line of plain English for the person approving it. Say why without "
+    "repeating the sensitive words.\n\n"
+    "KEEP THE REST OF YOUR ANSWER CLEAR OF WHAT YOU FLAG. This is not a detail; it is half "
+    "the job, and only you can do it.\n"
+    "- Anything you return under a HELD category is cut out of the transcript before "
+    "anything is written. Your summary_en, and the prose of every item you return in any "
+    "other field, must not restate it — not in the same words, and not in different ones. "
+    "Write 'a passage was held for review' and move on.\n"
+    "- Saying the same thing in your own words is the case that matters. The cut is made by "
+    "searching for the words you quoted, so 'Marius has his disciplinary hearing on Friday' "
+    "gets removed and 'there is a hearing for Marius on Friday and he will probably lose "
+    "his job' does not. It is the same fact about the same person, and it is written into a "
+    "file. You are the only thing that can prevent that, because you are the only one here "
+    "who knows the two sentences mean the same thing.\n"
+    "- This applies to the held six only. A commercial_figure or a conduct_or_quality "
+    "passage is published with its label, so summarise it normally — prices flow.\n"
+    "- Everything not held is summarised exactly as you would have anyway. A recording with "
+    "one held passage still gets a full and useful summary of the rest of it; leaving out "
+    "the delivery dates because a staff matter was mentioned is its own kind of loss.\n\n"
+    "Worked examples, from these sites:\n"
+    "1. 'The quote to the body corporate is R4,500 for the torch-on repair.' -> "
+    "commercial_figure. A price to a client. Published with a label. what_it_is: 'a price "
+    "quoted to a client'.\n"
+    "2. 'We raised R1.65m and we'll land at R1.604m, so there's a bit in it.' -> own_margin. "
+    "HELD: that is what KBC charged next to what it will spend, in one breath. what_it_is: "
+    "'our own cost against what we charged'.\n"
+    "3. 'Sipho's disciplinary is on Thursday, it's the second warning.' -> staff_matter.\n"
+    "4. 'Mrs Naidoo isn't answering because her husband is in hospital.' -> "
+    "personal_circumstances.\n"
+    "5. 'Don't write this down, but the engineer signed off a slab he never inspected.' -> "
+    "do_not_write_down. Quote the instruction together with what it is about.\n"
+    "6. 'Ja, maar moenie dit neerskryf nie.' -> do_not_write_down. Afrikaans, same rule.\n"
+    "7. 'Ungakubhali oku, uThabo akaphangeli namhlanje kuba unyana wakhe ugula.' -> "
+    "do_not_write_down. isiXhosa: he is asking that it not be written.\n"
+    "8. 'Die prys vir die dak is R12,000, maar moenie vir hulle sê wat ons betaal het nie.' "
+    "-> commercial_figure ONLY. 'Don't tell them what we paid' is an instruction about what "
+    "to say to a client, not a request that something not be written down, and one figure "
+    "is not a margin. Do not return do_not_write_down here.\n"
+    "9. 'His ID is 8203155009089 for the site register.' -> bare_identifier. Quote only the "
+    "number.\n"
+    "10. 'Between you and me, the insurer says we mustn't admit the beam was "
+    "under-designed.' -> legal_exposure.\n"
+    "11. 'The waterproofing at unit 12 is lifting again, their workmanship is poor.' -> "
+    "conduct_or_quality. Published with a label.\n"
+    "12. 'The chromadek arrives Tuesday and the scaffold comes down Friday.' -> nothing.\n"
+    "13. 'Thabo finished the flashing on block C.' -> nothing. A named person doing their "
+    "job is not sensitive.\n"
+    "14. 'The supplier rate is R92 a square and the contract sum is R840,000.' -> one "
+    "commercial_figure. Ordinary business, published with a label."
+)
+
+#: One entry in ``sensitive_passages``. Note what is NOT here: the model does not say
+#: whether a passage is held or labelled. That follows from the category, in code, so the
+#: held band cannot be widened by a model having a strong day.
+SENSITIVE_PASSAGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "One passage that would harm somebody if it were repeated.",
+    "properties": {
+        "quote": {
+            "type": "string",
+            "description": (
+                "Verbatim from the transcript, character for character, in the language it "
+                "was spoken. The smallest span that carries the sensitive fact — for an "
+                "identity number, the number itself. These are the words that get cut out, "
+                "and they are located mechanically: a quote that cannot be found is not "
+                "withheld at all."
+            ),
+        },
+        "category": {
+            "type": "string",
+            "enum": list(SENSITIVITY_CATEGORIES),
+            "description": "Which of the eight kinds this is.",
+        },
+        "who_is_harmed": {
+            "type": "string",
+            "description": (
+                "Who is harmed if this is repeated, in a few words: 'the staff member', "
+                "'the client', 'KBC itself'. If the honest answer is nobody, do not return "
+                "the passage at all."
+            ),
+        },
+        "what_it_is": {
+            "type": "string",
+            "description": (
+                "A short plain-English noun phrase naming the KIND of thing, carrying none "
+                "of the detail — it is published in place of the words on a page a client "
+                "may read. 'a rate', 'a staff matter', 'a person's health'. No names, no "
+                "figures, no dates."
+            ),
+        },
+        "reason": {
+            "type": "string",
+            "description": (
+                "One line of plain English for the person approving it, saying why without "
+                "repeating the sensitive words."
+            ),
+        },
+        "confidence": {
+            "type": "number",
+            "description": "0.0 to 1.0 — how sure you are that repeating this harms somebody.",
+        },
+    },
+    "required": ["quote", "category", "who_is_harmed", "what_it_is", "reason", "confidence"],
+    "additionalProperties": False,
+}
+
+_SENSITIVE_PASSAGES_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "description": (
+        "Passages that would harm somebody if repeated. Empty is the usual and correct "
+        "answer."
+    ),
+    "items": SENSITIVE_PASSAGE_SCHEMA,
+}
+
+
+def extraction_schema(*, sensitivity: bool = False) -> dict[str, Any]:
+    """The extraction schema, with the gate's field added when the gate is running.
+
+    The field is added to ``required`` as well as to ``properties``, because the
+    OpenAI-compatible path sends ``strict: true`` — which demands that every property be
+    required — and because :meth:`transcriber.extract.Extractor._read` checks the required
+    list to catch a provider that has quietly stopped honouring the constraint.
+
+    It is a parameter rather than a permanent part of the schema for one reason: with
+    ``GATE_MODE=off`` the gate is not merely inactive, it is **not in the way**. No extra
+    field is asked for, no extra words are sent, and nothing about the analysis pass differs
+    from the day before the gate existed. A gate that can break the transcription of a
+    recording while switched off is not off.
+    """
+    schema = copy.deepcopy(EXTRACTION_SCHEMA)
+    if sensitivity:
+        schema["properties"]["sensitive_passages"] = copy.deepcopy(_SENSITIVE_PASSAGES_PROPERTY)
+        schema["required"] = list(schema["required"]) + ["sensitive_passages"]
+    return schema
+
+
+def extraction_system(*, sensitivity: bool = False) -> str:
+    """The extraction system prompt, with the gate's instructions when the gate is running.
+
+    One call, not two. A second model call per recording would double the cost and add a
+    second thing that can fail between a recording and its transcript, for an answer the
+    model reading the transcript is already holding in its head.
+    """
+    if not sensitivity:
+        return EXTRACTION_SYSTEM
+    return EXTRACTION_SYSTEM + "\n\n" + SENSITIVITY_NOTE
 
 
 # --------------------------------------------------------------------------- rendering

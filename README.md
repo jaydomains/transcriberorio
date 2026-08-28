@@ -227,6 +227,158 @@ is watched, what is written, or what is in the ledger changes.
 
 ---
 
+## Holding back the things that should not be written down yet
+
+Some of what gets said on a call should not go into the record until you have said it may.
+This part of the service reads every recording, decides whether anything in it is one of
+those things, and — once you switch it on — cuts those words out of the transcript and puts
+them in a queue for a person to approve.
+
+**Right now it holds nothing.** It ships switched to *watching*, which reads every recording
+and writes down what it *would* have held, and then holds nothing at all. Read
+**Watching first** below before you change that. That order is not caution for its own sake;
+it is the difference between a queue you can clear and a wall you bounce off.
+
+### What is held
+
+A short list, on purpose. These are the things that hurt somebody if they are repeated:
+
+- a staff matter — a warning, a hearing, pay, performance, a dismissal;
+- an identifiable person's health or personal circumstances;
+- legal exposure — an admission that we are at fault, what our attorney or insurer is
+  planning, "this must not leave the firm";
+- a bare identifier — an identity number, bank details, a home address;
+- **anybody asking that something not be written down**, in any language. If somebody says
+  it, that settles it, whatever the subject;
+- **our own cost set against our own charge, in one breath** — "we raised R1.65m and we'll
+  land at R1.604m".
+
+### What flows through, with a label on it
+
+**Prices flow.** A price quoted to or by a client, a supplier's rate, an invoice, a fee, a
+contract sum, a defect, poor workmanship, a named person doing their job, a complaint about
+a company — all of it goes into the record as it always did, with a note of what kind of
+thing it is attached.
+
+That was decided against the first instinct, on a measurement: 6.3% of the content lines in
+your record carry a rand figure. Holding prices would be ten to fifteen approvals a day, and
+a gate you stop opening does not fail safely — it quietly swallows the record. The leak you
+are worried about is a price being repeated to a client, and that is a problem to solve on
+the way *out*, not by keeping it out of your own notes.
+
+### What is not sensitive at all
+
+Materials, deliveries, programme dates, defects in a building, somebody straightforwardly
+doing their job. **This is the answer most of the time and it is supposed to be.** Treating
+ordinary site talk as sensitive buries the few things that matter under the many that do
+not, which is its own kind of failure.
+
+### What a held passage looks like in the record
+
+Nothing waits. All three files are still written, on time, exactly as they always were —
+only the *words* of the held passage wait. Where they were, the transcript says something
+like:
+
+> `[held 7D6A70]` A staff matter was recorded on 24 Aug 2026 and is held pending review, so
+> the words are not written here. What was said in held passage 7D6A70 on 24 Aug 2026, and
+> may it be released into the record?
+
+The same sentence is repeated at the top of the transcript, before anything that was said on
+the call. That is not tidiness: the record files the first twenty questions it finds in a
+transcript, and a long site meeting produces forty, so a marker sitting down in the body
+falls off the end and the site's page ends up saying nothing at all. At the top it cannot be
+pushed off.
+
+The wording matters. It is written as an open question so the record picks it up and puts it
+on the site's live page, where it reads as *"a rate was recorded on 24 August and is being
+held"* rather than the assistant telling a client *"there is no record of a rate."* **A
+confident answer built on a quietly partial record is worse than the leak it prevents.**
+
+### How review works
+
+Every morning the 06:00 email carries a link. Open it on your phone, read the passage with a
+little either side, and tap yes or no. Approving it puts the words back exactly where they
+were said, in the transcript that is already in the record. Refusing it leaves the note
+where it is, saying a passage was held and refused.
+
+**A staff member reviews their own held passages.** You see how many are waiting and which
+site they came from — never the words. The one exception is a staff disciplinary matter,
+which comes to you whoever recorded it.
+
+That is not politeness. Your people record voluntarily and can stop keeping a folder any
+time. If somebody works out that you read the held text from their calls, the sensible thing
+for them to do is stop recording — and then those recordings are gone entirely, which is the
+exact loss this whole service was built to cure, arriving as a social problem instead of a
+technical one.
+
+Each person gets their own link, in their own copy of the email. **The link is a key** — do
+not forward it, because anybody holding it can answer that person's queue. It expires, and a
+new one comes with tomorrow's email.
+
+### Nothing is ever decided for you
+
+There is no deadline, no automatic release, no automatic discard, and no daily cap that
+quietly commits the overflow. A passage waits until a person answers it, however long that
+is. The morning email escalates instead: first the count, then how long the oldest has
+waited, then which site it is on, and after a week it goes in the subject line.
+
+The reason it is built that way is that under pressure the thing that must never quietly
+empty is the gate. Every design that had a timer in it emptied the gate rather than the
+record, while still looking like a gate.
+
+### Watching first, and how to read the number
+
+`GATE_MODE=shadow` is what it ships as, and it means: read every recording, write down what
+would have been held, **hold nothing**. Every transcript goes into the record complete. The
+morning email gains a section that looks like this:
+
+```
+THE GATE IS WATCHING AND HOLDING NOTHING
+
+  NOTHING WAS WITHHELD. ...
+
+    recordings read                 214
+    of those, read by the model     211  (99%)
+    read by the rules alone         3
+    of those, carrying something    9  (4.2%)
+    passages it would have held     11
+    that is, per day                1.6
+    share of the words              0.043%
+    days measured                   7
+```
+
+Read it in this order:
+
+1. **"read by the model"** first, before anything else. Most of what is held can only be
+   seen by something that reads the whole conversation — a staff matter, somebody's health,
+   what our attorney said, our own margin. If that number is well below the number above it,
+   **the rest of this table means nothing**: a small figure would mean the question was not
+   asked, not that there was nothing to find. The email says so itself and refuses to tell
+   you it is ready.
+2. **"that is, per day"** is the real question: *how many times a day would I have to tap
+   yes or no?* One or two is a habit. Ten is a wall, and it is the classifier that needs
+   changing, not the queue.
+3. **"what it would have held, by kind"**, underneath, tells you *why*. If it is mostly one
+   category and that category looks wrong, that is the thing to fix.
+
+Leave it watching for a week or two of ordinary work. When the per-day figure is small, the
+categories look right, and the model read effectively all of the recordings, set
+`GATE_MODE=on`. Until then it costs you nothing and tells you everything.
+
+### The commands
+
+| Command | What it does |
+| --- | --- |
+| `transcriber gate --status` | What mode it is in, how many are waiting, and the measurement so far. |
+| `transcriber held list` | Counts, sites and ages. Never anybody's words. Add `--as <you>` for your own list. |
+| `transcriber held show <ref> --as <you>` | One passage of your own, in full. |
+| `transcriber held release <ref> --as <you>` | Approve it. The words go back where they were said. |
+| `transcriber held refuse <ref> --as <you>` | Refuse it. The note stays, saying so. |
+| `transcriber review --link <person>` | Mints a review link by hand, if somebody's email went astray. |
+| `transcriber review serve` | Runs the review page itself. |
+
+---
+
 ## Running it for a team
 
 One person recording a few calls a day needs none of this: the settings below already have
@@ -350,6 +502,9 @@ python3 -m transcriber run
 | `transcriber requeue <id>` | Puts one recording back in the queue. |
 | `transcriber routes` | Lists your routes, adds one, changes one, pauses one. See **Routes** above. |
 | `transcriber config` | Reads and changes one setting at a time — `config set ANALYSIS_MODEL_STRONG claude-opus-5` — checking it before it writes. |
+| `transcriber gate` | What the sensitivity gate is doing, and the measurement it is building. `--status` for the summary. |
+| `transcriber held` | The queue of passages waiting for approval: `list`, `show`, `release`, `refuse`. See **Holding back** above. |
+| `transcriber review` | Runs the review page (`serve`), or mints one person a link by hand (`--link <person>`). |
 
 `once`, `sweep`, `archive`, `backfill` and `status` all take `--route <short name>` to act
 on one route only. Left off, they act on every route that is switched on.
@@ -397,6 +552,19 @@ these by hand. See **Routes** above for what they mean.
 | `ROUTE_<NAME>_ARCHIVE` | Where its originals move at 60 days. Empty means this kind stays where it is, for good. |
 | `ROUTE_<NAME>_ENGINE` | Empty means the service default. Set it only if this kind needs a different transcription service. |
 | `ROUTE_<NAME>_ENABLED` | `false` pauses the route: its folder stops being watched, and nothing else changes. |
+| `ROUTE_<NAME>_REVIEWER` | Who reviews the passages held from this folder — normally whoever records into it. **Required on every switched-on route before `GATE_MODE=on` will start.** Leave it unset and everything held from that folder goes to the service owner instead, including a staff member's own health and personal circumstances, which is the one thing the design says must not happen. |
+
+### Holding things back for approval
+
+See **Holding back the things that should not be written down yet** above for what these
+actually do. The service ships watching and holding nothing; you change that once the
+measurement in the morning email is real.
+
+| Variable | Meaning |
+| --- | --- |
+| `GATE_MODE` | `off`, `shadow` or `on`. Default **`shadow`**: reads every recording, writes down what it would have held, and holds nothing. `on` actually withholds. `off` does not read for it at all and nothing about the analysis changes from the day before this existed. |
+| `GATE_HELD_STORE` | The SQLite file the held words live in. Defaults to beside `LEDGER_PATH`. **It must not be inside `WORK_DIR`** — that gets cleared on a disk budget, and a held passage is the only copy of those words outside the recording. The service refuses to start if you point it there. Back this up with the ledger. |
+| `GATE_REVIEW_BASE_URL` | The `https://` address of the review page. **Required before `GATE_MODE=on` will start** — without it there is nowhere to approve anything and nothing would ever be released. Each person's own link is built from this and sent in their copy of the morning email. |
 
 `<NAME>` is the short name in capitals with hyphens as underscores, so `site-meetings`
 becomes `ROUTE_SITE_MEETINGS_SOURCE`.

@@ -45,6 +45,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import smtplib
 import ssl
 import time
@@ -53,6 +54,8 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from typing import Any, Callable, Mapping, Sequence
 
+from . import logging_setup
+from . import release as release_module
 from .heartbeat import Heartbeat, PingResult
 from .ledger import Ledger
 from .models import (
@@ -66,7 +69,17 @@ from .models import (
     strip_owner_paths,
     utc_now_iso,
 )
+from .review_page import display_name
 from .sweep import local_now, parse_stamp, routes_of
+from .withheld import (
+    CATEGORY_PHRASE,
+    MODE_OFF,
+    MODE_ON,
+    MODE_SHADOW,
+    Decision,
+    WithheldStore,
+    normalise_mode,
+)
 
 log = logging.getLogger("transcriber.digest")
 
@@ -75,6 +88,13 @@ __all__ = [
     "RouteDigest",
     "RouteQueue",
     "QueueReport",
+    "HeldSite",
+    "HeldReport",
+    "held_report",
+    "held_store_for",
+    "HELD_AGE_LINE",
+    "HELD_AGE_NAMED",
+    "HELD_AGE_SUBJECT",
     "queue_report",
     "queue_history",
     "record_queue_depth",
@@ -536,6 +556,618 @@ def _stale_after(config: Any) -> float:
     return hours * 3600.0 if hours > 0 else QUEUE_STALE_AFTER_S
 
 
+# ---------------------------------------------------------------- the held-passage queue
+
+#: How the held queue escalates, in days. The rule he gave is that it must get **more
+#: specific, not just louder** — a warning that says the same thing more loudly every
+#: morning becomes wallpaper by the third one, and then the queue is invisible again while
+#: still technically being reported. So each step adds a *fact*: first the age, then the
+#: oldest one by name, then the subject line — which is the only escalation left that
+#: reaches him before he opens anything.
+HELD_AGE_LINE = 1        # the age of the oldest is stated
+HELD_AGE_NAMED = 3       # the oldest is named: its site, whose list it is, its reference
+HELD_AGE_SUBJECT = 7     # it reaches the subject line of the email
+#
+# All three are sentences and nothing else. There is no age at which a passage is released,
+# refused, discarded or hidden from this report, and no threshold in this module produces
+# anything but words — which is what makes "nothing is decided for him on a timer, ever"
+# a property of the code rather than a promise about it.
+
+
+def held_store_for(config: Any) -> WithheldStore | None:
+    """Open the store of held passages, or ``None`` when this deployment has never used one.
+
+    ``None`` is only ever returned for a service that has genuinely never classified a
+    recording — the gate is off *and* there is no database on disk. A gate switched off
+    after it has held something must still report what is waiting, because switching the
+    classifier off does not answer anybody's held passage, and a queue that vanished from
+    the morning email the day the mode changed would be the exact silent-emptying failure
+    this whole design is built against.
+    """
+    path = str(getattr(config, "held_store_path", "") or "")
+    if not path:
+        path = WithheldStore.path_beside(str(getattr(config, "ledger_path", ":memory:")))
+    mode = normalise_mode(getattr(config, "gate_mode", MODE_SHADOW))
+    if mode == MODE_OFF and path not in (":memory:", "") and not os.path.exists(path):
+        return None
+    try:
+        return WithheldStore(path, scrub=getattr(config, "scrub", None))
+    except Exception as exc:  # noqa: BLE001 - the morning email goes out regardless
+        log.warning("the held-passage store could not be opened: %s", exc)
+        return None
+
+
+@dataclass(frozen=True)
+class HeldSite:
+    """One site's share of the held queue. A count and an age — never a word."""
+
+    site: str
+    count: int = 0
+    recordings: int = 0
+    oldest_age_days: int = 0
+
+    def line(self) -> str:
+        name = self.site or "no site named"
+        waiting = (
+            f", oldest waiting {self.oldest_age_days} day{'' if self.oldest_age_days == 1 else 's'}"
+            if self.oldest_age_days
+            else ", all of them from today"
+        )
+        return f"{name}: {self.count} waiting{waiting}"
+
+
+#: The share of classified recordings the model must actually have read before the shadow
+#: measurement is allowed to describe itself as ready to arm. Not a threshold that decides
+#: anything — nothing in this module can release, discard or arm — only the line between
+#: printing "it is ready" and printing "this number is not yet real". Set high because the
+#: failure it guards is silent: a gate whose classifier stopped running reports a small
+#: held fraction, which is exactly what a well-tuned gate reports.
+_MEASUREMENT_IS_REAL_ABOVE = 0.8
+
+
+@dataclass(frozen=True)
+class HeldReport:
+    """The held queue as the morning email says it — and as it must never say it.
+
+    Two rules shape every field on this object:
+
+    **Counts and sites, never words.** A staff member reviews their own held passages, and
+    James sees how many and where. That is not politeness: staff record voluntarily and can
+    stop keeping a folder at all, and one who works out that the boss reads the held text
+    from their calls has an obvious and rational response. The recordings would then be gone
+    entirely, which is the original loss arriving as a social effect rather than a technical
+    one, and it cannot be fixed in code afterwards. So the only text on this object is a
+    category's own phrase — "a staff matter", "a legal matter" — chosen from a fixed list of
+    six, plus the classifier's public subject for passages that are *his own* to read.
+
+    **Nothing here is a deadline.** Age is reported and never acted on. There is no field
+    that expires, no threshold that releases, and no count that commits an overflow. Under
+    fatigue the thing that must never quietly empty is the gate, and the way that is
+    guaranteed is that this module can only ever produce sentences.
+    """
+
+    mode: str = MODE_SHADOW
+    #: True when the gate is actually withholding. False in shadow, which is what ships.
+    pending: int = 0
+    recordings: int = 0
+    oldest_age_days: int = 0
+    oldest_site: str = ""
+    oldest_ref: str = ""
+    oldest_reviewer: str = ""
+    oldest_phrase: str = ""
+    oldest_recording: str = ""
+    oldest_is_his: bool = False
+    by_site: tuple[HeldSite, ...] = ()
+    by_reviewer: tuple[tuple[str, int], ...] = ()
+    by_category: tuple[tuple[str, int], ...] = ()
+    #: Pending passages with no reviewer recorded, which cannot be grouped. Said out loud
+    #: rather than left out of the totals.
+    unassigned: int = 0
+    #: The shadow-mode measurement — what the classifier *would* have held, over how many
+    #: recordings, and what fraction of the text that came to.
+    would_have_held: int = 0
+    classified: int = 0
+    with_a_hold: int = 0
+    fraction_of_text: float = 0.0
+    fraction_of_recordings: float = 0.0
+    spans_per_day: float = 0.0
+    days_measured: int = 0
+    shadow_by_category: tuple[tuple[str, int], ...] = ()
+    #: How many of those recordings the model actually answered the sensitivity question
+    #: on, and how many fell back to the mechanical rules. Without this pair, a gate whose
+    #: classifier is not running reads in this email exactly like a fortnight of clean
+    #: recordings — and both read as "ready to arm". Four of the six held categories are
+    #: invisible to the rules, so the difference is most of the gate.
+    model_read: int = 0
+    rules_only: int = 0
+    #: What the classifier could not stand behind, and how many recordings each applies to.
+    #: Counts of a fixed set of sentences; never a word of any recording.
+    classifier_notes: tuple[tuple[str, int], ...] = ()
+    #: Every passage this store has ever recorded, answered or not, in any mode. It is the
+    #: difference between "the gate has found nothing" and "the gate has never run", which
+    #: read identically from a count of what is pending and need opposite responses.
+    held_ever: int = 0
+    #: Answers a person gave on the reported day. Released and refused are both progress.
+    released_today: int = 0
+    refused_today: int = 0
+    #: Released passages whose words have not been written into the record yet.
+    outstanding: release_module.Outstanding = field(default_factory=release_module.Outstanding)
+    review_url: str = ""
+    unavailable: str = ""
+
+    @property
+    def armed(self) -> bool:
+        return self.mode == MODE_ON
+
+    @property
+    def empty(self) -> bool:
+        """Nothing to say at all: a service that has never classified a recording."""
+        return (
+            not self.unavailable
+            and self.mode != MODE_ON
+            and self.pending == 0
+            and self.classified == 0
+            and self.would_have_held == 0
+            and not self.outstanding.any
+        )
+
+    @property
+    def needs_a_person(self) -> bool:
+        return self.pending > 0 or self.outstanding.any or bool(self.unavailable)
+
+    @property
+    def escalation(self) -> str:
+        """How specific this morning's warning has to be: none | age | named | subject."""
+        if not self.pending:
+            return "none"
+        if self.oldest_age_days >= HELD_AGE_SUBJECT:
+            return "subject"
+        if self.oldest_age_days >= HELD_AGE_NAMED:
+            return "named"
+        if self.oldest_age_days >= HELD_AGE_LINE:
+            return "age"
+        return "none"
+
+    def subject_warning(self) -> str:
+        """The subject-line warning, after a week. Empty before that.
+
+        Specific rather than shouted: how many, and how long the oldest has waited. That is
+        the smallest sentence that tells him something he did not know yesterday.
+        """
+        if self.escalation != "subject":
+            return ""
+        return (
+            f"⚠ {self.pending} passage(s) held, oldest {self.oldest_age_days} days"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "pending": self.pending,
+            "recordings": self.recordings,
+            "oldest_age_days": self.oldest_age_days,
+            "escalation": self.escalation,
+            "by_site": [
+                {"site": s.site, "count": s.count, "oldest_age_days": s.oldest_age_days}
+                for s in self.by_site
+            ],
+            "by_category": [list(pair) for pair in self.by_category],
+            "unassigned": self.unassigned,
+            "would_have_held": self.would_have_held,
+            "classified": self.classified,
+            "with_a_hold": self.with_a_hold,
+            "fraction_of_text": self.fraction_of_text,
+            "fraction_of_recordings": self.fraction_of_recordings,
+            "spans_per_day": self.spans_per_day,
+            "days_measured": self.days_measured,
+            "model_read": self.model_read,
+            "rules_only": self.rules_only,
+            "fraction_the_model_read": round(self.fraction_the_model_read, 4),
+            "measurement_is_real": self.fraction_the_model_read >= _MEASUREMENT_IS_REAL_ABOVE,
+            "classifier_notes": [list(pair) for pair in self.classifier_notes],
+            "released_today": self.released_today,
+            "refused_today": self.refused_today,
+            "held_ever": self.held_ever,
+            "outstanding": self.outstanding.count,
+            "unavailable": self.unavailable,
+        }
+
+    # -- the section --------------------------------------------------------------
+
+    def heading(self) -> str:
+        if self.unavailable:
+            return "HELD PASSAGES — the queue could not be read"
+        if self.mode == MODE_SHADOW:
+            return "THE GATE IS WATCHING AND HOLDING NOTHING"
+        if self.mode == MODE_OFF:
+            return "HELD PASSAGES — the gate is switched off"
+        if not self.pending:
+            return "HELD PASSAGES — nothing is waiting"
+        return f"HELD PASSAGES — {self.pending} waiting for a person"
+
+    def lines(self) -> list[str]:
+        if self.unavailable:
+            return [
+                f"  {chunk}"
+                for chunk in _wrap(
+                    f"The held-passage queue could not be read this morning: "
+                    f"{self.unavailable}. Nothing has been released and nothing has been "
+                    f"discarded — this is a fault in this report. Run "
+                    f"`transcriber gate --status`."
+                )
+            ]
+        out: list[str] = []
+        if self.mode == MODE_SHADOW:
+            out += self._shadow_lines()
+        elif self.mode == MODE_OFF:
+            out += [
+                f"  {chunk}"
+                for chunk in _wrap(
+                    "The gate is switched off: no recording is read for sensitive passages "
+                    "and nothing is being held. Everything said on a recording is written "
+                    "into the record as it was said."
+                )
+            ]
+        if self.pending or self.mode == MODE_ON:
+            out += self._pending_lines()
+        if self.released_today or self.refused_today:
+            out.append("")
+            out.append(
+                f"  Answered on the day reported: {self.released_today} released, "
+                f"{self.refused_today} refused."
+            )
+        if self.outstanding.any:
+            out.append("")
+            for line in self.outstanding.lines():
+                for chunk in _wrap(line):
+                    out.append(f"  {chunk}")
+        return out
+
+    def _shadow_lines(self) -> list[str]:
+        """What it *would* have held. Plainly marked as not withheld — the whole measurement.
+
+        This is what ships. The five design passes disagreed about how much this touches by
+        a factor of twenty-five, and arming a gate against an estimate is how the queue
+        becomes a wall he bounces off. So the number is read off a real run before anything
+        is ever withheld, and the sentence has to be unmistakable: nothing below was held
+        back, and every one of these transcripts went into the record complete.
+        """
+        out = [
+            f"  {chunk}"
+            for chunk in _wrap(
+                "NOTHING WAS WITHHELD. The gate is in shadow: it reads every recording and "
+                "writes down what it would have held, and then holds nothing. Every "
+                "transcript below went into the record complete, with nothing taken out and "
+                "nothing waiting for you. This section is the measurement that has to be "
+                "real before it is ever switched on."
+            )
+        ]
+        out.append("")
+        if not self.classified:
+            out.append("  No recording has been read for sensitive passages yet.")
+            return out
+        out += [
+            f"    recordings read                 {self.classified}",
+            f"    of those, read by the model     {self.model_read}"
+            f"  ({self.fraction_the_model_read * 100:.0f}%)",
+            f"    read by the rules alone         {self.rules_only}",
+            f"    of those, carrying something    {self.with_a_hold}"
+            f"  ({self.fraction_of_recordings * 100:.1f}%)",
+            f"    passages it would have held     {self.would_have_held}",
+            f"    that is, per day                {self.spans_per_day:.1f}",
+            f"    share of the words              {self.fraction_of_text * 100:.3f}%",
+            f"    days measured                   {self.days_measured}",
+        ]
+        if self.shadow_by_category:
+            out.append("")
+            out.append("    what it would have held, by kind:")
+            for name, count in self.shadow_by_category:
+                out.append(f"      {_category_words(name)}: {count}")
+        if self.classifier_notes:
+            out.append("")
+            out.append("  What it could not stand behind:")
+            for note, count in self.classifier_notes:
+                for index, chunk in enumerate(_wrap(f"{note} — on {count} recording(s)", 68)):
+                    out.append(f"    {'- ' if index == 0 else '  '}{chunk}")
+        out.append("")
+        out += self._is_it_ready()
+        return out
+
+    @property
+    def fraction_the_model_read(self) -> float:
+        return (self.model_read / self.classified) if self.classified else 0.0
+
+    def _is_it_ready(self) -> list[str]:
+        """The sentence that tells him what to do with the number — or refuses to.
+
+        "If it is small and the categories look right, it is ready" is only true when the
+        classifier that produced the number was actually running. Four of the six held
+        categories can only be seen by the model reading the transcript; when it did not,
+        the per-day figure is small for the one reason that must never be read as reassuring.
+        A gate armed against that number would let staff matters, a person's health and
+        KBC's own cost-against-charge go straight into the record while the email that
+        approved it said the measurement looked good.
+        """
+        if self.fraction_the_model_read < _MEASUREMENT_IS_REAL_ABOVE:
+            return [
+                f"  {chunk}"
+                for chunk in _wrap(
+                    f"THIS NUMBER IS NOT YET REAL, so do not switch the gate on against it. "
+                    f"The model answered the sensitivity question on {self.model_read} of "
+                    f"{self.classified} recordings. The rest were read by the mechanical "
+                    f"rules alone, which can only see an explicit request that something not "
+                    f"be written down and a bare identity or account number — not a staff "
+                    f"matter, not a person's health, not what our attorney is planning, and "
+                    f"not our own cost set against what we charged. A low figure here means "
+                    f"the question was not asked, not that there was nothing to find. This "
+                    f"needs fixing before the measurement means anything."
+                )
+            ]
+        return [
+            f"  {chunk}"
+            for chunk in _wrap(
+                "Read the per-day figure as the number of approvals a day switching this on "
+                "would cost. If it is small and the categories look right, it is ready. If "
+                "it is not, it is the classifier that needs changing, not the queue."
+            )
+        ]
+
+    def _pending_lines(self) -> list[str]:
+        out: list[str] = []
+        if not self.pending:
+            out.append("")
+            if self.classified == 0 and self.held_ever == 0:
+                # Armed and never used. Worth one line rather than a cheerful sentence about
+                # a history that does not exist: a gate switched on against a classifier that
+                # is not running looks exactly like a gate that has found nothing.
+                out.append(
+                    "  The gate is on and has not read a recording yet. Nothing has been "
+                    "held and nothing has been kept out of the record."
+                )
+            else:
+                out.append(
+                    "  Nothing is being held: every passage the gate has held has been "
+                    "answered."
+                )
+            return out
+        out.append("")
+        for chunk in _wrap(
+            f"{self.pending} passage(s) from {self.recordings} recording(s) were taken out "
+            f"of a transcript and are waiting for a person. They are marked in place in the "
+            f"record where they were said, so nothing reads as missing — but until somebody "
+            f"answers each one, the words are only in the recording and in the store."
+        ):
+            out.append(f"  {chunk}")
+
+        out.append("")
+        for site in self.by_site:
+            out.append(f"    {site.line()}")
+        if self.unassigned:
+            out.append(
+                f"    {self.unassigned} more with no reviewer recorded — see "
+                f"`transcriber gate --status`"
+            )
+
+        if self.by_reviewer:
+            out.append("")
+            out.append("  Whose list each is on:")
+            for who, count in self.by_reviewer:
+                out.append(f"    {who}: {count}")
+
+        # The escalation. Each step adds a fact rather than an adjective.
+        if self.escalation in ("age", "named", "subject"):
+            out.append("")
+            out.append(
+                f"  The oldest has been waiting {self.oldest_age_days} "
+                f"day{'' if self.oldest_age_days == 1 else 's'}."
+            )
+        if self.escalation in ("named", "subject"):
+            out.append(f"  {self._name_the_oldest()}")
+        if self.escalation == "subject":
+            out.append("")
+            for chunk in _wrap(
+                "This has now been waiting over a week, so it is in the subject line of "
+                "this email as well. Nothing will happen to it on its own: it will not be "
+                "released, it will not be discarded, and it will not stop being reported. "
+                "It needs one tap of yes or no from the person whose list it is on."
+            ):
+                out.append(f"  {chunk}")
+
+        out.append("")
+        if self.review_url:
+            out.append(f"  Answer them here: {self.review_url}")
+        out.append(
+            "  Or from the service host: `transcriber held list`, then "
+            "`transcriber held show <reference>`."
+        )
+        return out
+
+    def _name_the_oldest(self) -> str:
+        """The oldest one, named as far as the person reading this may be told.
+
+        His own passage is named fully — the recording, the reference, and the classifier's
+        own short subject for it. Somebody else's is named by its site, whose list it is on
+        and the *category's* phrase, never the classifier's subject: that phrase is one of
+        six fixed sentences, so a staff member's held words cannot reach his screen through
+        a field that was supposed to be a summary of them.
+        """
+        where = self.oldest_site or "no site named"
+        if self.oldest_is_his:
+            what = self.oldest_phrase or "something held for review"
+            recording = self.oldest_recording or "a recording"
+            return (
+                f"It is {self.oldest_ref} on your own list — {what}, from {recording} at "
+                f"{where}."
+            )
+        return (
+            f"It is on {self.oldest_reviewer or 'somebody'}'s list, at {where}: "
+            f"{self.oldest_phrase or 'something held for review'}. You see that it is "
+            f"waiting, not what it says."
+        )
+
+
+def _category_words(name: str) -> str:
+    """One of the six categories in the words the review page uses. Never an internal name."""
+    return CATEGORY_PHRASE.get(name, name.replace("_", " "))
+
+
+def held_report(
+    config: Any,
+    ledger: Ledger,
+    *,
+    store: WithheldStore | None = None,
+    day: str = "",
+    now: str = "",
+    principal: str = "",
+) -> HeldReport:
+    """The held queue and the shadow measurement, counted without reading anybody's words.
+
+    One walk over the pending passages is unavoidable — per-site ages and per-category
+    counts do not exist anywhere else — and every record is reduced through
+    :meth:`transcriber.withheld.HeldRecord.without_words` on the same line it is read, so
+    nothing carrying text ever escapes this function. That is the boundary decision 6 lives
+    on, and it is one line rather than a convention because a convention gets edited.
+    """
+    mode = normalise_mode(getattr(config, "gate_mode", MODE_SHADOW))
+    owner = (principal or _principal_of(config)).strip()
+    url = str(getattr(config, "gate_review_base_url", "") or "").strip()
+    held = store if store is not None else held_store_for(config)
+    if held is None:
+        return HeldReport(mode=mode, review_url=url)
+
+    stamp = now or utc_now_iso()
+    try:
+        overview = held.overview(decision=Decision.PENDING, now=stamp)
+    except Exception as exc:  # noqa: BLE001 - the morning email goes out regardless
+        log.warning("the held-passage queue could not be counted: %s", exc)
+        return HeldReport(mode=mode, review_url=url, unavailable=f"{type(exc).__name__}: {exc}")
+
+    sites: dict[str, list[int]] = {}
+    site_items: dict[str, set[str]] = {}
+    categories: dict[str, int] = {}
+    listed = 0
+    oldest: Any = None
+    for reviewer, count in sorted((overview.get("by_reviewer") or {}).items()):
+        if not count or not reviewer or reviewer == "unassigned":
+            continue
+        try:
+            queue = held.queue_for(reviewer, decision=Decision.PENDING)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("one reviewer's held queue could not be read: %s", exc)
+            continue
+        for full in queue:
+            record = full.without_words()   # the words stop here, on this line
+            listed += 1
+            site = record.site or "no site named"
+            sites.setdefault(site, []).append(record.age_days(stamp))
+            site_items.setdefault(site, set()).add(record.item_id)
+            categories[record.category] = categories.get(record.category, 0) + 1
+            if oldest is None or record.held_at < oldest.held_at:
+                oldest = record
+
+    by_site = tuple(
+        sorted(
+            (
+                HeldSite(
+                    site=site,
+                    count=len(ages),
+                    recordings=len(site_items.get(site, ())),
+                    oldest_age_days=max(ages) if ages else 0,
+                )
+                for site, ages in sites.items()
+            ),
+            key=lambda s: (-s.oldest_age_days, -s.count, s.site),
+        )
+    )
+    reviewers = tuple(
+        sorted(
+            (
+                (display_name(who), int(count))
+                for who, count in (overview.get("by_reviewer") or {}).items()
+                if count and who and who != "unassigned"
+            ),
+            key=lambda pair: (-pair[1], pair[0]),
+        )
+    )
+
+    measurement: Mapping[str, Any] = {}
+    day_counts: Mapping[str, Any] = {}
+    try:
+        measurement = held.measurement()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("the gate's measurement could not be read: %s", exc)
+    try:
+        stats = held.stats()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("the held-passage store could not be summarised: %s", exc)
+        stats = {}
+    try:
+        day_counts = held.counts_for_day(day) if day else {}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("the gate's counts for %s could not be read: %s", day, exc)
+
+    owed = release_module.outstanding(held, ledger)
+
+    pending = int(overview.get("count") or 0)
+    oldest_reviewer = str(getattr(oldest, "reviewer", "") or "")
+    return HeldReport(
+        mode=mode,
+        pending=pending,
+        recordings=int(overview.get("recordings") or 0),
+        oldest_age_days=int(overview.get("oldest_age_days") or 0),
+        oldest_site=str(getattr(oldest, "site", "") or ""),
+        oldest_ref=str(getattr(oldest, "ref", "") or ""),
+        oldest_reviewer=display_name(oldest_reviewer),
+        oldest_phrase=(
+            str(getattr(oldest, "phrase", "") or "")
+            if oldest is not None and oldest_reviewer == owner
+            else _category_words(str(getattr(oldest, "category", "") or ""))
+        ),
+        oldest_recording=str(getattr(oldest, "source_name", "") or ""),
+        oldest_is_his=bool(owner) and oldest_reviewer == owner,
+        by_site=by_site,
+        by_reviewer=reviewers,
+        by_category=tuple(sorted(categories.items(), key=lambda pair: (-pair[1], pair[0]))),
+        unassigned=max(0, pending - listed),
+        would_have_held=int(measurement.get("spans") or 0),
+        classified=int(measurement.get("recordings_classified") or 0),
+        with_a_hold=int(measurement.get("recordings_with_a_hold") or 0),
+        fraction_of_text=float(measurement.get("fraction_of_text") or 0.0),
+        fraction_of_recordings=float(measurement.get("fraction_of_recordings") or 0.0),
+        spans_per_day=float(measurement.get("spans_per_day") or 0.0),
+        days_measured=int(measurement.get("days_measured") or 0),
+        shadow_by_category=tuple(
+            sorted((measurement.get("by_category") or {}).items(), key=lambda p: (-p[1], p[0]))
+        ),
+        model_read=int(measurement.get("recordings_the_model_read") or 0),
+        rules_only=int(measurement.get("recordings_rules_only") or 0),
+        classifier_notes=tuple(
+            sorted((measurement.get("notes") or {}).items(), key=lambda p: (-p[1], p[0]))
+        )[:6],
+        held_ever=int(stats.get("holds") or 0),
+        released_today=int(day_counts.get("released") or 0),
+        refused_today=int(day_counts.get("refused") or 0),
+        outstanding=owed,
+        review_url=url,
+    )
+
+
+def _principal_of(config: Any) -> str:
+    """Who this email is written for. The same answer the review page reaches.
+
+    Named explicitly where the configuration says so, otherwise the first digest recipient —
+    which is the address this email is already going to. Getting a different answer here
+    from the one the review page gets would put a staff member's own subject line on his
+    screen, so the rule is written once and read the same way in both places.
+    """
+    for attribute in ("gate_principal", "principal", "review_principal"):
+        value = str(getattr(config, attribute, "") or "").strip()
+        if value:
+            return value
+    recipients = tuple(getattr(config, "smtp_to", ()) or ())
+    return str(recipients[0]).strip() if recipients else ""
+
+
 # --------------------------------------------------------------------------- wording
 
 #: Plain-English translations of the failure reasons this pipeline actually produces. The
@@ -838,6 +1470,9 @@ class Digest:
     #: The work in hand right now, per route. Not part of the day being reported: it is the
     #: answer to "where are the rest of them?", which is asked about this minute.
     queue: QueueReport = field(default_factory=QueueReport)
+    #: The held-passage queue and, while the gate ships dark, the measurement. Counts, sites
+    #: and ages — never a word of what anybody said.
+    held: HeldReport = field(default_factory=HeldReport)
 
     @property
     def needs_a_person(self) -> bool:
@@ -845,6 +1480,7 @@ class Digest:
             self.open_failures > 0
             or self.counts.nothing_arrived
             or bool(self.route_disagreements)
+            or self.held.needs_a_person
         )
 
     @property
@@ -876,6 +1512,10 @@ class SendResult:
     detail: str = ""
     recipients: int = 0
     host: str = ""
+    #: Reviewers who are not digest recipients and were sent their own queue's link. A
+    #: staff member reviewing their own held passages is the ordinary case and is never on
+    #: SMTP_TO, so without this number the queue's only drain is invisible from here.
+    reviewers: int = 0
 
 
 @dataclass
@@ -920,6 +1560,10 @@ def build(
     attention = _attention(ledger, target)
     routes = route_digests(config, ledger, target)
     queue = queue_report(config, ledger, day=target, now=clock)
+    # Read, never written to. Nothing in the morning email decides anything about a held
+    # passage: it counts them, says how old the oldest is, and gets more specific about it
+    # every few days until a person answers it.
+    held = held_report(config, ledger, day=target, now=utc_now_iso(clock))
     disagreements = route_disagreements(ledger, target)
     if sweep_report is None:
         sweep_report = _stored_report(ledger, "sweep")
@@ -938,6 +1582,7 @@ def build(
         stats=ledger.stats(),
         routes=routes,
         queue=queue,
+        held=held,
         disagreements=disagreements,
         sweep_report=sweep_report,
         archive_report=archive_report,
@@ -969,6 +1614,14 @@ def build(
         )
         subject = strip_emails(subject)
 
+    # A held passage that has waited a week reaches the subject line — the last escalation
+    # there is, and the only one that reaches him before he opens anything. It goes on
+    # after the counts and before any credential warning, because a credential that has
+    # expired means nothing is processing at all and outranks everything.
+    held_warning = held.subject_warning()
+    if held_warning:
+        subject = f"{held_warning} — {subject}"
+
     warnings = credential_warnings(config, clock)
     if warnings and warnings[0][0] <= _EXPIRY_SUBJECT_DAYS:
         subject = f"⚠ {warnings[0][1]} — {subject}"
@@ -984,6 +1637,7 @@ def build(
         routes=routes,
         route_disagreements=disagreements,
         queue=queue,
+        held=held,
     )
 
 
@@ -1092,6 +1746,7 @@ def _render(
     sweep_report: Any,
     routes: Sequence["RouteDigest"] = (),
     queue: "QueueReport | None" = None,
+    held: "HeldReport | None" = None,
     disagreements: Sequence[Mapping[str, Any]] = (),
     archive_report: Any,
     service_error: str = "",
@@ -1182,6 +1837,14 @@ def _render(
     else:
         lines += ["Nothing needs you this morning.", ""]
 
+    # Held passages sit here, above the counts, only when somebody is actually waiting on
+    # him. They are not a failure — nothing is lost and nothing is late — but they are the
+    # one thing in this email that no amount of time will resolve on its own, so when there
+    # is a queue it goes where a queue that needs a person goes. When there is nothing
+    # waiting, the same section drops below the routes and reports the measurement instead.
+    if held is not None and held.pending:
+        lines += _held_section(held)
+
     lines += [
         "WHAT ARRIVED",
         _RULE,
@@ -1212,6 +1875,9 @@ def _render(
             marker = "!" if entry.needs_a_person else " "
             lines.append(f"  {marker} {entry.line()}")
         lines.append("")
+
+    if held is not None and not held.pending:
+        lines += _held_section(held)
 
     if disagreements:
         # Next to the per-route breakdown, because it is a fact about two routes rather than
@@ -1305,6 +1971,20 @@ def _render(
     return "\n".join(lines)
 
 
+def _held_section(held: "HeldReport") -> list[str]:
+    """The held-passage section, or nothing at all on a service that has never used one.
+
+    Nothing at all is the deliberate case, and it is narrow: the gate has classified no
+    recording, is holding nothing, and owes the record nothing. Every other state produces a
+    section, including a gate that has been switched off with passages still waiting — a
+    queue that disappeared from the morning email the day somebody changed a setting is
+    exactly the silent emptying this design exists to make impossible.
+    """
+    if held.empty:
+        return []
+    return [held.heading(), _RULE] + held.lines() + [""]
+
+
 def _failure_block(
     index: int,
     failure: Mapping[str, Any],
@@ -1366,13 +2046,77 @@ def _indent(text: str, prefix: str = "  ") -> str:
 # --------------------------------------------------------------------------- sending
 
 
+def review_links(config: Any) -> dict[str, str]:
+    """One working review link per person who has something waiting, plus the principal.
+
+    The queue has exactly one drain, and this is it. The morning email used to print the
+    bare ``GATE_REVIEW_BASE_URL``, which without a token renders "This link has expired.
+    Open the link in this morning's email" — pointing at the email the dead link came from.
+    There is no login form and no other issuance path, so the only working link came from an
+    operator running ``transcriber review --link`` on the service host, by hand, per person,
+    every thirty-six hours. Nothing releases or discards on a timer, by design, so a queue
+    nobody can open is a queue that fills forever and a record that quietly hollows out.
+
+    Never raises. A digest that failed to send because the token store was busy would be the
+    same silent morning this service exists to remove; the email goes out either way, and
+    with no link it still names the command that works from the host.
+    """
+    if normalise_mode(getattr(config, "gate_mode", MODE_SHADOW)) != MODE_ON:
+        # Nothing is being withheld, so there is nothing to approve and no reason to mint a
+        # capability. Shadow is measured, not answered.
+        return {}
+    if not str(getattr(config, "gate_review_base_url", "") or "").strip():
+        return {}
+    try:
+        from . import review_server
+
+        service = review_server.service_from_config(config)
+        links = review_server.links_for_pending(config, service)
+    except Exception as exc:  # noqa: BLE001 - the morning email goes out regardless
+        log.warning("review links could not be minted for this morning's email: %s", exc)
+        return {}
+    # A token is a capability. It must never reach a log line, and it reaches one the moment
+    # anything interpolates this dictionary into a message.
+    if links:
+        secrets: list[str] = []
+        for url in links.values():
+            secrets.append(url)
+            _base, _sep, token = url.partition("?k=")
+            if token:
+                secrets.append(token)
+        logging_setup.add_secrets(secrets)
+    return links
+
+
+def _personalised(body: str, base_url: str, link: str) -> str:
+    """The digest body with the review link this one reader can actually open.
+
+    One substitution of one whole line, matched on the sentence
+    :meth:`HeldReport._pending_lines` writes. Deliberately not a substitution of the bare
+    URL: the tokenised link *starts with* the base URL, so replacing the URL and then the
+    sentence containing it appends the token twice and produces a dead link, which is the
+    bug this whole function exists to fix.
+    """
+    marker = f"Answer them here: {base_url}"
+    if not base_url or not link or marker not in body:
+        return body
+    return body.replace(marker, f"Answer them here: {link}")
+
+
 def send(
     config: Any,
     digest: Digest,
     *,
     smtp_factory: Callable[..., Any] | None = None,
+    links: Mapping[str, str] | None = None,
 ) -> SendResult:
-    """Send the digest as one plain-text part. Never raises; the caller must see failure."""
+    """Send the digest as one plain-text part. Never raises; the caller must see failure.
+
+    One message per recipient rather than one message to all of them, because the review
+    link is a capability belonging to one person: putting everybody's in one body would let
+    any recipient open anybody's queue, and putting one person's in a body everybody gets
+    would do it more quietly. The bodies are otherwise identical.
+    """
     recipients = tuple(getattr(config, "smtp_to", ()) or ())
     host = str(getattr(config, "smtp_host", "") or "")
     port = int(getattr(config, "smtp_port", 587) or 587)
@@ -1381,18 +2125,40 @@ def send(
         log.error("%s", detail)
         return SendResult(ok=False, detail=detail, recipients=len(recipients), host=host)
 
-    message = EmailMessage()
-    message["Subject"] = digest.subject
-    message["From"] = str(getattr(config, "smtp_from", "") or "")
-    message["To"] = ", ".join(recipients)
-    message["Date"] = formatdate(localtime=True)
-    message["Message-ID"] = make_msgid()
-    message["Auto-Submitted"] = "auto-generated"
-    message.set_content(digest.body, subtype="plain", charset="utf-8")
+    issued = dict(links or {})
+    base_url = str(getattr(config, "gate_review_base_url", "") or "").strip()
+    sender = str(getattr(config, "smtp_from", "") or "")
+
+    def build(to: str, body: str, subject: str) -> EmailMessage:
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = sender
+        message["To"] = to
+        message["Date"] = formatdate(localtime=True)
+        message["Message-ID"] = make_msgid()
+        message["Auto-Submitted"] = "auto-generated"
+        message.set_content(body, subtype="plain", charset="utf-8")
+        return message
+
+    outgoing = [
+        build(who, _personalised(digest.body, base_url, issued.get(who, "")), digest.subject)
+        for who in recipients
+    ]
+    # Everybody who has passages waiting and does not get the morning email — a staff member
+    # reviewing their own held passages is the ordinary case, and they are not on SMTP_TO.
+    # Without this the only person who can ever drain the queue is the principal, and
+    # decision 6 says most of it is not his to read.
+    others = [who for who in sorted(issued) if who and who not in recipients]
+    for who in others:
+        outgoing.append(
+            build(who, _own_queue_body(config, digest, issued[who]),
+                  _own_queue_subject(digest, who))
+        )
 
     try:
         with _connect(config, host, port, smtp_factory) as server:
-            server.send_message(message)
+            for message in outgoing:
+                server.send_message(message)
     except Exception as exc:  # noqa: BLE001 - every send failure is reported, none is raised
         detail = f"{type(exc).__name__}: {exc}"
         scrub = getattr(config, "scrub", None)
@@ -1404,10 +2170,47 @@ def send(
         return SendResult(ok=False, detail=detail, recipients=len(recipients), host=host)
 
     log.info(
-        "morning digest sent to %d recipient(s) via %s:%s — %s",
-        len(recipients), host, port, digest.subject,
+        "morning digest sent to %d recipient(s) and %d reviewer(s) via %s:%s — %s",
+        len(recipients), len(others), host, port, digest.subject,
     )
-    return SendResult(ok=True, recipients=len(recipients), host=host)
+    return SendResult(ok=True, recipients=len(recipients), host=host, reviewers=len(others))
+
+
+def _own_queue_subject(digest: Digest, who: str) -> str:
+    return f"Your held passages — {digest.day}"
+
+
+def _own_queue_body(config: Any, digest: Digest, link: str) -> str:
+    """What a reviewer who is not the principal is sent: their own queue, and the way in.
+
+    Deliberately not the morning digest. It carries the whole service's failures, its queue
+    depth and its per-route breakdown — none of which is a staff member's business — and it
+    names the oldest held passage's site and reviewer. This says one thing: you have some
+    waiting, here is where to answer them.
+
+    It carries no count and no site either. Those are on the page behind the link, which
+    checks who is asking; an email is forwarded, screenshotted and read over a shoulder.
+    """
+    return "\n".join(
+        [
+            f"For {digest.day}.",
+            "",
+            "You have passages from your own recordings waiting for a yes or a no.",
+            "",
+            "They were taken out of the transcript and are not in the record until you say",
+            "so. Nothing will happen to them on their own: they will not be released, they",
+            "will not be discarded, and they will not stop being reported. Only you see the",
+            "words — the count and the site are all anybody else is shown.",
+            "",
+            f"  Answer them here: {link}",
+            "",
+            "That link is yours, it expires, and a new one comes with tomorrow's email.",
+            "Do not forward it: anybody holding it can answer your queue.",
+            "",
+            "-- ",
+            "Sent by the transcriber. Nothing in this path decides anything.",
+        ]
+    ) + "\n"
 
 
 def _connect(config: Any, host: str, port: int, smtp_factory: Callable[..., Any] | None) -> Any:
@@ -1455,7 +2258,7 @@ def run(
     digest = build(
         config, ledger, day=day, now=clock, sweep_report=sweep_report, archive_report=archive_report
     )
-    sent = send(config, digest, smtp_factory=smtp_factory)
+    sent = send(config, digest, smtp_factory=smtp_factory, links=review_links(config))
     # Written after the build, never during it: tomorrow's "is it growing?" is answered
     # against what this morning's email actually reported, and a dry run or a `status` that
     # rewrote the history would make the answer depend on who looked.

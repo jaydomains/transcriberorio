@@ -29,6 +29,35 @@ nothing here falls back to one: a row whose route is no longer in the configurat
 quarantined, loudly, naming the route and the routes that do exist. Writing a site meeting's
 transcript into the phone-calls folder because the route it named had been renamed is
 exactly the kind of quiet wrongness this service exists to make impossible.
+
+**The sensitivity gate sits between the transcript and the three files, and its order is
+not a preference.** Four steps, in this order and no other:
+
+1. *Read the transcript for sensitive passages, before the AI pass.* The mechanical rules —
+   an explicit instruction not to write something down, a bare identifier that validates as
+   one — run here, on the text exactly as the engine returned it. They run here rather than
+   after the analysis because a twelve-second recording is never sent to the strong model
+   at all: it is routed as trivial, produces no sensitive-passage list, and would otherwise
+   pass through the gate unread while saying "don't write this down" out loud.
+2. *Run the AI pass on the unredacted text.* Its quote verification asks "did the model
+   invent this?", and only the text as transcribed can answer that. Analyse a masked
+   transcript and every item quoting a masked passage fails verification and is discarded —
+   a redaction that silently destroys action items. The model's own reading of what is
+   sensitive comes back in the same answer and is folded into the classification here.
+3. *Store the words, then cut them.* A held passage, once cut, exists in two places: the
+   audio and the held-passage store. So the store is written first, all spans in one
+   transaction, and a store that will not take them means nothing is cut and nothing is
+   published. Never the other way round.
+4. *Mask the transcript text, then everything derived from it.* On the transcript, not on
+   the actions file: the actions file is named so the record never ingests it, and only the
+   transcript reaches the record. A redaction in the wrong file is not a redaction.
+
+Every mode runs all four steps. ``GATE_MODE`` is carried into them and decides one thing
+only — whether anything is actually withheld — so ``shadow`` measures the real classifier
+on real recordings down the same code path that ``on`` will use, and changes nothing else
+about what is written. It ships dark for a reason: the design passes' estimates of how much
+this touches differ by a factor of twenty-five, and arming it against an estimate is how the
+queue becomes a wall he bounces off.
 """
 
 from __future__ import annotations
@@ -43,10 +72,10 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from . import audio as audio_probe
-from . import completeness, naming, outputs, plausibility
+from . import completeness, naming, outputs, plausibility, redact, sensitivity
 from .engines import (
     EngineAudioTooLarge,
     EngineAuthError,
@@ -86,12 +115,15 @@ from .models import (
     utc_now_iso,
 )
 from .naming import TimestampUnavailable
-from .outputs import OutputContractError, UploadIncompleteError
+from .outputs import HeldTextWouldLeak, OutputContractError, UploadIncompleteError
 from .ratelimit import RateLimitShutdown
+from .sensitivity import GateSettings
+from .withheld import HeldSpan, WithheldStore, held_spans_from
 
 __all__ = [
     "Pipeline",
     "Outcome",
+    "GateResult",
     "PipelineFatal",
     "build_graph",
     "build_engine",
@@ -132,6 +164,11 @@ _META_RETRY_AT = "retry_at"
 _META_RETRY_REASON = "retry_reason"
 _META_GATE_FIRST_SEEN = "gate_first_seen"
 
+#: Where the sensitivity gate's own record of this recording goes in the ledger row. Counts,
+#: categories and hold references only — never a word of what was held. It is also what stops
+#: a retry counting the same recording twice in the measurement the arming decision rests on.
+_META_SENSITIVITY = "sensitivity"
+
 _UNSAFE_PATH = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -171,6 +208,37 @@ class Outcome:
     def line(self) -> str:
         head = f"{self.result}: {self.name or self.item_id}"
         return f"{head} — {self.reason}" if self.reason else head
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """What the sensitivity gate did to one recording, before any file was rendered.
+
+    ``transcript`` and ``extraction`` are what the three files are rendered from. In
+    ``shadow`` and ``off`` they are the originals, word for word, because those modes
+    withhold nothing; in ``on`` they are the same things with every held passage replaced by
+    its marker.
+
+    ``held`` is what was actually cut, and it is empty in every mode but ``on``. It travels
+    to :mod:`transcriber.outputs`, which refuses to publish any of the three files if one of
+    these passages survived into one of them.
+
+    Nothing in this object carries a held word except ``held`` itself, which carries them
+    because the backstop has to search for them. ``note`` is the ledger's copy and is counts
+    and references only.
+    """
+
+    report: Any                                  # sensitivity.Report
+    transcript: Transcript
+    extraction: Any
+    held: tuple[HeldSpan, ...] = ()
+    notes: tuple[str, ...] = ()
+    note: dict[str, Any] = field(default_factory=dict)
+    measured: bool = False
+
+    @property
+    def withheld(self) -> bool:
+        return bool(self.held)
 
 
 # --------------------------------------------------------------------------- construction
@@ -281,6 +349,7 @@ class Pipeline:
         *,
         engine: Any = None,
         extractor: Any = None,
+        withheld: Any = None,
         owner: str | None = None,
         clock: Any = time.time,
         sleep: Any = time.sleep,
@@ -309,6 +378,12 @@ class Pipeline:
         #: limit assumes. Keyed by name so a route override builds its own, once.
         self._engines: dict[str, Any] = {}
         self._extractor = extractor
+        #: Resolved once, at construction: which mode the gate runs in, and who reviews
+        #: which route's held passages. Reading it per recording would mean two recordings
+        #: of one poll could be classified under different rules if the file changed
+        #: underneath, and "when did it start holding these?" would have no answer.
+        self.gate = GateSettings.from_config(config)
+        self._withheld = withheld
         self._build_lock = threading.Lock()
         self._rng = random.Random()
 
@@ -378,6 +453,26 @@ class Pipeline:
                     except AnalysisConfigError as exc:
                         raise PipelineFatal(f"the analysis pass is not usable: {exc}") from exc
         return self._extractor
+
+    @property
+    def withheld(self) -> WithheldStore:
+        """The held-passage store, opened on first use and never in ``off``.
+
+        Opened at :attr:`transcriber.config.Config.held_store_path` — the path startup
+        already validated is outside the work directory — rather than at the store's own
+        default, so the path that was checked is the path that is written. A held passage is
+        the only copy of that text outside the audio, and the work directory is cleared on a
+        disk budget: a queue that empties itself when a disk fills is the one failure this
+        gate may never have.
+        """
+        if self._withheld is None:
+            with self._build_lock:
+                if self._withheld is None:
+                    path = self.gate.held_store or WithheldStore.path_beside(
+                        str(getattr(self.config, "ledger_path", ":memory:") or ":memory:")
+                    )
+                    self._withheld = WithheldStore(path, scrub=getattr(self.config, "scrub", None))
+        return self._withheld
 
     # -- the route -----------------------------------------------------------------
 
@@ -578,18 +673,39 @@ class Pipeline:
         )
         row = self.ledger.get(row.item_id) or row
 
-        # --- 5. the AI pass, then persist ANALYSED --------------------------------
+        # --- 5. the sensitivity gate reads the transcript -------------------------
+        # Before the AI pass and on the text exactly as transcribed. A trivial recording
+        # never reaches the strong model, so a gate that only read the model's answer would
+        # never read a twelve-second "don't write this down" at all.
+        report = self._assess(row, transcript)
+
+        # --- 6. the AI pass, on the UNREDACTED transcript -------------------------
+        # Its quote verification asks whether the model invented the words, and only the
+        # text as transcribed can answer that. Masking first would fail every item quoting a
+        # held passage and discard it — a redaction that destroys action items.
         extraction = self._analyse(row, transcript, hints)
-        self.ledger.advance(
-            row.item_id,
-            State.ANALYSED,
-            meta=_merge_meta(row.meta, {"analysis": _analysis_note(extraction)}),
-        )
+        report = self._assess(row, transcript, extraction, standing=report)
+
+        # --- 7. store the held words, then cut them out ---------------------------
+        gate = self._withhold(row, route, transcript, extraction, report)
+
+        # --- 8. persist ANALYSED --------------------------------------------------
+        # The redacted analysis, deliberately: `_review_row` keeps an unverifiable quote in
+        # the row so `transcriber status` can show a person what the model produced, and the
+        # ledger is printed. A held passage must not reach it any more than it reaches a file.
+        changes: dict[str, Any] = {"analysis": _analysis_note(gate.extraction)}
+        if gate.note:
+            # Only when the gate actually read the recording. An empty entry on every row in
+            # ``off`` would read like a gate that ran and found nothing, which is a different
+            # claim from a gate that was never asked.
+            changes[_META_SENSITIVITY] = gate.note
+        self.ledger.advance(row.item_id, State.ANALYSED, meta=_merge_meta(row.meta, changes))
         row = self.ledger.get(row.item_id) or row
 
-        # --- 6. write the three files, confirm them, then persist DONE ------------
-        result = self._publish(row, parsed, transcript, extraction, info, route,
-                               notes=_engine_notes(engine_meta))
+        # --- 9. write the three files, confirm them, then persist DONE ------------
+        result = self._publish(row, parsed, gate.transcript, gate.extraction, info, route,
+                               notes=_engine_notes(engine_meta) + gate.notes,
+                               held=gate.held)
         self.ledger.advance(
             row.item_id,
             State.DONE,
@@ -718,6 +834,250 @@ class Pipeline:
         )
         return extraction
 
+    # -- the sensitivity gate ------------------------------------------------------
+
+    def _assess(
+        self,
+        row: Row,
+        transcript: Transcript,
+        extraction: Any = None,
+        *,
+        standing: Any = None,
+    ) -> Any:
+        """Which passages of this transcript must not be written down yet.
+
+        Called twice for one recording, and the two calls are not a duplication.
+
+        The first, before the AI pass, runs the mechanical rules on their own: an explicit
+        instruction not to write something down, in any language, and a bare identifier that
+        validates as one. Those need no model to agree with them, and they have to run on
+        every recording — including the short ones the router never sends to the strong
+        model, which is exactly where "don't put that in writing" gets said.
+
+        The second folds in the model's own reading, which arrives inside the analysis
+        answer. When the analysis carried none — the recording was trivial, or the analysis
+        pass is not asking the question yet — the first answer stands rather than being
+        replaced by a poorer one; ``standing`` is that answer.
+
+        Offsets are into the transcript exactly as the engine returned it. Nothing has
+        rewritten it at this point and nothing may: :mod:`transcriber.redact` cuts on these
+        numbers.
+        """
+        if not self.gate.classifies:
+            return sensitivity.assess("", None, settings=self.gate)
+
+        data = None if extraction is None else getattr(extraction, "sensitive_passages", None)
+        if extraction is not None and data is None:
+            # Asked and not answered. The rules pass stands; the report says so out loud in
+            # its own notes, which reach the file a person reads when the gate is armed.
+            return standing if standing is not None else sensitivity.assess(
+                transcript.text or "", None, settings=self.gate
+            )
+        return sensitivity.assess(transcript.text or "", data, settings=self.gate)
+
+    def _withhold(
+        self,
+        row: Row,
+        route: Route,
+        transcript: Transcript,
+        extraction: Any,
+        report: Any,
+    ) -> GateResult:
+        """Store the held words, cut them out, and mask everything derived from them.
+
+        One code path for all three modes, with :attr:`GateSettings.mode` carried into it
+        and deciding one thing only: whether anything is actually cut. That is what makes
+        ``shadow`` worth running — it measures the real classifier on real recordings
+        through the same code ``on`` will use, and changes nothing about what is written.
+        Every ``if`` below that reads the mode is either "does the store call it a hold or a
+        would-have-held" or "is anything cut", and there is no third kind.
+
+        Two orderings are structural. **The store is written before the transcript is cut**,
+        because after the cut the words exist only in the audio and in that database, and a
+        store that will not take them means nothing is cut and nothing is published.
+        **Everything derived from the transcript is masked from the same redaction**, so an
+        item's quote comes out as the same words either side of the same marker — still a
+        literal substring of the published transcript, so the render-time quote check passes
+        because it is true rather than because it was loosened.
+        """
+        if not self.gate.classifies:
+            return GateResult(report=report, transcript=transcript, extraction=extraction)
+
+        text = transcript.text or ""
+        spans = held_spans_from(
+            report.would_hold(),
+            item_id=row.item_id,
+            route=route.name,
+            transcript=text,
+            site=str(getattr(extraction, "site", "") or ""),
+            source_name=row.name,
+            recorded_at=str(row.created_at or ""),
+            recorded_by=self.gate.reviewer_for(route.name),
+            principal=self._service_owner(),
+        )
+        measured = self._record_pass(row, route, spans, report, extraction)
+
+        if spans:
+            self._hold(spans)
+
+        cut, redaction, problems = redact.redact_transcript(
+            transcript, spans, mode=self.gate.mode, held_on=utc_now_iso()
+        )
+        if problems:
+            # Neither withheld silently nor published silently. A span the redactor could
+            # not find is the one case where it cannot say what the file contains, so the
+            # recording goes to a person with the reason in plain words and nothing is
+            # uploaded. Not retried: the same transcript reaches the same answer.
+            raise _ItemFault(
+                "this recording has passages that must not be written down yet, and they "
+                "could not all be taken out of the transcript, so none of its three files "
+                "has been written: " + "; ".join(problems)
+            )
+        masked, outcomes = redact.redact_extraction(extraction, redaction)
+
+        held = redaction.cut_spans
+        notes = tuple(report.notes) if redaction.armed else ()
+        if held and not str(getattr(extraction, "site", "") or "").strip():
+            # The record files a transcript's questions against a site it recognises, and a
+            # recording that names none files none — so this recording's holds would be
+            # marked in the transcript and invisible on every live page. Said out loud in
+            # the file rather than left to be discovered by an assistant answering a client
+            # from a record it does not know is partial.
+            notes = notes + (
+                "this recording had passages held for review and names no site the record "
+                "will recognise, so the marks in the transcript are the only place they are "
+                "visible — a person should say which site it belongs to",
+            )
+        note = _sensitivity_note(report, redaction, spans, measured=measured)
+        log.info(
+            "sensitivity",
+            report.describe()
+            + (f", {len(held)} cut out of the transcript" if held else "")
+            + (
+                f", {sum(1 for o in outcomes if o.action == 'held')} proposal(s) held with them"
+                if any(o.action == "held" for o in outcomes)
+                else ""
+            ),
+            mode=self.gate.mode,
+            would_hold=len(report.would_hold()),
+            cut=len(held),
+            route=route.name,
+        )
+        return GateResult(
+            report=report,
+            transcript=cut,
+            extraction=masked,
+            held=held,
+            notes=notes,
+            note=note,
+            measured=measured,
+        )
+
+    def _hold(self, spans: Sequence[HeldSpan]) -> None:
+        """Put the words in the store, before anything cuts them out of the transcript.
+
+        All of them in one transaction: a store holding four of five spans is a service that
+        has taken words out of the record with no way for anybody to ask for them back.
+
+        A store that will not take them ends the run **when the gate is armed** — nothing is
+        cut, nothing is published, the recording retries and then goes to a person, and the
+        transcript is still whole in the work directory and still whole in OneDrive.
+
+        When it is not armed it is loud and survivable, and that asymmetry is the point.
+        ``shadow`` cuts nothing, so a store it cannot write to costs a row of measurement and
+        risks nothing at all — and a measurement that can stop a recording reaching the
+        record is a measurement somebody switches off in the first bad week, which leaves the
+        gate to be armed against an estimate. That is the failure this whole mode exists to
+        prevent, so it may not be caused by it.
+        """
+        try:
+            self.withheld.hold_many(spans, mode=self.gate.mode)
+        except Exception as exc:  # noqa: BLE001 - re-raised above when it actually matters
+            if self.gate.withholds:
+                raise
+            log.error(
+                "gate-store-unavailable",
+                f"the sensitivity gate is measuring in {self.gate.mode} mode and could not "
+                f"record {len(spans)} passage(s) it would have held, so they are missing "
+                f"from the measurement the decision to arm the gate rests on. Nothing was "
+                f"withheld and nothing was lost from the record: {_plain(exc)}",
+                mode=self.gate.mode,
+                would_hold=len(spans),
+            )
+
+    def _record_pass(
+        self, row: Row, route: Route, spans: Sequence[HeldSpan], report: Any, extraction: Any
+    ) -> bool:
+        """One row per recording the classifier read, held or not. The denominator.
+
+        "Eleven passages held this week" answers nothing. "Eleven passages across 214
+        recordings, 0.4% of the text, eight of them one category" is the number that decides
+        whether the gate can be armed at all, and it is the whole reason it ships dark.
+
+        Written once per recording rather than once per attempt: a recording that retried
+        three times would otherwise contribute its characters three times and quietly
+        understate the fraction that gets held. Recorded before the hold and before the cut,
+        because a recording that was classified and then failed to publish was still
+        classified, and dropping it would flatter the number.
+
+        A store that cannot be written is fatal to a run that is withholding — the words are
+        about to be cut — and is loud but survivable to one that is not. Shadow must never
+        be able to stop a recording reaching the record: a measurement that can break the
+        service is a measurement nobody leaves switched on.
+        """
+        if (row.meta or {}).get(_META_SENSITIVITY):
+            return False
+        classifier = (
+            ",".join(str(m) for m in (getattr(extraction, "models_used", ()) or ()))
+            if getattr(report, "model_answered", False)
+            else "rules"
+        )
+        try:
+            self.withheld.record_pass(
+                row.item_id,
+                route=route.name,
+                mode=self.gate.mode,
+                spans=spans,
+                transcript_chars=int(getattr(report, "transcript_chars", 0) or 0),
+                classifier=classifier,
+                # In shadow nothing is cut, so no file carries these and the ledger row's
+                # meta is the only other place they exist — which nobody opens at 06:00.
+                # Stored here, they reach the morning email in every mode.
+                notes=tuple(getattr(report, "notes", ()) or ()),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - re-raised below when it actually matters
+            if self.gate.withholds:
+                raise
+            log.error(
+                "gate-store-unavailable",
+                f"the sensitivity gate is measuring in {self.gate.mode} mode and could not "
+                f"write to its store, so this recording is missing from the measurement the "
+                f"decision to arm the gate rests on. Nothing was withheld and nothing was "
+                f"lost from the record: {_plain(exc)}",
+                mode=self.gate.mode,
+            )
+            return False
+
+    def _service_owner(self) -> str:
+        """Who a staff disciplinary matter is held for, whoever recorded the call.
+
+        A staff member reviews their own held passages — he sees the count and the site,
+        never the words — and the one exception he named is a staff matter, which is
+        genuinely his. That needs a name for "him", and the one this service already has is
+        the address the morning email escalates the queue to. Never logged and never
+        printed, on the same footing as every other address here.
+
+        ``SMTP_TO`` is required at startup, so a running service always has one. A
+        hand-built configuration without one — a test, the selftest — leaves this empty, and
+        :func:`transcriber.withheld.reviewer_for` then falls back to whoever recorded the
+        call for a staff matter too. That is stated rather than papered over: it is the one
+        case where the routing is weaker than decision 6, and it cannot arise in a
+        deployment that started.
+        """
+        recipients = tuple(getattr(self.config, "smtp_to", ()) or ())
+        return str(recipients[0]).strip() if recipients else ""
+
     def _publish(
         self,
         row: Row,
@@ -728,6 +1088,7 @@ class Pipeline:
         route: Route,
         *,
         notes: tuple[str, ...] = (),
+        held: Sequence[HeldSpan] = (),
     ) -> outputs.UploadResult:
         # The route's folder, and only ever the route's folder. Not a service-wide default,
         # not the first route's, not the folder the recording came from. Asked before
@@ -756,6 +1117,10 @@ class Pipeline:
             web_url=row.web_url or "",
             engine=row.engine or transcript.engine or "",
             notes=tuple(notes),
+            # What was cut out of this transcript, so the renderer can refuse to publish any
+            # of the three files if one of those passages survived into one of them. Empty
+            # in every mode but ``on``: nothing was cut, so nothing can have leaked.
+            held=tuple(held),
         )
         self._refuse_name_collision(row, ctx)
         log.info("publishing", f"three files into the {route.display} output folder",
@@ -1007,6 +1372,10 @@ _NEVER_RETRY = (
     _ItemFault,
     SplitDurationError,
     SplitUnsupported,
+    # Named although ``OutputContractError`` below already covers it, because it is the one
+    # entry here whose meaning is "a held passage nearly reached the record". Retrying
+    # renders the same bytes and reaches the same answer, and a person has to look at it.
+    HeldTextWouldLeak,
     OutputContractError,
     TimestampUnavailable,
     TranscriptTooLarge,
@@ -1134,6 +1503,33 @@ def _analysis_note(extraction: Any) -> dict[str, Any]:
         "review_items": [_review_row(item) for item in review[:_MAX_REVIEW_KEPT]],
         "notes": [str(n) for n in (getattr(extraction, "notes", ()) or ())],
         "models": list(getattr(extraction, "models_used", ()) or ()),
+        "observed_by": "agent",
+    }
+
+
+def _sensitivity_note(
+    report: Any, redaction: Any, spans: Sequence[HeldSpan], *, measured: bool
+) -> dict[str, Any]:
+    """The gate's own line in the ledger row: counts, categories, references. No words.
+
+    ``transcriber status`` prints this row and a person copies it into an email, so nothing
+    here may be a word of what was held. The references are safe by construction — they are
+    printed in the published transcript beside the marker, which is how somebody asks for a
+    passage back.
+    """
+    return {
+        "at": utc_now_iso(),
+        "mode": str(getattr(report, "mode", "") or ""),
+        "model_answered": bool(getattr(report, "model_answered", False)),
+        "would_hold": len(report.would_hold()),
+        "labelled": len(report.labelled()),
+        "categories": report.counts(),
+        "held_chars": int(getattr(report, "held_chars", 0) or 0),
+        "transcript_chars": int(getattr(report, "transcript_chars", 0) or 0),
+        "cut": len(getattr(redaction, "applied", ()) or ()),
+        "refs": [span.ref for span in spans],
+        "counted_in_the_measurement": bool(measured),
+        "notes": [str(n) for n in (getattr(report, "notes", ()) or ())],
         "observed_by": "agent",
     }
 

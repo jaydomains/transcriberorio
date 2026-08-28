@@ -21,8 +21,9 @@ says "copy this", it means copy it into your password manager or a note on your 
 | 5 | Set up the morning email | 10 min | you |
 | 6 | Set up the "is it still alive" alarm | 5 min | you |
 | 7 | Choose where it runs | — | decide with me |
-| 8 | Run the setup wizard | 10 min | you |
-| 9 | Prove it works before it touches anything | 5 min | me, with you watching |
+| 8 | Set up the approval page and say who reviews what | 15 min | you |
+| 9 | Run the setup wizard | 10 min | you |
+| 10 | Prove it works before it touches anything | 5 min | me, with you watching |
 
 **Start with step 1 today.** It is the only one that might need somebody else, and everything else
 waits on it. Steps 2–6 you can do in any order while step 1 is being approved.
@@ -223,7 +224,73 @@ Let's decide this together once you know whether you have an Azure subscription.
 
 ---
 
-## Step 8 — Run the setup wizard
+## Step 8 — Set up the approval page and say who reviews what
+
+**You can skip this today and it will still work.** The service starts up *watching*: it reads
+every recording for things that should not be written down yet, notes what it would have held,
+and holds nothing. Everything goes into the record exactly as it does now. This step is what you
+do before you switch that from watching to actually holding — which is a decision you make in a
+week or two, off a real number in the morning email, not today.
+
+Do it now anyway if you can, because part of it needs a web address and that takes a day or two
+to arrange.
+
+### 8a. Who reviews whose passages
+
+**A person reviews the passages held from their own recordings.** You see how many are waiting
+and which site — never the words. Staff disciplinary matters are the exception and come to you,
+whoever recorded them.
+
+That is not politeness. Your people record voluntarily and can stop keeping a folder any time. If
+one of them works out that you read the held text from their calls, the sensible thing for them
+to do is stop recording, and then those recordings are gone — the exact loss this service was
+built to cure, arriving as a people problem instead of a technical one.
+
+So: **for every folder you set up in step 2, write down the email address of whoever records into
+it.** For your own folders, that is you.
+
+| Folder | Who records into it | Their address |
+|---|---|---|
+| Phone calls | | |
+| Site meetings | | |
+| WhatsApp voice notes | | |
+| *(one row per folder)* | | |
+
+The wizard in step 9 asks you for these, one per folder. It also refuses to switch the gate on
+later if any folder is missing one — because with it blank, everything held from that folder
+comes to you instead, including somebody's health and family circumstances.
+
+### 8b. The approval page
+
+Approving a passage takes seconds on a phone, and the link comes in the morning email. The page
+needs somewhere to live:
+
+1. It has to be **`https://`**, not `http://`. The passages travel over it.
+2. It does not need to be public — behind your office VPN is better if you have one.
+3. It needs a name. Something like `https://transcriber.kbc.co.za/held`.
+
+Tell me the address once you have it and I will point the service at it. Until then, leave it
+blank: nothing is being held, so there is nothing to approve.
+
+**About the links.** Each person gets their own link, inside their own copy of the morning email.
+**A link is a key** — anybody holding it can answer that person's queue — so it should not be
+forwarded, and it expires on its own. A fresh one arrives with each morning's email. If somebody
+loses theirs, I can mint a replacement in one command.
+
+### 8c. What you will actually decide, in a week or two
+
+Once it has been watching for a fortnight of ordinary work, the morning email will carry a small
+table. The two lines to read are **"read by the model"**, which tells you whether the number
+means anything at all, and **"that is, per day"**, which is how many times a day you would have
+to tap yes or no. If that is one or two, it is a habit and we switch it on. If it is ten, we fix
+what it is holding first — never the queue.
+
+The email will not tell you it is ready unless it genuinely is. If the reading half was not
+running, it says so and says not to switch it on.
+
+---
+
+## Step 9 — Run the setup wizard
 
 Don't edit any files. Run this:
 
@@ -285,7 +352,7 @@ on disk — I'll set that up with you.
 
 ---
 
-## Step 9 — Prove it works before it touches anything
+## Step 10 — Prove it works before it touches anything
 
 Three checks, in this order. I'll run them with you.
 
@@ -333,7 +400,11 @@ Only after those three do we turn on the loop.
       everything else failing.
 - [ ] Tell me whether you have an **Azure subscription**, so we can settle step 7.
 - [ ] Tell me **which address** the morning email should go to.
+- [ ] **Step 8a** — write down who records into each folder, and their email address. That is
+      who approves the things held back from their own calls; you see the count and the site.
+- [ ] Tell me whether you can get a **web address** for the approval page. Nothing is held until
+      you say so, so this is not urgent — but it takes the longest to arrange.
 
-Once step 1 is approved, the whole of steps 2–9 is one command: `python3 -m transcriber setup`.
+Once step 1 is approved, the whole of steps 2–10 is one command: `python3 -m transcriber setup`.
 
 Everything else can wait for the engine comparison.

@@ -52,6 +52,35 @@ Copy `.env.example` to `.env` and work through it. Every variable is explained i
   countdown in the morning email and the service stopping dead in two years' time with no
   warning at all.
 
+### The sensitivity gate
+
+It ships **watching and holding nothing**, and that is what you deploy. Leave
+`GATE_MODE=shadow`: it reads every recording, records what it *would* have held, and
+withholds nothing at all. Arming it is a separate decision, taken in a week or two off the
+measurement in the morning email — see **Holding back the things that should not be written
+down yet** in `README.md`.
+
+```
+GATE_MODE=shadow                  # off | shadow | on. Ship shadow. Nothing is withheld.
+GATE_HELD_STORE=                  # empty = beside LEDGER_PATH. MUST NOT be inside WORK_DIR.
+GATE_REVIEW_BASE_URL=             # https:// address of the approval page. Needed only for `on`.
+ROUTE_<NAME>_REVIEWER=            # per route: who approves what is held from that folder.
+```
+
+Three of these will refuse to start rather than fail quietly later:
+
+- **`GATE_HELD_STORE` inside `WORK_DIR`** is refused. `WORK_DIR` is cleared on a disk budget,
+  and a held passage is the only copy of those words outside the recording — it would be
+  deleted without anybody deciding to.
+- **`GATE_MODE=on` with no `GATE_REVIEW_BASE_URL`** is refused. There would be nowhere to
+  approve anything and nothing would ever be released.
+- **`GATE_MODE=on` with any switched-on route missing `ROUTE_<NAME>_REVIEWER`** is refused.
+  Blank means "the service owner reviews them", which sends a staff member's own health and
+  personal circumstances to the principal — the one routing the design forbids.
+
+**Back up `GATE_HELD_STORE` with the ledger.** Once the gate is armed, a held passage exists
+in exactly two places: that database and the original recording. See **Backing up**.
+
 Three variables were added after `.env.example` was first written and may not be in your
 copy — all optional, all defaulting to empty:
 
@@ -167,10 +196,15 @@ ledger records every step *before* the work that follows it.
 
 ## Backing up
 
-One file: whatever `LEDGER_PATH` points at. It is SQLite in WAL mode, so copy
-`ledger.sqlite`, `ledger.sqlite-wal` and `ledger.sqlite-shm` together, or use
-`sqlite3 ledger.sqlite ".backup /somewhere/ledger-backup.sqlite"` which is safe while the
-service is running.
+Two files: whatever `LEDGER_PATH` points at, and — once the gate is armed —
+`GATE_HELD_STORE`. Both are SQLite in WAL mode and both are backed up the same way. The held
+store matters as much as the ledger and for a sharper reason: a passage waiting for approval
+has been cut out of the transcript, so that database and the original recording are the only
+two places those words exist.
 
-The recordings and the transcripts are in OneDrive and in the record's git history. The
-ledger is the only thing that lives solely here.
+For each one: copy `<name>.sqlite`, `<name>.sqlite-wal` and `<name>.sqlite-shm` together,
+or use `sqlite3 <name>.sqlite ".backup /somewhere/<name>-backup.sqlite"`, which is safe
+while the service is running.
+
+The recordings and the transcripts are in OneDrive and in the record's git history. These
+two databases are the only things that live solely here.
