@@ -2,7 +2,7 @@
 
 The load-bearing property of this file, and the reason the service exists:
 
-    **The delta cursor moves only in the same transaction as the rows from that page.**
+    **A route's delta cursor moves only in the same transaction as that route's rows.**
 
 If the process dies between recording a page and saving the cursor, both are lost together
 and the next poll re-reads the same page. If it dies after, both survived together. There is
@@ -14,6 +14,14 @@ That is not left to a caller remembering to do two calls in the right order:
 name that looks like a delta link. Moving a cursor *backwards* is allowed
 (:meth:`Ledger.rewind_cursor`) because re-discovering a recording is harmless; only
 advancing past unrecorded rows is dangerous.
+
+Every route has its own pair of cursors — ``delta:<route>`` for the live poll and
+``sweep:<route>`` for the nightly zero-cursor re-enumeration — and every row records the
+route it arrived on. Generalising the invariant did not weaken it: :meth:`Ledger.record_page`
+still writes rows and cursor in one transaction, and it now writes *that route's* rows and
+*that route's* cursor, so a page lost by one route cannot move another route's mark. Build
+the cursor names with :func:`delta_cursor_name` / :func:`sweep_cursor_name` rather than by
+hand: a caller that formats the string itself is a caller that can format it differently.
 
 Claiming is a single conditional UPDATE with a lease, so two workers cannot hold the same
 recording and a worker that dies does not strand one: the lease expires and the file is
@@ -28,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import sqlite3
 import threading
@@ -36,10 +45,12 @@ from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from .models import (
+    DEFAULT_ROUTE,
     DriveItem,
     Row,
     State,
     day_of,
+    is_route_name,
     strip_dictated_emails,
     strip_emails,
     strip_owner_paths,
@@ -51,16 +62,63 @@ __all__ = [
     "LedgerError",
     "LedgerInvariantError",
     "LedgerStateError",
+    "DEFAULT_ROUTE",
     "DELTA_CURSOR",
     "SWEEP_CURSOR",
+    "delta_cursor_name",
+    "sweep_cursor_name",
+    "route_cursor_names",
     "SCHEMA_VERSION",
 ]
 
-DELTA_CURSOR = "delta:source"   # the live poll's cursor
-SWEEP_CURSOR = "delta:sweep"    # the nightly zero-cursor re-enumeration's own mark
 
-#: Cursors under these names are delta links and may only be written by record_page.
+def delta_cursor_name(route: str = DEFAULT_ROUTE) -> str:
+    """The live poll's cursor for one route: ``delta:calls``.
+
+    A function rather than an f-string at each call site because five modules need this
+    name and they must all produce the *same* one — a worker polling ``delta:calls`` while
+    the sweep rewinds ``delta:Calls`` is a route that re-reads its whole folder nightly and
+    a bug nothing would report.
+    """
+    return f"delta:{_cursor_route(route)}"
+
+
+def sweep_cursor_name(route: str = DEFAULT_ROUTE) -> str:
+    """The nightly zero-cursor re-enumeration's own mark for one route: ``sweep:calls``."""
+    return f"sweep:{_cursor_route(route)}"
+
+
+def route_cursor_names(route: str = DEFAULT_ROUTE) -> tuple[str, str]:
+    """Both of a route's delta cursors, live first — for ``status`` and for rewinding a route."""
+    return delta_cursor_name(route), sweep_cursor_name(route)
+
+
+def _cursor_route(route: str) -> str:
+    name = (route or "").strip()
+    if not is_route_name(name):
+        raise LedgerError(
+            f"{route!r} is not a usable route name, and a cursor key cannot be built from "
+            "it — route names are lowercase letters, digits and hyphens"
+        )
+    return name
+
+
+DELTA_CURSOR = "delta:default"   # the live poll's cursor for the one route a legacy .env has
+SWEEP_CURSOR = "sweep:default"   # and that route's nightly re-enumeration mark
+
+#: A cursor holding a delta link may only be written by record_page. Two shapes qualify:
+#: anything under ``delta`` (which is where they have always lived, including the backfill's
+#: own ``delta:backfill``) and a route's ``sweep:<route>``. The sweep pass keeps other marks
+#: under the same ``sweep:`` prefix — ``sweep:last_attempt_at``, ``sweep:last_report`` — and
+#: those are ordinary bookkeeping; a route name cannot contain an underscore, which is what
+#: keeps the two apart.
 _GUARDED_PREFIX = "delta"
+_ROUTE_DELTA_CURSOR_RE = re.compile(r"^(?:delta|sweep):[a-z0-9][a-z0-9-]*$")
+
+
+def is_delta_cursor(name: str) -> bool:
+    """True when this cursor holds a delta link and may only move alongside its rows."""
+    return str(name).startswith(_GUARDED_PREFIX) or bool(_ROUTE_DELTA_CURSOR_RE.match(str(name)))
 
 
 class LedgerError(RuntimeError):
@@ -75,7 +133,7 @@ class LedgerStateError(LedgerError):
     """An attempt to move a row somewhere the state machine does not allow."""
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Migrations run in order, each in its own transaction, each recorded. To add one: append
 # (2, "note", (sql, sql, ...)) below and raise SCHEMA_VERSION. Never edit an entry that has
@@ -150,11 +208,35 @@ _MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS idx_events_at ON events(at)",
         ),
     ),
+    (
+        2,
+        "routes: one column on every row, one pair of cursors per route",
+        (
+            # Defaulting to 'default' rather than to NULL is the whole point of this step: a
+            # database written before routes existed holds the rows of the one route a
+            # single-folder .env describes, and after the upgrade they have to read back as
+            # exactly that route — not as a route nobody can name.
+            "ALTER TABLE items ADD COLUMN route TEXT NOT NULL DEFAULT 'default'",
+            "CREATE INDEX IF NOT EXISTS idx_items_route ON items(route)",
+            # The two cursors move to their per-route names carrying their values with them.
+            # Dropping them instead would be safe — a rewound cursor re-reads pages we
+            # already hold — but it would make every upgraded installation re-enumerate its
+            # whole source folder on the first poll, which looks exactly like a fault.
+            # OR REPLACE covers the case where the new name somehow already exists; the
+            # value being moved is the older one either way, and re-reading loses nothing.
+            "UPDATE OR REPLACE cursors SET name='delta:default' WHERE name='delta:source'",
+            "UPDATE OR REPLACE cursors SET name='sweep:default' WHERE name='delta:sweep'",
+        ),
+    ),
 )
 
 # Columns advance()/set_fields() may never write directly: identity, the state machine's own
 # column, and the discovery stamp, which is history.
-_PROTECTED_COLUMNS = frozenset({"item_id", "state", "discovered_at"})
+#: ``route`` is protected for the same reason ``item_id`` is: it decides which folder this
+#: recording's transcript is written to and which archive it ages into, so a stray
+#: ``set_fields(route=...)`` would silently redirect a finished recording's outputs.
+#: :meth:`Ledger.reassign_route` is the deliberate way, and it records why.
+_PROTECTED_COLUMNS = frozenset({"item_id", "state", "discovered_at", "route"})
 _JSON_COLUMNS = frozenset({"output_item_ids", "meta"})
 
 

@@ -35,6 +35,12 @@ __all__ = [
     "OWNER_PATH_RE",
     "strip_owner_paths",
     "AUDIO_EXTENSIONS",
+    "DEFAULT_ROUTE",
+    "ROUTE_NAME_RE",
+    "is_route_name",
+    "route_env_stem",
+    "route_env_var",
+    "Route",
     "State",
     "DriveItem",
     "Row",
@@ -134,6 +140,95 @@ def utc_now_iso(now: float | None = None) -> str:
 def day_of(stamp: str | None) -> str:
     """The ``YYYY-MM-DD`` part of one of our timestamps, or '' if there isn't one."""
     return (stamp or "")[:10]
+
+
+#: The name of the one route a `.env` written before routes existed describes. A ledger row
+#: with no route recorded is that route's, which is why the column defaults to it rather
+#: than to NULL: an upgraded database has to read back as correct, not as unknown.
+DEFAULT_ROUTE = "default"
+
+#: What a route may be called. Lowercase, digits and hyphens, starting with a letter or a
+#: digit — because the name is not decoration: it is half of a cursor key
+#: (``delta:site-meetings``), a column value in the ledger, and the middle of an environment
+#: variable name. Anything that would need quoting, case-folding or escaping in one of those
+#: three places is refused here instead of going wrong in one of them later.
+ROUTE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def is_route_name(name: str | None) -> bool:
+    return bool(name) and bool(ROUTE_NAME_RE.match(name or ""))
+
+
+def route_env_stem(name: str) -> str:
+    """``site-meetings`` -> ``SITE_MEETINGS``: the middle of that route's variables.
+
+    One function rather than three copies of ``name.upper().replace("-", "_")``, because
+    config, the wizard and the ``routes`` command all have to arrive at the *same* variable
+    name or a route reads its folders from settings nobody ever wrote.
+    """
+    return (name or "").strip().upper().replace("-", "_")
+
+
+def route_env_var(name: str, suffix: str) -> str:
+    """The full variable: ``route_env_var("site-meetings", "source")`` -> ``ROUTE_SITE_MEETINGS_SOURCE``."""
+    return f"ROUTE_{route_env_stem(name)}_{(suffix or '').strip().upper()}"
+
+
+@dataclass(frozen=True)
+class Route:
+    """One watched folder and where its results go.
+
+    A kind of recording, in his words: phone calls, site meetings, WhatsApp voice notes,
+    whatever the next device drops somewhere else. The service runs N of these, each with
+    its own delta cursor, and the route a recording arrived on travels with it all the way
+    to the folder its transcript lands in.
+
+    Frozen because a route is read by the worker, the pipeline, the archive pass and the
+    digest, on different threads, throughout a run: a route that could be edited underneath
+    them is a recording written to a folder nobody chose. Changing one means writing the
+    ``.env`` and restarting, which is also the only way the change is durable.
+
+    ``archive_folder_id`` empty means this route never archives — a deliberate value, not a
+    missing one. ``engine`` empty means the service default. ``enabled`` false means the
+    folder is not watched, and nothing else: the ledger history of everything it ever
+    processed is untouched, which is what makes pausing a route safe.
+    """
+
+    name: str
+    label: str = ""
+    source_folder_id: str = ""
+    output_folder_id: str = ""
+    archive_folder_id: str = ""
+    engine: str = ""
+    enabled: bool = True
+
+    @property
+    def display(self) -> str:
+        """What to call it in a sentence a person reads. Never empty."""
+        return (self.label or "").strip() or self.name
+
+    @property
+    def archives(self) -> bool:
+        """False means aged recordings stay where they are — skipped, not an error."""
+        return bool((self.archive_folder_id or "").strip())
+
+    @property
+    def env_stem(self) -> str:
+        return route_env_stem(self.name)
+
+    def env_var(self, suffix: str) -> str:
+        return route_env_var(self.name, suffix)
+
+    def describe(self) -> str:
+        """One plain line for a log, a report or the ``routes`` listing."""
+        parts = [f"{self.display} ({self.name})"]
+        if not self.enabled:
+            parts.append("paused")
+        if self.engine:
+            parts.append(f"engine {self.engine}")
+        if not self.archives:
+            parts.append("never archives")
+        return ", ".join(parts)
 
 
 class State:
@@ -298,6 +393,10 @@ class Row:
     item_id: str
     name: str = ""
     state: str = State.DISCOVERED
+    #: Which route this recording arrived on. It decides where its transcript is written and
+    #: which archive folder, if any, it ages into, so it travels with the row rather than
+    #: being re-derived later from a parent folder that may since have changed.
+    route: str = DEFAULT_ROUTE
     size: int = 0
     etag: str | None = None
     parent_id: str | None = None

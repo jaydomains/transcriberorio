@@ -12,10 +12,19 @@ from any string about to be logged or emailed. The address-shaped settings (the 
 principal name, the SMTP envelope) are redacted on the same footing, because the house rule
 is that this service never prints an email address anywhere, for any reason.
 
+**Routes are the unit of configuration.** A route is one watched folder and where its
+results go, and the service runs N of them. ``ROUTES`` names them; each one's folders come
+from its own variables. A ``.env`` written before routes existed has none of that, so its
+``SOURCE_FOLDER_ID`` / ``OUTPUT_FOLDER_ID`` / ``ARCHIVE_FOLDER_ID`` become exactly one route
+called ``default`` and it keeps working untouched. ``config.routes`` is therefore never
+empty, and the three single-folder attributes remain readable as the first route's folders
+so a module that has not been migrated yet still sees what it always saw.
+
 Environment variables, all read by :meth:`Config.from_env`::
 
     GRAPH_TENANT_ID GRAPH_CLIENT_ID GRAPH_CLIENT_SECRET GRAPH_USER_ID
-    SOURCE_FOLDER_ID OUTPUT_FOLDER_ID ARCHIVE_FOLDER_ID
+    ROUTES + per route ROUTE_<NAME>_LABEL _SOURCE _OUTPUT _ARCHIVE _ENGINE _ENABLED
+    SOURCE_FOLDER_ID OUTPUT_FOLDER_ID ARCHIVE_FOLDER_ID   (the single-folder form, still read)
     TRANSCRIBE_ENGINE  + one of OPENAI_API_KEY | ELEVENLABS_API_KEY | AZURE_SPEECH_KEY
                        (+ AZURE_SPEECH_REGION when the engine is azure)
     ANALYSIS_API_KEY ANALYSIS_BASE_URL ANALYSIS_MODEL_CHEAP ANALYSIS_MODEL_STRONG
@@ -34,12 +43,21 @@ import os
 import stat
 import tempfile
 from datetime import date as _date
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from typing import Any, Mapping, Sequence
+
+from .models import DEFAULT_ROUTE, Route, is_route_name, route_env_var
 
 log = logging.getLogger("transcriber.config")
 
-__all__ = ["Config", "ConfigError", "ENGINES", "ENGINE_KEY_VARS", "make_private_dir"]
+__all__ = [
+    "Config",
+    "ConfigError",
+    "ENGINES",
+    "ENGINE_KEY_VARS",
+    "ROUTE_SUFFIXES",
+    "make_private_dir",
+]
 
 ENGINES = ("openai", "elevenlabs", "azure")
 ENGINE_KEY_VARS = {
@@ -54,6 +72,7 @@ SECRET_FIELDS = frozenset(
         "graph_client_secret",
         "graph_user_id",
         "engine_key",
+        "engine_keys",
         "analysis_api_key",
         "smtp_user",
         "smtp_password",
@@ -62,6 +81,18 @@ SECRET_FIELDS = frozenset(
         "heartbeat_url",
     }
 )
+
+#: The per-route settings, in the order the wizard asks for them and the ``.env`` writes
+#: them. One list, so config, the wizard and the ``routes`` command cannot disagree about
+#: what a route is made of.
+ROUTE_SUFFIXES = ("LABEL", "SOURCE", "OUTPUT", "ARCHIVE", "ENGINE", "ENABLED")
+
+#: The single-folder variables a pre-routes ``.env`` uses, and the route field each becomes.
+LEGACY_FOLDER_VARS = {
+    "SOURCE_FOLDER_ID": "source_folder_id",
+    "OUTPUT_FOLDER_ID": "output_folder_id",
+    "ARCHIVE_FOLDER_ID": "archive_folder_id",
+}
 
 _REQUIRED = object()  # sentinel: no default, must be supplied
 
@@ -95,9 +126,13 @@ _SPEC: tuple[_Var, ...] = (
     _Var("graph_client_id", "GRAPH_CLIENT_ID", "str", _REQUIRED, "app registration (client) id"),
     _Var("graph_client_secret", "GRAPH_CLIENT_SECRET", "str", _REQUIRED, "app registration client secret"),
     _Var("graph_user_id", "GRAPH_USER_ID", "str", _REQUIRED, "id or principal name of the OneDrive owner"),
-    _Var("source_folder_id", "SOURCE_FOLDER_ID", "str", _REQUIRED, "driveItem id of the recordings folder (/CALLS)"),
-    _Var("output_folder_id", "OUTPUT_FOLDER_ID", "str", _REQUIRED, "driveItem id of the folder the .md outputs are written to"),
-    _Var("archive_folder_id", "ARCHIVE_FOLDER_ID", "str", _REQUIRED, "driveItem id of the folder aged recordings are moved to"),
+    # The single-folder form, from before routes existed. No longer required — a .env that
+    # sets ROUTES does not need them — but still read, and still the whole configuration of
+    # a service that has never been migrated. Whether one is missing is decided by the route
+    # validation below, which knows whether it is looking at a route or at this.
+    _Var("source_folder_id", "SOURCE_FOLDER_ID", "str", "", "driveItem id of the recordings folder (/CALLS), when there is only one; with ROUTES set, each route names its own"),
+    _Var("output_folder_id", "OUTPUT_FOLDER_ID", "str", "", "driveItem id of the folder the .md outputs are written to, when there is only one"),
+    _Var("archive_folder_id", "ARCHIVE_FOLDER_ID", "str", "", "driveItem id of the folder aged recordings are moved to, when there is only one; empty means never archive"),
     _Var("orphan_folder_id", "ORPHAN_FOLDER_ID", "str", "", "optional folder a half-written output set is moved aside to; left unset, strays are named in the error and replaced on the next attempt"),
     _Var("graph_secret_expires_on", "GRAPH_SECRET_EXPIRES_ON", "str", "", "ISO date the Entra client secret expires; the digest counts down to it (optional but strongly recommended)"),
     # --- transcription engine --------------------------------------------------------
@@ -154,6 +189,15 @@ class Config:
     graph_client_id: str = ""
     graph_client_secret: str = ""
     graph_user_id: str = ""
+    #: Every route the service runs, in the order they were configured. **Never empty**: a
+    #: configuration with no ``ROUTES`` is exactly one route called ``default``, built from
+    #: the three single-folder variables below, so every caller can loop over this without
+    #: a special case for the old shape.
+    routes: tuple[Route, ...] = ()
+    #: The first route's folders, kept readable under their old names so a module that has
+    #: not been migrated to routes yet still sees what it always saw. They are derived, not
+    #: separate state — assigning one writes through to ``routes[0]``, so the two can never
+    #: drift apart and quietly send a transcript to a folder nobody chose.
     source_folder_id: str = ""
     output_folder_id: str = ""
     archive_folder_id: str = ""
@@ -165,6 +209,10 @@ class Config:
     # engine
     engine: str = "openai"
     engine_key: str = ""
+    #: Engine name -> API key, for every engine any route actually uses. A route may
+    #: override the service engine, and an override with no key is a route that cannot
+    #: transcribe anything — caught at startup rather than at the first recording.
+    engine_keys: dict[str, str] = field(default_factory=dict)
     engine_base_url: str = ""
     azure_region: str = ""
     # analysis
@@ -205,6 +253,87 @@ class Config:
     http_timeout_s: int = 60
     max_retries: int = 5
     log_level: str = "INFO"
+    #: Things that are not wrong enough to refuse to start but that a person should know
+    #: about the configuration they wrote — in plain English, one per line. Logged at
+    #: WARNING on startup and available to ``status`` and the digest, because a notice that
+    #: only ever went to a log file is a notice nobody read.
+    notices: tuple[str, ...] = ()
+
+    # -- routes -------------------------------------------------------------------
+
+    def __post_init__(self) -> None:
+        """Make ``routes`` authoritative, whichever way this Config was built.
+
+        Constructed from ``from_env`` the routes are already parsed and validated.
+        Constructed directly — a test, ``offline()``, the wizard — there may be only the
+        three single-folder values, and those are one route called ``default``. Either way
+        the object leaves here with at least one route and the legacy attributes reading as
+        that route's folders.
+        """
+        routes = tuple(self.routes or ())
+        if not routes:
+            routes = (
+                Route(
+                    name=DEFAULT_ROUTE,
+                    label="Recordings",
+                    source_folder_id=self.source_folder_id,
+                    output_folder_id=self.output_folder_id,
+                    archive_folder_id=self.archive_folder_id,
+                ),
+            )
+        object.__setattr__(self, "routes", routes)
+        self._mirror_first_route()
+        object.__setattr__(self, "_routes_ready", True)
+
+    def _mirror_first_route(self) -> None:
+        first = self.routes[0]
+        for name in LEGACY_FOLDER_VARS.values():
+            object.__setattr__(self, name, getattr(first, name))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Keep the derived folder attributes and ``routes[0]`` as one fact, not two.
+
+        The three single-folder attributes are what the unmigrated modules read. Making them
+        plain fields would let a config be written on one side and read on the other, which
+        is how a transcript ends up in a folder nobody configured; making them read-only
+        would break every caller that still assigns one. So a write goes *through* to the
+        first route, and every read comes back from it.
+        """
+        if name in LEGACY_FOLDER_VARS.values() and getattr(self, "_routes_ready", False):
+            object.__setattr__(self, name, value)
+            first = replace(self.routes[0], **{name: value})
+            object.__setattr__(self, "routes", (first, *self.routes[1:]))
+            return
+        object.__setattr__(self, name, value)
+
+    @property
+    def enabled_routes(self) -> tuple[Route, ...]:
+        """The routes actually watched. A paused route keeps its ledger history and its cursor."""
+        return tuple(r for r in self.routes if r.enabled)
+
+    @property
+    def route_names(self) -> tuple[str, ...]:
+        return tuple(r.name for r in self.routes)
+
+    def route(self, name: str) -> Route | None:
+        """One route by name, or None. Callers say what they will do about a missing one."""
+        wanted = (name or "").strip()
+        for candidate in self.routes:
+            if candidate.name == wanted:
+                return candidate
+        return None
+
+    def engine_for(self, route: Route | str | None = None) -> str:
+        """Which engine transcribes this route's recordings — its override, or the default."""
+        found = self.route(route) if isinstance(route, str) else route
+        return (getattr(found, "engine", "") or "").strip() or self.engine
+
+    def engine_key_for(self, route: Route | str | None = None) -> str:
+        """The API key for whichever engine this route uses. Empty is a configuration fault."""
+        engine = self.engine_for(route)
+        if engine in self.engine_keys:
+            return self.engine_keys[engine]
+        return self.engine_key if engine == self.engine else ""
 
     # -- construction -------------------------------------------------------------
 
@@ -241,12 +370,15 @@ class Config:
         # The engine's key lives under the engine's own variable name, so an operator
         # switching engines cannot leave the previous engine's key in place and have it
         # silently used.
+        engine_keys: dict[str, str] = {}
         key_var = ENGINE_KEY_VARS.get(engine)
         if key_var:
             engine_key = (source.get(key_var) or "").strip()
             if not engine_key:
                 problems.append(f"{key_var} is not set — the API key for the {engine} transcription engine")
             values["engine_key"] = engine_key
+            if engine_key:
+                engine_keys[engine] = engine_key
         if engine == "azure" and not values.get("azure_region"):
             problems.append("AZURE_SPEECH_REGION is not set — required when TRANSCRIBE_ENGINE=azure")
 
@@ -285,27 +417,59 @@ class Config:
         if not 1 <= values.get("archive_day_of_month", 1) <= 28:
             problems.append("ARCHIVE_DAY_OF_MONTH must be 1-28, so it exists in February too")
 
-        # Three distinct folders, checked here rather than discovered later. Point
-        # OUTPUT_FOLDER_ID at the source folder — a natural reading of the record's own
-        # "folder = wherever the transcriber writes" — and the live poll classifies every
-        # non-audio item in it as our own output and drops it with no ledger row at all. The
-        # nightly sweep shares that classify call, so the backstop inherits the primary's
-        # exact blind spot, and the only symptom is a zero-arrival alert naming the wrong cause.
-        named = {
-            "SOURCE_FOLDER_ID": values.get("source_folder_id"),
-            "OUTPUT_FOLDER_ID": values.get("output_folder_id"),
-            "ARCHIVE_FOLDER_ID": values.get("archive_folder_id"),
-            "ORPHAN_FOLDER_ID": values.get("orphan_folder_id"),
-        }
-        given = [(name, str(value).strip()) for name, value in named.items() if str(value or "").strip()]
-        for index, (first_name, first_value) in enumerate(given):
-            for second_name, second_value in given[index + 1:]:
-                if first_value == second_value:
-                    problems.append(
-                        f"{first_name} and {second_name} are the same folder "
-                        f"({first_value!r}); they must be three different folders, or files "
-                        f"this service writes are indistinguishable from files it must read"
-                    )
+        # The routes, and every way a set of them can be wrong. Folder identity is checked
+        # here rather than discovered later, because the failures it prevents are silent:
+        # point a route's output at some route's source and the service reads its own
+        # transcripts back in as recordings; watch one folder from two routes and whichever
+        # cursor moves first carries the other past a recording it never saw.
+        routes, declared = _routes_from_env(source, problems)
+        _validate_routes(
+            routes,
+            declared=declared,
+            orphan_folder_id=str(values.get("orphan_folder_id") or "").strip(),
+            problems=problems,
+        )
+        values["routes"] = routes
+
+        # A route may transcribe with a different engine from the service default, and an
+        # override whose key was never set is a route that fails on its first recording.
+        for route in routes:
+            override = (route.engine or "").strip().lower()
+            if not route.enabled or not override or override not in ENGINE_KEY_VARS:
+                continue
+            route_key_var = ENGINE_KEY_VARS[override]
+            route_key = (source.get(route_key_var) or "").strip()
+            if route_key:
+                engine_keys[override] = route_key
+            else:
+                problems.append(
+                    f"{route_key_var} is not set — {_route_phrase(route)} is set to "
+                    f"transcribe with {override}, which needs its own API key"
+                )
+            if override == "azure" and not str(source.get("AZURE_SPEECH_REGION") or "").strip():
+                problems.append(
+                    f"AZURE_SPEECH_REGION is not set — {_route_phrase(route)} is set "
+                    "to transcribe with azure, which needs the region as well as the key"
+                )
+        values["engine_keys"] = engine_keys
+
+        # Both forms present. ROUTES wins, as documented — but silently preferring one over
+        # the other leaves an operator editing SOURCE_FOLDER_ID and wondering why nothing
+        # changes, so it is said out loud instead.
+        notices: list[str] = []
+        if declared:
+            stale = sorted(
+                var for var in LEGACY_FOLDER_VARS if str(source.get(var) or "").strip()
+            )
+            if stale:
+                notices.append(
+                    "This .env lists routes in ROUTES and also still sets "
+                    + ", ".join(stale)
+                    + ". The routes are what the service uses; those older single-folder "
+                    "settings are ignored completely. Delete them so the file says what the "
+                    "service actually does."
+                )
+        values["notices"] = tuple(notices)
 
         for name in ("graph_secret_expires_on", "engine_key_expires_on", "analysis_key_expires_on"):
             raw = str(values.get(name) or "").strip()
@@ -329,6 +493,8 @@ class Config:
             raise ConfigError(problems)
 
         config = cls(**values)
+        for notice in config.notices:
+            log.warning("%s", notice)
         _make_private(config.work_dir)
         return config
 
@@ -375,6 +541,8 @@ class Config:
             value = getattr(self, name, None)
             if isinstance(value, str) and len(value) >= 4:
                 values.append(value)
+            elif isinstance(value, Mapping):
+                values.extend(v for v in value.values() if isinstance(v, str) and len(v) >= 4)
             elif isinstance(value, (tuple, list)):
                 values.extend(v for v in value if isinstance(v, str) and len(v) >= 4)
         return tuple(values)
@@ -395,6 +563,270 @@ class Config:
         return "Config(" + ", ".join(parts) + ")"
 
     __str__ = __repr__
+
+
+def _routes_from_env(
+    source: Mapping[str, str], problems: list[str]
+) -> tuple[tuple[Route, ...], bool]:
+    """Every configured route, and whether ``ROUTES`` was the thing that configured them.
+
+    Two shapes are supported and only two. ``ROUTES=calls,site-meetings`` names the routes
+    and each one's folders come from its own variables; nothing at all means the
+    single-folder ``.env`` written before routes existed, which is one route called
+    ``default``. The second is not a deprecated path to be tolerated — it is the shape of
+    every installation in the field, and it must keep working untouched.
+    """
+    raw = str(source.get("ROUTES") or "").strip()
+    if not raw:
+        return (
+            (
+                Route(
+                    name=DEFAULT_ROUTE,
+                    label="Recordings",
+                    source_folder_id=str(source.get("SOURCE_FOLDER_ID") or "").strip(),
+                    output_folder_id=str(source.get("OUTPUT_FOLDER_ID") or "").strip(),
+                    archive_folder_id=str(source.get("ARCHIVE_FOLDER_ID") or "").strip(),
+                    engine="",
+                    enabled=True,
+                ),
+            ),
+            False,
+        )
+
+    routes: list[Route] = []
+    seen: set[str] = set()
+    for name in [part.strip() for part in raw.replace("\n", ",").split(",")]:
+        if not name:
+            continue
+        if not is_route_name(name):
+            problems.append(
+                f"ROUTES lists {name!r}, which is not a usable route name — a route name is "
+                "lowercase letters, digits and hyphens, starting with a letter or a digit "
+                f"(so {_suggest_route_name(name)!r} rather than {name!r}). The name is used "
+                "as a key in the ledger and in the environment variable names for its "
+                "folders, which is why it cannot contain anything else."
+            )
+            continue
+        if name in seen:
+            problems.append(
+                f"ROUTES lists {name!r} twice — each route is named once, because its name "
+                "is what its folders, its cursor and its ledger rows are keyed on"
+            )
+            continue
+        seen.add(name)
+
+        def var(suffix: str) -> str:
+            return str(source.get(route_env_var(name, suffix)) or "").strip()
+
+        engine = var("ENGINE").lower()
+        if engine and engine not in ENGINES:
+            problems.append(
+                f"{route_env_var(name, 'ENGINE')}={engine!r} is not a known engine — "
+                "one of: " + ", ".join(ENGINES) + ", or leave it empty to use the service default"
+            )
+            engine = ""
+
+        enabled_raw = var("ENABLED")
+        enabled = True
+        if enabled_raw:
+            lowered = enabled_raw.lower()
+            if lowered in ("1", "true", "yes", "on"):
+                enabled = True
+            elif lowered in ("0", "false", "no", "off"):
+                enabled = False
+            else:
+                problems.append(
+                    f"{route_env_var(name, 'ENABLED')}={enabled_raw!r} is not usable — "
+                    "expected true or false"
+                )
+
+        routes.append(
+            Route(
+                name=name,
+                label=var("LABEL"),
+                source_folder_id=var("SOURCE"),
+                output_folder_id=var("OUTPUT"),
+                archive_folder_id=var("ARCHIVE"),
+                engine=engine,
+                enabled=enabled,
+            )
+        )
+    return tuple(routes), True
+
+
+def _suggest_route_name(name: str) -> str:
+    """What the operator probably meant, so the error can show it rather than describe it."""
+    cleaned = "".join(
+        c if c.isalnum() else "-" for c in (name or "").strip().lower()
+    ).strip("-")
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    return cleaned or "calls"
+
+
+def _route_phrase(route: Route) -> str:
+    """How a route is named in a sentence somebody reads.
+
+    ``Phone calls (calls)`` when it has a label, ``route 'calls'`` when it does not — never
+    ``calls (calls)``, which is what naming a thing twice looks like.
+    """
+    label = (route.label or "").strip()
+    return f"{label} ({route.name})" if label else f"route {route.name!r}"
+
+
+def _folder_var(route: Route, suffix: str, *, declared: bool) -> str:
+    """The variable an operator has to edit to fix this route's folder.
+
+    Which one it is depends on how the service was configured, and telling somebody to set
+    ``ROUTE_DEFAULT_SOURCE`` when their file says ``SOURCE_FOLDER_ID`` sends them looking
+    for a setting that is not there.
+    """
+    if declared:
+        return route_env_var(route.name, suffix)
+    return {"SOURCE": "SOURCE_FOLDER_ID", "OUTPUT": "OUTPUT_FOLDER_ID",
+            "ARCHIVE": "ARCHIVE_FOLDER_ID"}[suffix]
+
+
+def _validate_routes(
+    routes: Sequence[Route],
+    *,
+    declared: bool,
+    orphan_folder_id: str,
+    problems: list[str],
+) -> None:
+    """Every way a set of routes can be wrong, reported together and in plain words.
+
+    The feedback-loop rule is the one that matters. Everything else here costs an operator
+    a restart; that one, left in, has the service transcribing its own transcripts as
+    though they were recordings, for as long as nobody notices.
+
+    Two routes **sharing an output folder is deliberately allowed**. Pooling several kinds
+    of recording into one folder is a thing he asked for, so it is not quietly forbidden
+    here on the grounds of tidiness.
+    """
+    enabled = [r for r in routes if r.enabled]
+    if not routes:
+        problems.append(
+            "there are no routes to run — set ROUTES to at least one route name, or set "
+            "SOURCE_FOLDER_ID and OUTPUT_FOLDER_ID for a single watched folder"
+        )
+        return
+    if not enabled:
+        problems.append(
+            "every route is switched off ("
+            + ", ".join(f"{_route_phrase(r)}" for r in routes)
+            + ") — nothing would be watched and nothing would be transcribed. Switch at "
+            "least one back on."
+        )
+
+    for route in enabled:
+        if not route.source_folder_id:
+            problems.append(
+                f"{_folder_var(route, 'SOURCE', declared=declared)} is not set — "
+                + (
+                    f"{_route_phrase(route)} has no folder to watch for recordings"
+                    if declared
+                    else "the folder recordings arrive in. Set it, or list your routes in "
+                         "ROUTES and give each one its own folders."
+                )
+            )
+        if not route.output_folder_id:
+            problems.append(
+                f"{_folder_var(route, 'OUTPUT', declared=declared)} is not set — "
+                + (
+                    f"{_route_phrase(route)} has nowhere to write its transcripts"
+                    if declared
+                    else "the folder the transcripts, summaries and actions are written to"
+                )
+            )
+
+    # 4. The feedback loop. Checked across every route, switched on or off, because a paused
+    #    route is a folder somebody will switch back on without re-reading the whole file.
+    for writer in routes:
+        if not writer.output_folder_id:
+            continue
+        for watcher in routes:
+            if not watcher.source_folder_id or writer.output_folder_id != watcher.source_folder_id:
+                continue
+            if writer.name == watcher.name:
+                problems.append(
+                    f"{_route_phrase(writer)} writes its transcripts into the very "
+                    "folder it watches for recordings — the service would read its own "
+                    "transcripts back in as new recordings and transcribe them again, over "
+                    "and over. Send its transcripts somewhere else."
+                )
+            else:
+                problems.append(
+                    f"{_route_phrase(writer)} writes its transcripts into the folder "
+                    f"{_route_phrase(watcher)} watches for recordings — the service "
+                    "would read its own transcripts back in as new recordings and transcribe "
+                    "them again. One of those two folders has to change."
+                )
+
+    # 5. One folder, one route. Two cursors over one folder is two claims on one recording.
+    for index, first in enumerate(enabled):
+        if not first.source_folder_id:
+            continue
+        for second in enabled[index + 1:]:
+            if first.source_folder_id != second.source_folder_id:
+                continue
+            problems.append(
+                f"{_route_phrase(first)} and {_route_phrase(second)} watch "
+                "the same folder — a recording can only belong to one route, and whichever "
+                "of the two saw it first would own it while the other moved its cursor past "
+                "it as though it had been handled"
+            )
+
+    # 7. The archive holds untouched originals, so it can be neither a folder we read from
+    #    nor a folder we write to.
+    for archiver in routes:
+        if not archiver.archives:
+            continue
+        for other in routes:
+            if other.source_folder_id and archiver.archive_folder_id == other.source_folder_id:
+                where = (
+                    "the very folder it watches"
+                    if archiver.name == other.name
+                    else f"the folder {_route_phrase(other)} watches"
+                )
+                problems.append(
+                    f"{_route_phrase(archiver)} archives its old recordings into "
+                    f"{where} for recordings — every recording it filed away would be "
+                    "discovered all over again the moment it was moved"
+                )
+            if other.output_folder_id and archiver.archive_folder_id == other.output_folder_id:
+                whose = (
+                    "its own transcripts"
+                    if archiver.name == other.name
+                    else f"the transcripts of {_route_phrase(other)}"
+                )
+                problems.append(
+                    f"{_route_phrase(archiver)} archives its old recordings into "
+                    f"the folder that holds {whose} — the archive is meant to be the "
+                    "untouched original recordings, and mixing the two makes it neither"
+                )
+
+    if orphan_folder_id:
+        for route in routes:
+            if orphan_folder_id == route.source_folder_id:
+                problems.append(
+                    "ORPHAN_FOLDER_ID is the folder "
+                    f"{_route_phrase(route)} watches — a half-written output set "
+                    "moved aside into it would be picked up as though it were a new recording"
+                )
+            if orphan_folder_id == route.output_folder_id:
+                problems.append(
+                    "ORPHAN_FOLDER_ID is the folder "
+                    f"{_route_phrase(route)} writes its transcripts to — a half-written "
+                    "set moved aside into it would sit alongside the good ones with nothing "
+                    "to tell them apart"
+                )
+            if route.archives and orphan_folder_id == route.archive_folder_id:
+                problems.append(
+                    "ORPHAN_FOLDER_ID is the folder "
+                    f"{_route_phrase(route)} archives recordings into — the archive is "
+                    "for finished originals, not for the wreckage of a failed write"
+                )
 
 
 def _env_of(name: str) -> str:
@@ -439,8 +871,12 @@ def _coerce(var: _Var, raw: Any) -> Any:
 # A spec entry with no field (or a field with no spec entry) means an environment variable
 # that is read and dropped, or a setting no operator can set. Both are silent failures, so
 # they are caught at import time instead.
+#: Fields with no environment variable of their own: the engine keys, which are read from
+#: whichever variable belongs to the engine in use; ``routes``, assembled from ROUTES and the
+#: per-route variables; and ``notices``, which the parse produces rather than reads.
+_DERIVED_FIELDS = frozenset({"engine_key", "engine_keys", "routes", "notices"})
 _SPEC_NAMES = {v.name for v in _SPEC}
-_FIELD_NAMES = {f.name for f in dataclass_fields(Config)} - {"engine_key"}
+_FIELD_NAMES = {f.name for f in dataclass_fields(Config)} - _DERIVED_FIELDS
 if _SPEC_NAMES != _FIELD_NAMES:
     raise RuntimeError(
         "config spec and Config fields disagree: "
