@@ -39,6 +39,7 @@ import os
 import re
 import socket
 import sqlite3
+import stat
 import threading
 import time
 from contextlib import contextmanager
@@ -309,7 +310,35 @@ class Ledger:
         # failure this service removes, so durability wins over write speed at this volume.
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA foreign_keys=ON")
+        self._restrict_permissions()
         return conn
+
+    def _restrict_permissions(self) -> None:
+        """Make the ledger readable only by the account that runs the service.
+
+        It is not just state. Quarantine reasons, last errors and the disagreement log all
+        carry fragments of what was said, and the sensitivity gate will hold whole withheld
+        passages here — so on a shared host this file is one of the most revealing things on
+        the machine. The work directory was already locked down and this was not, which is
+        the kind of gap that survives precisely because the file looks like bookkeeping.
+
+        SQLite writes ``-wal`` and ``-shm`` beside it, and they carry the same content, so
+        all three are set. Best effort by design: a volume that will not take a chmod (a
+        Windows bind mount, some container filesystems) must not stop the service starting —
+        losing recordings is the worse failure. It is done on every connection because WAL
+        files come and go.
+        """
+        if self._memory:
+            return
+        for suffix in ("", "-wal", "-shm"):
+            target = self.path + suffix
+            try:
+                if os.path.exists(target):
+                    os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                # Reported once at startup by config, not per connection: a warning on every
+                # database open would be noise nobody reads.
+                pass
 
     def _conn(self) -> sqlite3.Connection:
         # An in-memory database is per-connection, so threads must share one; a file
