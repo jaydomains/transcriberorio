@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 
 from transcriber import digest
@@ -22,6 +23,14 @@ from transcriber.models import DriveItem, State
 
 from . import support
 from .vendored_ingest import ADDR_RE
+
+
+
+def _stamp(epoch: float) -> str:
+    """An ISO timestamp the ledger would have written, for a given moment."""
+    import datetime as _dt
+
+    return _dt.datetime.fromtimestamp(epoch, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class TheSubjectLineCarriesTheWholeMessage(unittest.TestCase):
@@ -79,14 +88,62 @@ class TheSubjectLineCarriesTheWholeMessage(unittest.TestCase):
         self.assertIn("nothing arrived yesterday", built.subject)
         self.assertTrue(built.needs_a_person)
 
-    def test_a_recording_still_in_flight_yesterday_counts_as_a_failure_this_morning(self) -> None:
+    def test_a_recording_stuck_for_hours_counts_as_a_failure_this_morning(self) -> None:
+        """Stuck is a failure — but stuck is decided by AGE, not merely by being unfinished.
+
+        This used to assert that anything unfinished from the reported day was a failure,
+        which is true of a recording that died at 09:00 and false of one of eighty that
+        landed at 17:00. Both are "discovered yesterday and not done".
+
+        The clock is moved rather than the timestamp, so the test does not depend on the
+        hour it happens to run at.
+        """
         day = self.discover("A", "B")
+        self.ledger.advance("A", State.DONE)
+
+        built = digest.build(
+            self.config, self.ledger, day=day, now=time.time() + 12 * 3600
+        )
+
+        self.assertIn("FAILED", built.subject)
+        self.assertEqual(built.open_failures, 1)
+
+    def test_a_fresh_backlog_is_queued_not_failed(self) -> None:
+        """Eighty recordings landing at 17:00 are still in hand at 06:00.
+
+        Calling them FAILED on a phone screen is the exact confusion this service exists to
+        remove, and it would teach him to distrust the one line meant to be trustworthy.
+        """
+        day = self.discover("A", "B", "C")
         self.ledger.advance("A", State.DONE)
 
         built = self.build(day)
 
-        self.assertIn("FAILED", built.subject)
-        self.assertEqual(built.open_failures, 1)
+        self.assertNotIn("FAILED", built.subject)
+        self.assertIn("2 queued", built.subject)
+
+    def test_stuck_and_queued_are_named_separately(self) -> None:
+        """The split itself, as a unit — mixed ages in one cohort need no fixture gymnastics."""
+        now = time.time()
+        stopped, queued = digest.split_stopped_from_queued(
+            [
+                {"state": State.QUARANTINED, "discovered_at": _stamp(now)},
+                {"state": State.TRANSCRIBED, "discovered_at": _stamp(now - 12 * 3600)},
+                {"state": State.DISCOVERED, "discovered_at": _stamp(now - 60)},
+            ],
+            now=now,
+        )
+
+        self.assertEqual((stopped, queued), (2, 1))
+
+    def test_an_unfinished_recording_with_no_timestamp_is_named_not_assumed_fine(self) -> None:
+        """No evidence it is moving is not evidence it is fine."""
+        now = time.time()
+        stopped, queued = digest.split_stopped_from_queued(
+            [{"state": State.DISCOVERED, "discovered_at": ""}], now=now
+        )
+
+        self.assertEqual((stopped, queued), (1, 0))
 
     def test_verified_silence_is_reported_as_itself(self) -> None:
         day = self.discover("A", "B")

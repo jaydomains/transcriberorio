@@ -34,12 +34,15 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Callable, Iterable, Sequence
 
 from . import archive as archive_module
 from . import audio as audio_module
-from . import config_cmd, naming, outputs, plausibility, routes_cmd, sweep as sweep_module
+from . import config_cmd, diskbudget, digest as digest_module, naming, outputs, plausibility
+from . import ratelimit, routes_cmd
+from . import sweep as sweep_module
 from .config import Config, ConfigError
 from .ledger import DELTA_CURSOR, Ledger, delta_cursor_name, sweep_cursor_name
 from .logging_setup import configure as configure_logging
@@ -265,10 +268,50 @@ def cmd_once(args: argparse.Namespace) -> int:
         return EXIT_OK if report.ok else EXIT_FAILED
 
 
+#: How long a shutdown waits before it stops being polite to threads that are queued behind
+#: the engine rate limit. A stop means "finish what is running", and a thread waiting for a
+#: token has not started anything — but it is still holding the process open, and a service
+#: that will not restart is a service that is down. Nothing is lost when one is released:
+#: its recording is in the ledger, unclaimed within a lease, and the next run picks it up.
+RATE_LIMIT_RELEASE_AFTER_S = 30.0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     config, ledger, graph = _service(args)
     with ledger:
-        return Worker(config, ledger, graph).run()
+        worker = Worker(config, ledger, graph)
+        _release_rate_limited_threads_on_shutdown(worker)
+        return worker.run()
+
+
+def _release_rate_limited_threads_on_shutdown(
+    worker: Worker, after_s: float = RATE_LIMIT_RELEASE_AFTER_S
+) -> threading.Thread:
+    """Watch for a stop, and after the grace window let queued threads stop waiting.
+
+    A daemon thread rather than a signal handler: the worker owns SIGTERM and SIGINT, and
+    two handlers for one signal is one handler. This only reads ``worker.stopping``, which
+    is the worker's own public answer to "have we been asked to stop", so nothing here can
+    change when or how the worker shuts down — it can only stop the engine rate limit from
+    holding a thread past the point where the process is trying to leave.
+    """
+
+    def watch() -> None:
+        while not worker.stopping:
+            time.sleep(0.5)
+        # In-flight work keeps its slot and finishes; this is only for threads that have not
+        # started a request and are queued for one.
+        deadline = time.monotonic() + max(0.0, after_s)
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+        ratelimit.request_shutdown(
+            f"shutting down and the engine rate limit still had threads queued after "
+            f"{after_s:.0f}s; they stop waiting and their recordings stay in the ledger"
+        )
+
+    thread = threading.Thread(target=watch, name="rate-limit-release", daemon=True)
+    thread.start()
+    return thread
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
@@ -538,7 +581,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     day = args.day or datetime.date.today().isoformat()
     with Ledger(ledger_path, scrub=getattr(config, "scrub", None)) as ledger:
         stats = ledger.stats()
-        routes = _route_status(config, ledger, stats)
+        # The work in hand, before anything else is printed: a person running `status` after
+        # a busy morning is asking "where are the other forty?", and the answer is a queue
+        # depth, not a total. Read once and shared by the table and the block below it.
+        queue = digest_module.queue_report(config, ledger, day=day)
+        routes = _route_status(config, ledger, stats, queue)
         wanted = (args.route or "").strip() or None
         if wanted and not any(r["route"] == wanted for r in routes):
             known = ", ".join(r["route"] for r in routes) or "none"
@@ -563,20 +610,25 @@ def cmd_status(args: argparse.Namespace) -> int:
         if args.as_json:
             print(json.dumps(
                 {"ledger": stats, "day": counts, "marks": marks, "attention": attention,
-                 "routes": routes, "route": wanted,
+                 "routes": routes, "route": wanted, "queue": queue.as_dict(),
                  "config_problems": problems.splitlines()},
                 indent=1, default=str,
             ))
         else:
             _print_status(ledger_path, stats, counts, marks, day, attention,
-                          routes=routes, only=wanted)
+                          routes=routes, only=wanted, queue=queue)
 
     if problems:
         return EXIT_CONFIG
     return EXIT_FAILED if (counts.get("failures") or []) else EXIT_OK
 
 
-def _route_status(config: Config | None, ledger: Ledger, stats: dict[str, Any]) -> list[dict[str, Any]]:
+def _route_status(
+    config: Config | None,
+    ledger: Ledger,
+    stats: dict[str, Any],
+    queue: Any = None,
+) -> list[dict[str, Any]]:
     """One row per route, configured or merely remembered, in configuration order.
 
     A route taken out of ``ROUTES`` keeps every ledger row it ever wrote, so it is listed
@@ -597,6 +649,7 @@ def _route_status(config: Config | None, ledger: Ledger, stats: dict[str, Any]) 
 
     ordered: list[str] = [r.name for r in configured]
     ordered.extend(name for name in sorted(by_route) if name not in ordered)
+    queued_by_route = {entry.name: entry for entry in getattr(queue, "routes", ())}
 
     known_routes = {r.name: r for r in configured}
     out: list[dict[str, Any]] = []
@@ -620,6 +673,15 @@ def _route_status(config: Config | None, ledger: Ledger, stats: dict[str, Any]) 
             "failed": quarantined,
             "verified_silence": silent,
             "working": total - done - quarantined - silent,
+            # The same number as "working", counted from the rows rather than subtracted
+            # from the states, and carrying how long the oldest of them has been waiting.
+            # A backlog and a loss look identical without this.
+            "queued": int(getattr(queued_by_route.get(name), "queued", 0) or 0),
+            "being_worked_on": int(getattr(queued_by_route.get(name), "started", 0) or 0),
+            "oldest_queued_at": str(getattr(queued_by_route.get(name), "oldest_at", "") or ""),
+            "oldest_queued_age_s": round(
+                float(getattr(queued_by_route.get(name), "oldest_age_s", 0.0) or 0.0), 1
+            ),
             "last_success": ledger.cursor_get(route_poll_ok_mark(name)) or "",
             "last_error": ledger.cursor_get(route_poll_error_mark(name)) or "",
             "delta_cursor_set": bool(
@@ -647,8 +709,8 @@ def _print_route_table(routes: Sequence[dict[str, Any]]) -> None:
         print("\n  no routes: nothing is configured and the ledger has no history")
         return
 
-    header = ("route", "watches", "writes to", "known", "done", "failed", "clashes",
-              "last success")
+    header = ("route", "watches", "writes to", "known", "done", "failed", "queued",
+              "clashes", "last success")
     rows: list[tuple[str, ...]] = []
     for route in routes:
         name = route["route"]
@@ -663,12 +725,13 @@ def _print_route_table(routes: Sequence[dict[str, Any]]) -> None:
             str(route["known"]),
             str(route["done"]),
             str(route["failed"]),
+            str(route.get("queued", 0)),
             str(route.get("route_disagreements", 0)),
             route["last_success"] or "never",
         ))
     widths = [max(len(header[i]), *(len(r[i]) for r in rows)) for i in range(len(header))]
     # The counts read as numbers, so they line up as numbers.
-    numeric = {3, 4, 5, 6}
+    numeric = {3, 4, 5, 6, 7}
 
     def cell(index: int, text: str) -> str:
         return text.rjust(widths[index]) if index in numeric else text.ljust(widths[index])
@@ -680,6 +743,12 @@ def _print_route_table(routes: Sequence[dict[str, Any]]) -> None:
 
     for route in routes:
         name = route["route"]
+        if route.get("queued"):
+            waiting = digest_module.human_duration(route.get("oldest_queued_age_s") or 0.0)
+            being = route.get("being_worked_on") or 0
+            print(f"    - {name}: {route['queued']} queued, oldest waiting {waiting}"
+                  + (f", {being} being worked on now" if being else "")
+                  + ". Queued is work in hand, not work lost.")
         if route["last_error"]:
             print(f"    ! {name} last failed to poll: {route['last_error']}")
         if route["configured"] and route["enabled"] and not route["delta_cursor_set"]:
@@ -715,6 +784,7 @@ def _print_status(
     attention: dict[str, Any] | None = None,
     routes: Sequence[dict[str, Any]] = (),
     only: str | None = None,
+    queue: Any = None,
 ) -> None:
     by_state = stats.get("by_state", {})
     print(f"transcriber — {ledger_path}")
@@ -732,14 +802,21 @@ def _print_status(
             print(f"      {state.lower():<14} {by_state[state]:>6}")
 
     _print_route_table(routes)
+    _print_queue(queue, only)
 
     print(f"\n  {day}: {counts.get('discovered', 0)} arrived, {counts.get('done', 0)} done, "
           f"{counts.get('quarantined', 0)} quarantined, {counts.get('in_flight', 0)} unfinished"
           + (f"  (route {only})" if only else ""))
 
     failures = counts.get("failures") or []
+    waiting = [f for f in failures if not State.is_terminal(str(f.get("state") or ""))]
     if failures:
         print(f"\n  {len(failures)} failure(s) waiting for a person:")
+        if waiting:
+            # Said before the list, not after it: these are the rows a person reads as
+            # "lost", and they are the queue printed above under another heading.
+            print(f"    ({len(waiting)} of these have simply not finished yet — they are in "
+                  f"the queue above, not lost)")
         for failure in failures[:25]:
             where = f"  [{failure.get('route')}]" if failure.get("route") else ""
             print(f"    {failure.get('name') or failure.get('item_id')}  "
@@ -799,6 +876,60 @@ def _print_status(
         print(f"  oldest unfinished: {oldest.get('name')} "
               f"[{oldest.get('route', DEFAULT_ROUTE)}] "
               f"(discovered {oldest.get('discovered_at')})")
+
+
+def _print_queue(queue: Any, only: str | None = None) -> None:
+    """What is in hand, in the words that stop a backlog reading as a loss.
+
+    "42 queued, working through them" and "42 missing" are the same forty-two recordings to
+    anybody looking at a total, and they are completely different problems. This is where
+    the difference gets said out loud, so a person does not have to infer it from a number
+    that has been going up.
+    """
+    if queue is None:
+        return
+    if getattr(queue, "unavailable", ""):
+        print(f"\n  queue: could not be counted ({queue.unavailable})")
+        return
+
+    entries = [r for r in getattr(queue, "routes", ()) if not only or r.name == only]
+    total = queue.queued if not only else sum(r.queued for r in entries)
+    started = queue.started if not only else sum(r.started for r in entries)
+    print("\n  queue")
+    # Printed before the count, because "42 queued" with no explanation reads as a service
+    # that has stopped. These are the worker's own words from its last drain, and they are
+    # only set when the work directory actually held something back.
+    if getattr(queue, "work_dir", ""):
+        print(f"    why it is moving slowly: {queue.work_dir}")
+    if getattr(queue, "work_dir_refused", ""):
+        print(f"    ! needs you: {queue.work_dir_refused}")
+    if not total:
+        print("    nothing is queued: everything that has arrived has been dealt with")
+        return
+    being = f" ({started} being worked on right now)" if started else ""
+    print(f"    {total} queued and being worked through{being} — work in hand, not work lost.")
+    print("    Every one of them has a row in this ledger and will be transcribed.")
+    for entry in entries:
+        if not entry.queued:
+            continue
+        print(f"      {entry.name:<16} {entry.queued:>5} queued, oldest waiting "
+              f"{digest_module.human_duration(entry.oldest_age_s)}")
+    if queue.oldest_name and not only:
+        print(f"    longest in the queue: {queue.oldest_name} "
+              f"[{queue.oldest_route}], first seen "
+              f"{digest_module.human_duration(queue.oldest_age_s)} ago")
+    if queue.previous_queued is not None and not only:
+        print(f"    it was {queue.previous_queued} when the {queue.previous_day} digest "
+              f"went out")
+    if queue.stale and not only:
+        print(f"    ! the oldest has been waiting longer than "
+              f"{digest_module.human_duration(queue.stale_after_s)}")
+    if queue.growing_across_days and not only:
+        print("    ! it has grown every morning for three mornings running")
+    if queue.short_of_throughput and not only:
+        print("      Recordings are arriving faster than they are being transcribed. Nothing")
+        print("      is being lost — it is getting slower. More workers, or a higher engine")
+        print("      limit, is what closes that gap.")
 
 
 def _print_mark(label: str, value: Any) -> None:
@@ -890,6 +1021,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         _selftest_routes(checks, tmp)
         _selftest_route_cursors(checks, os.path.join(tmp, "routes.sqlite3"))
         _selftest_settings(checks, tmp)
+        _selftest_rate_limit(checks, config)
+        _selftest_queue(checks, config, os.path.join(tmp, "queue.sqlite3"))
         _selftest_audio(checks)
         _selftest_plausibility(checks)
         _selftest_quotes(checks)
@@ -1277,6 +1410,160 @@ def _selftest_settings(checks: _Checks, work_dir: str) -> None:
 
 
 # -- 3. the audio itself -----------------------------------------------------------
+
+
+def _selftest_rate_limit(checks: _Checks, config: Config) -> None:
+    """The engine limiter: off unless configured, and unbypassable when it is on.
+
+    Proved on an injected clock, so this section is instant and cannot be flaky: nothing
+    here sleeps, and the token bucket's arithmetic is checked by moving the clock rather
+    than by waiting for it.
+    """
+    checks.section("the engine rate limit")
+
+    ticks = [1000.0]
+    limiter = ratelimit.RateLimiter(clock=lambda: ticks[0], name="selftest")
+    checks.check("an unconfigured limiter is off", not limiter.enabled)
+    checks.check("and lets everything straight through",
+                 all(limiter.try_acquire() for _ in range(10)))
+
+    limiter.configure(max_concurrent=2, max_per_minute=0)
+    took = [limiter.try_acquire(want_token=False) for _ in range(3)]
+    checks.check("two at a time means two at a time", took == [True, True, False], repr(took))
+    limiter.release_slot()
+    checks.check("and a third goes as soon as one finishes",
+                 limiter.try_acquire(want_token=False))
+
+    bucket = ratelimit.RateLimiter(max_per_minute=2, clock=lambda: ticks[0], name="selftest")
+    spent = [bucket.try_acquire(want_slot=False) for _ in range(3)]
+    checks.check("a minute's allowance is a minute's allowance",
+                 spent == [True, True, False], repr(spent))
+    ticks[0] += 30.0
+    checks.check("and it refills on the clock, not on a sleep",
+                 bucket.try_acquire(want_slot=False))
+    ticks[0] -= 600.0
+    checks.check("a clock that goes backwards hands out nothing",
+                 not bucket.try_acquire(want_slot=False))
+
+    reentrant = ratelimit.RateLimiter(max_concurrent=1, clock=lambda: ticks[0], name="selftest")
+    with reentrant.slot():
+        with reentrant.slot():  # the HTTP client, inside an engine that already holds a slot
+            deep = reentrant.snapshot().in_flight
+    checks.check("one thread cannot deadlock against itself", deep == 1, f"in flight: {deep}")
+    checks.check("and the slot is handed back at the end",
+                 reentrant.snapshot().in_flight == 0)
+
+    running = ratelimit.RateLimiter(max_concurrent=2, max_per_minute=60,
+                                    clock=lambda: ticks[0], name="selftest")
+    with running.slot():
+        running.take_token()
+        ratelimit.request_shutdown("selftest: stopping mid-transcription")
+        try:
+            running.take_token()   # an attempt inside a request that is already in flight
+            spent = True
+        except ratelimit.RateLimitShutdown:
+            spent = False
+        finally:
+            ratelimit.clear_shutdown()
+    checks.check("a transcription already running spends its allowance and finishes", spent)
+
+    stopping = ratelimit.RateLimiter(max_concurrent=1, clock=lambda: ticks[0], name="selftest")
+    stopping.try_acquire(want_token=False)
+    ratelimit.request_shutdown("selftest")
+    try:
+        checks.raises(
+            "a thread waiting for a turn is released by a shutdown",
+            ratelimit.RateLimitShutdown,
+            lambda: stopping.slot(timeout=5.0).__enter__(),
+        )
+    finally:
+        ratelimit.clear_shutdown()
+
+    from .engines.base import LimitedEngine, create_engine
+
+    engine = create_engine(config)
+    checks.check("every engine is built inside the rate limit",
+                 isinstance(engine, LimitedEngine), type(engine).__name__)
+    checks.check("and still answers as the engine it is", engine.name == config.engine,
+                 engine.name)
+    limits = ratelimit.limits_from_config(config)
+    checks.check("the limits are read from the configuration", limits[0] >= 1, repr(limits))
+
+
+def _selftest_queue(checks: _Checks, config: Config, path: str) -> None:
+    """A backlog reports as a backlog. This is the sentence the service exists to say."""
+    checks.section("the queue: work in hand, never work lost")
+
+    with Ledger(path) as ledger:
+        ledger.record_page(
+            [_drive_item(f"q{n}", f"Call Someone_260827_1200{n:02d}.m4a", b"0123456789")
+             for n in range(3)],
+            "cursor-1",
+        )
+        ledger.advance("q0", State.DONE)
+        report = digest_module.queue_report(config, ledger)
+        checks.check("what is unfinished is what is queued", report.queued == 2,
+                     f"{report.queued} queued")
+        checks.check("a finished recording is not in the queue",
+                     all(entry.queued <= 2 for entry in report.routes))
+        checks.check("the queue reads as work in hand",
+                     "lost" in report.headline() and "queued" in report.headline(),
+                     report.headline())
+        rendered = "\n".join(report.lines())
+        checks.check("and says so in the words a person reads",
+                     "will be transcribed" in rendered, rendered[:120])
+
+        ledger.advance("q1", State.DONE)
+        ledger.advance("q2", State.DONE)
+        empty = digest_module.queue_report(config, ledger)
+        checks.check("an empty queue says nothing is waiting", empty.queued == 0)
+        checks.check("and is not called a failure", "lost" not in empty.headline(),
+                     empty.headline())
+
+        _selftest_work_dir(checks)
+
+        digest_module.record_queue_depth(ledger, "2026-08-25", 4)
+        digest_module.record_queue_depth(ledger, "2026-08-26", 9)
+        remembered = digest_module.queue_history(ledger)
+        checks.check("yesterday's depth is remembered so growth can be seen",
+                     remembered.get("2026-08-26") == 9, repr(remembered))
+
+
+def _selftest_work_dir(checks: _Checks) -> None:
+    """The work directory's budget can always be got out of. It once could not.
+
+    Kept scratch belongs to recordings that are finished with, and a finished recording is
+    never coming back for it, so without this the work directory could cross its limit and
+    stay there: nothing running, nothing claimed, and no report saying anything but "busy".
+    """
+    with tempfile.TemporaryDirectory(prefix="transcriber-workdir-") as tmp:
+        items = os.path.join(tmp, "items")
+        old_when = time.time() - 5 * 24 * 3600
+        for name, aged in (("finished", True), ("still-queued", True), ("fresh", False)):
+            os.makedirs(os.path.join(items, name), exist_ok=True)
+            path = os.path.join(items, name, "audio.m4a")
+            with open(path, "wb") as handle:
+                handle.truncate(16 * diskbudget.MIB)
+            if aged:
+                os.utime(path, (old_when, old_when))
+                os.utime(os.path.dirname(path), (old_when, old_when))
+
+        budget = diskbudget.DiskBudget(tmp, 32 * diskbudget.MIB, ttl_s=0.0)
+        cleared = budget.reclaim(keep=("still-queued",))
+        checks.check("the audio of a finished recording stops holding the budget",
+                     cleared.removed == ["finished"], repr(cleared.removed))
+        checks.check("the audio of a recording still in the queue is kept",
+                     os.path.exists(os.path.join(items, "still-queued", "audio.m4a")))
+        checks.check("and so is this morning's failure, for somebody to listen to",
+                     os.path.exists(os.path.join(items, "fresh", "audio.m4a")))
+
+        candidates = [("a", 1 * diskbudget.MIB, "a.m4a"), ("b", 1 * diskbudget.MIB, "b.m4a")]
+        waiting = diskbudget.admit(budget, candidates)
+        checks.check("over budget, nothing new is claimed",
+                     waiting.admitted == [] and len(waiting.held) == 2, repr(waiting.admitted))
+        forced = diskbudget.admit(budget, candidates, force_one=True)
+        checks.check("but over budget with nothing running is not a place it can be stuck",
+                     forced.admitted == ["a"] and forced.forced, repr(forced.admitted))
 
 
 def _selftest_audio(checks: _Checks) -> None:

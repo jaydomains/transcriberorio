@@ -29,8 +29,10 @@ Environment variables, all read by :meth:`Config.from_env`::
                        (+ AZURE_SPEECH_REGION when the engine is azure)
     ANALYSIS_API_KEY ANALYSIS_BASE_URL ANALYSIS_MODEL_CHEAP ANALYSIS_MODEL_STRONG
     SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASSWORD SMTP_FROM SMTP_TO SMTP_STARTTLS
-    HEARTBEAT_URL LEDGER_PATH WORK_DIR ORPHAN_FOLDER_ID
+    HEARTBEAT_URL LEDGER_PATH WORK_DIR WORK_DIR_MAX_BYTES WORK_DIR_KEEP_FINISHED_HOURS
+    ORPHAN_FOLDER_ID
     GRAPH_SECRET_EXPIRES_ON ENGINE_KEY_EXPIRES_ON ANALYSIS_KEY_EXPIRES_ON
+    ENGINE_MAX_CONCURRENT ENGINE_MAX_PER_MINUTE
     POLL_INTERVAL_S SETTLE_INTERVAL_S LEASE_SECONDS CONCURRENCY MAX_ATTEMPTS
     ARCHIVE_AGE_DAYS DIGEST_HOUR SWEEP_HOUR ARCHIVE_DAY_OF_MONTH TIMEZONE
     LANGUAGES VOCABULARY VOCABULARY_FILE HTTP_TIMEOUT_S MAX_RETRIES LOG_LEVEL
@@ -46,6 +48,13 @@ from datetime import date as _date
 from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from typing import Any, Mapping, Sequence
 
+from .diskbudget import (
+    DEFAULT_KEEP_FINISHED_S,
+    DEFAULT_WORK_DIR_MAX_BYTES,
+    MINIMUM_WORK_DIR_MAX_BYTES,
+    format_bytes,
+    parse_bytes,
+)
 from .models import DEFAULT_ROUTE, Route, is_route_name, route_env_var
 
 log = logging.getLogger("transcriber.config")
@@ -159,11 +168,17 @@ _SPEC: tuple[_Var, ...] = (
     # --- durable state ---------------------------------------------------------------
     _Var("ledger_path", "LEDGER_PATH", "str", _REQUIRED, "path to the SQLite ledger — no default, because two ledgers is the same as none"),
     _Var("work_dir", "WORK_DIR", "str", os.path.join(tempfile.gettempdir(), "transcriber"), "scratch directory for downloads"),
+    _Var("work_dir_max_bytes", "WORK_DIR_MAX_BYTES", "bytes", DEFAULT_WORK_DIR_MAX_BYTES, "how much scratch the work directory may hold before the worker stops claiming new recordings (4GiB, 500MB or a plain number of bytes; 0 means no limit)"),
+    _Var("work_dir_keep_finished_hours", "WORK_DIR_KEEP_FINISHED_HOURS", "int", int(DEFAULT_KEEP_FINISHED_S // 3600), "hours the downloaded audio of a finished recording — done, quarantined, or written off as silence — is kept in the work directory before it is cleared away"),
     # --- loop and timing -------------------------------------------------------------
     _Var("poll_interval_s", "POLL_INTERVAL_S", "int", 120, "seconds between delta polls"),
     _Var("settle_interval_s", "SETTLE_INTERVAL_S", "int", 60, "seconds between the two size reads of the completeness check"),
     _Var("lease_seconds", "LEASE_SECONDS", "int", 900, "how long a worker's claim survives without renewal"),
     _Var("concurrency", "CONCURRENCY", "int", 2, "recordings processed at once"),
+    _Var("engine_max_concurrent", "ENGINE_MAX_CONCURRENT", "int", 3, "transcription requests in flight at once, across every route and every thread — the API's limit, not the machine's"),
+    _Var("engine_max_per_minute", "ENGINE_MAX_PER_MINUTE", "int", 0, "transcription requests started per minute, across every route and every thread; 0 means no per-minute limit"),
+    _Var("queue_stale_hours", "QUEUE_STALE_HOURS", "int", 24, "how long the queue may sit before the digest calls it stale rather than busy"),
+    _Var("stuck_after_hours", "STUCK_AFTER_HOURS", "int", 6, "how long an unfinished recording may sit before the subject line calls it FAILED rather than queued — the difference between a backlog and a breakage"),
     _Var("max_attempts", "MAX_ATTEMPTS", "int", 3, "failures before an item is quarantined for a person"),
     _Var("archive_age_days", "ARCHIVE_AGE_DAYS", "int", 60, "age at which a done recording is moved to the archive folder"),
     _Var("digest_hour", "DIGEST_HOUR", "int", 6, "local hour the digest is sent, every day"),
@@ -235,11 +250,28 @@ class Config:
     # state
     ledger_path: str = ""
     work_dir: str = ""
+    #: How much the work directory may hold before the worker stops claiming. Nothing is
+    #: dropped when it is reached: discovery carries on, the ledger rows stay claimable, and
+    #: the drain starts again as recordings finish and their scratch is removed. 0 means no
+    #: limit, which is the old behaviour and a full disk waiting for a busy week.
+    work_dir_max_bytes: int = DEFAULT_WORK_DIR_MAX_BYTES
+    #: How long the audio of a recording that is finished with is kept. A failure keeps its
+    #: download so a retry is cheap and so a person can hear what went wrong; without an end
+    #: to that, the audio of quarantined recordings piles up until the work directory is
+    #: permanently over budget and the drain claims nothing at all, forever.
+    work_dir_keep_finished_hours: int = int(DEFAULT_KEEP_FINISHED_S // 3600)
     # loop and timing
     poll_interval_s: int = 120
     settle_interval_s: int = 60
     lease_seconds: int = 900
     concurrency: int = 2
+    #: The transcription API's limits, which are not the machine's. ``concurrency`` decides
+    #: how many recordings this VM works on; these decide how hard the engine is pushed, and
+    #: they are shared across every route and every thread in the process.
+    engine_max_concurrent: int = 3
+    engine_max_per_minute: int = 0
+    queue_stale_hours: int = 24
+    stuck_after_hours: int = 6
     max_attempts: int = 3
     archive_age_days: int = 60
     digest_hour: int = 6
@@ -407,9 +439,30 @@ class Config:
                 values["vocabulary"] = tuple(dict.fromkeys(merged))
 
         for name in ("poll_interval_s", "settle_interval_s", "lease_seconds", "concurrency",
-                     "max_attempts", "archive_age_days", "http_timeout_s"):
+                     "engine_max_concurrent", "queue_stale_hours", "stuck_after_hours",
+                     "max_attempts", "archive_age_days",
+                     "http_timeout_s", "work_dir_keep_finished_hours"):
             if name in values and values[name] < 1:
                 problems.append(f"{_env_of(name)}={values[name]} must be at least 1")
+        if values.get("engine_max_per_minute", 0) < 0:
+            problems.append(
+                "ENGINE_MAX_PER_MINUTE cannot be negative — set the number of transcription "
+                "requests a minute the API allows, or 0 for no per-minute limit"
+            )
+        # 0 is off, which is what every installation ran before this existed. Anything above
+        # 0 has to be big enough for one ordinary recording, or the budget refuses the very
+        # work it is meant to pace and the queue never moves.
+        budget = values.get("work_dir_max_bytes", DEFAULT_WORK_DIR_MAX_BYTES)
+        if budget < 0:
+            problems.append("WORK_DIR_MAX_BYTES cannot be negative")
+        elif 0 < budget < MINIMUM_WORK_DIR_MAX_BYTES:
+            problems.append(
+                f"WORK_DIR_MAX_BYTES={format_bytes(budget)} is too small to transcribe "
+                f"anything with — an hour-long recording is around 58 MB and is downloaded "
+                f"and then split into pieces beside itself, so the smallest workable limit "
+                f"is {format_bytes(MINIMUM_WORK_DIR_MAX_BYTES)}. Raise it, or set it to 0 "
+                f"for no limit at all."
+            )
         if values.get("lease_seconds", 900) <= values.get("settle_interval_s", 60):
             problems.append(
                 "LEASE_SECONDS must exceed SETTLE_INTERVAL_S, or a claim expires while the "
@@ -929,6 +982,10 @@ def _coerce(var: _Var, raw: Any) -> Any:
             return int(str(raw).strip())
         except ValueError:
             raise ValueError("expected a whole number") from None
+    if var.kind == "bytes":
+        # ``parse_bytes`` raises ValueError with the sentence to print, like every other
+        # kind here, so a size is reported in the same one-pass list as everything else.
+        return parse_bytes(raw)
     if var.kind == "float":
         try:
             return float(str(raw).strip())

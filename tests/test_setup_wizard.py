@@ -8,6 +8,7 @@ completely empty ``.env``. It looked like it worked.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import stat
@@ -46,7 +47,8 @@ class AnAnswerIsActuallyStored(unittest.TestCase):
             import builtins
 
             builtins.input = _FakeIn(["tenant-123"])
-            got = ctx.ask("GRAPH_TENANT_ID", "Tenant?")
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = ctx.ask("GRAPH_TENANT_ID", "Tenant?")
         finally:
             import builtins
 
@@ -64,7 +66,8 @@ class AnAnswerIsActuallyStored(unittest.TestCase):
             # An existing value is offered as the default, so it takes two: blank then blank.
             ctx.values["ORPHAN_FOLDER_ID"] = ""
             builtins.input = _FakeIn([""])
-            got = ctx.ask("ORPHAN_FOLDER_ID", "Orphan folder?", required=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = ctx.ask("ORPHAN_FOLDER_ID", "Orphan folder?", required=False)
         finally:
             builtins.input = original
         self.assertEqual(got, "")
@@ -77,7 +80,7 @@ class AnAnswerIsActuallyStored(unittest.TestCase):
         original = builtins.input
         try:
             builtins.input = _FakeIn([])  # immediate EOF
-            with self.assertRaises(SystemExit):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
                 ctx.ask("GRAPH_TENANT_ID", "Tenant?")
         finally:
             builtins.input = original
