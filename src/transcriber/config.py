@@ -305,6 +305,10 @@ class Config:
             object.__setattr__(self, "routes", (first, *self.routes[1:]))
             return
         object.__setattr__(self, name, value)
+        if name == "routes" and getattr(self, "_routes_ready", False) and self.routes:
+            # Replacing the routes wholesale — the wizard, a test — has to take the derived
+            # attributes with it, or the two halves of one fact go out of step.
+            self._mirror_first_route()
 
     @property
     def enabled_routes(self) -> tuple[Route, ...]:

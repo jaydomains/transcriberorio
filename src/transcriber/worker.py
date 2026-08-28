@@ -1,13 +1,25 @@
-"""The loop: poll the change feed, process what is claimable, run the scheduled jobs.
+"""The loop: poll every route's change feed, process what is claimable, run the jobs.
 
-Three things here are worth knowing before changing any of it.
+Four things here are worth knowing before changing any of it.
 
-**The cursor never advances past a row.** :meth:`Worker.poll` hands each delta page to
-``Ledger.record_page``, which writes that page's rows and that page's cursor in one
+**The cursor never advances past a row.** :meth:`Worker.poll_route` hands each delta page to
+``Ledger.record_page``, which writes that page's rows and that route's cursor in one
 transaction. If a page comes back with no cursor at all, the rows are still recorded and the
 cursor is deliberately left where it was, so the next poll re-reads a page we already have
 rather than skipping one we do not. Re-reading costs a second of work; skipping loses a
 recording, which is the failure this service exists to remove.
+
+**One broken folder is not a dead service.** Every enabled route is polled in turn, each
+from its own cursor, and a route that fails to poll is written down, named in the report and
+stepped over — the routes after it are still polled, and the work already discovered on
+every route is still processed. The difference between "WhatsApp is broken" and "the
+transcriber is down" is this loop's job to make visible. The one exception is a fault in the
+*service* rather than in a route — a rejected credential, a broken ledger — which stops
+everything on purpose and says so.
+
+**The concurrency limit is the whole service's, not each route's.** Discovery is per route;
+the queue is one queue. Three routes must not put three times the load on Graph, so the
+drain reads every route's claimable work together and runs ``CONCURRENCY`` of it at a time.
 
 **Shutdown is not a drop.** SIGTERM and SIGINT stop new work being submitted, wait for what
 is already running, and then release every claim this worker still holds, so a redeploy
@@ -37,9 +49,9 @@ from . import archive as archive_module
 from . import sweep as sweep_module
 from .graph import ResyncRequired
 from .heartbeat import Heartbeat
-from .ledger import DELTA_CURSOR, Ledger
+from .ledger import Ledger, delta_cursor_name
 from .logging_setup import get_logger, item_context
-from .models import DriveItem, Row, State, utc_now_iso
+from .models import DEFAULT_ROUTE, DriveItem, Route, Row, State, utc_now_iso
 from .pipeline import _FATAL as PIPELINE_FATAL_ERRORS
 from .pipeline import Outcome, Pipeline, PipelineFatal
 
@@ -53,6 +65,8 @@ __all__ = [
     "LAST_CYCLE_OK",
     "LAST_CYCLE_ERROR",
     "LAST_POLL_OK",
+    "route_poll_ok_mark",
+    "route_poll_error_mark",
     "claimable_now",
 ]
 
@@ -65,10 +79,34 @@ LAST_CYCLE_ERROR = "worker:last_cycle_error"
 LAST_POLL_OK = "worker:last_poll_ok"
 
 
+def route_poll_ok_mark(route: str) -> str:
+    """When this route last polled cleanly. One mark per route, never one for the lot.
+
+    A single service-wide mark said "the last poll worked" while one folder had been failing
+    for a week, because some other route polled fine a minute ago. Per route, "site meetings
+    last worked on Tuesday" is a sentence the status page and the digest can actually say.
+    """
+    return f"worker:last_poll_ok:{route}"
+
+
+def route_poll_error_mark(route: str) -> str:
+    """The reason this route's last poll failed, or empty once it works again.
+
+    Cleared on success rather than only written on failure: a mark that could only ever be
+    set would leave a route looking broken forever after one bad afternoon.
+    """
+    return f"worker:last_poll_error:{route}"
+
+
 @dataclass
 class PollResult:
-    """One walk of the change feed."""
+    """One walk of the change feed — one route's, or every route's added together.
 
+    ``per_route`` is empty on a single route's result and holds one entry per route on the
+    combined one, so a caller can print the total and still name the folder that failed.
+    """
+
+    route: str = ""
     pages: int = 0
     items_seen: int = 0
     recorded: int = 0
@@ -77,12 +115,63 @@ class PollResult:
     cursor_held_back: int = 0
     skipped_as_ours: int = 0
     error: str = ""
+    per_route: list["PollResult"] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return not self.error
 
+    @property
+    def failed_routes(self) -> tuple[str, ...]:
+        """The routes that could not be polled, by name. Empty when every one worked."""
+        if self.per_route:
+            return tuple(r.route for r in self.per_route if not r.ok)
+        return () if self.ok else (self.route,)
+
+    @property
+    def polled_routes(self) -> tuple[str, ...]:
+        if self.per_route:
+            return tuple(r.route for r in self.per_route)
+        return (self.route,) if self.route else ()
+
+    @classmethod
+    def combine(cls, results: Sequence["PollResult"]) -> "PollResult":
+        """Add up one cycle's routes, keeping each route's own result alongside the total.
+
+        The failures are joined **named**: "whatsapp: TimeoutError ..." rather than a bare
+        message, because the first question about a failed poll is which folder it was.
+        """
+        combined = cls(per_route=list(results))
+        for one in results:
+            combined.pages += one.pages
+            combined.items_seen += one.items_seen
+            combined.recorded += one.recorded
+            combined.new.extend(one.new)
+            combined.resynced = combined.resynced or one.resynced
+            combined.cursor_held_back += one.cursor_held_back
+            combined.skipped_as_ours += one.skipped_as_ours
+        combined.error = "; ".join(
+            f"{one.route}: {one.error}" if one.route else one.error
+            for one in results
+            if not one.ok
+        )
+        return combined
+
     def line(self) -> str:
+        if len(self.per_route) > 1:
+            # Several routes: the total first, then each route by name — including the ones
+            # that worked, so "site meetings fine, WhatsApp broken" is one line rather than
+            # an inference from a number that got smaller.
+            head = f"polled {len(self.per_route)} routes, {len(self.new)} new"
+            return head + " — " + "; ".join(f"{r.route}: {r.own_line()}" for r in self.per_route)
+        if len(self.per_route) == 1:
+            # One route — the ordinary shape of a legacy `.env` — reads exactly as it did
+            # before routes existed, with no name in front of a sentence about one folder.
+            return self.per_route[0].own_line()
+        return self.own_line()
+
+    def own_line(self) -> str:
+        """This one walk, without the per-route roll-up."""
         if self.error:
             return f"poll failed: {self.error}"
         parts = [f"{self.pages} page(s)", f"{self.items_seen} item(s)", f"{len(self.new)} new"]
@@ -120,6 +209,11 @@ class CycleReport:
     def ok(self) -> bool:
         return self.poll.ok and not self.errors
 
+    @property
+    def failed_routes(self) -> tuple[str, ...]:
+        """The routes that could not be polled this cycle, by name."""
+        return self.poll.failed_routes
+
     def line(self) -> str:
         parts = [
             self.poll.line(),
@@ -127,6 +221,10 @@ class CycleReport:
             f"{self.done} done",
             f"{self.quarantined} quarantined",
         ]
+        if self.failed_routes:
+            # Named, every cycle. A count of errors does not tell anybody which folder to
+            # go and look at, and that is the only useful thing to say about a failed poll.
+            parts.append("could not poll " + ", ".join(self.failed_routes))
         if self.jobs:
             parts.append("ran " + ", ".join(self.jobs))
         if self.errors:
@@ -134,15 +232,21 @@ class CycleReport:
         return "; ".join(parts)
 
 
-def claimable_now(ledger: Ledger, limit: int, clock: float) -> list[Row]:
+def claimable_now(
+    ledger: Ledger, limit: int, clock: float, route: str | None = None
+) -> list[Row]:
     """Claimable rows whose backoff has elapsed, oldest first.
 
     The backoff lives in the row's meta rather than in a column, so it is filtered here
     rather than in SQL: a row that failed a minute ago is claimable as far as the lease is
     concerned, and hammering it again immediately is how a throttled provider stays throttled.
+
+    ``route`` narrows it to one route, which is what ``once --route`` wants. Left unset — the
+    loop's own case — every route's work is one queue, because the concurrency limit protects
+    Graph and the engine, and they do not care which folder a recording came from.
     """
     ready: list[Row] = []
-    for row in ledger.claimable(limit=limit, now=clock):
+    for row in ledger.claimable(limit=limit, now=clock, route=route):
         if float(row.meta.get("retry_at") or 0.0) > clock:
             continue
         ready.append(row)
@@ -171,7 +275,11 @@ class Worker:
         self.pipeline = pipeline or Pipeline(config, ledger, graph, owner=self.owner)
         self.heartbeat = heartbeat if heartbeat is not None else Heartbeat.from_config(config)
         self.poll_interval_s = max(1, int(getattr(config, "poll_interval_s", 120) or 120))
+        #: The whole service's limit, deliberately not each route's. Three routes are three
+        #: folders to watch, not three times the load on Graph and the engine.
         self.concurrency = max(1, int(getattr(config, "concurrency", 2) or 2))
+        #: The first route's folders, kept under their old names for anything that still
+        #: reads them. Every decision this class makes goes through ``routes`` instead.
         self.source_folder_id = str(getattr(config, "source_folder_id", "") or "") or None
         self.output_folder_id = str(getattr(config, "output_folder_id", "") or "")
 
@@ -182,6 +290,55 @@ class Worker:
         self._in_flight_lock = threading.Lock()
         self._last_sweep: Any = None
         self._last_archive: Any = None
+
+    # -- routes --------------------------------------------------------------------
+
+    @property
+    def routes(self) -> tuple[Route, ...]:
+        """Every route the configuration describes, paused ones included.
+
+        Read from the config each time rather than copied at construction: the config is the
+        one place a route is defined, and a worker holding a stale copy of it would poll a
+        folder the person who edited the ``.env`` believes is no longer watched.
+        """
+        found = tuple(getattr(self.config, "routes", ()) or ())
+        if found:
+            return found
+        # A stand-in config with no routes at all is the pre-routes shape. One route, named
+        # exactly what the ledger's migration calls those rows, so nothing is orphaned.
+        return (
+            Route(
+                name=DEFAULT_ROUTE,
+                source_folder_id=str(getattr(self.config, "source_folder_id", "") or ""),
+                output_folder_id=str(getattr(self.config, "output_folder_id", "") or ""),
+                archive_folder_id=str(getattr(self.config, "archive_folder_id", "") or ""),
+            ),
+        )
+
+    @property
+    def enabled_routes(self) -> tuple[Route, ...]:
+        """The routes actually watched. A paused route keeps its cursor and its history."""
+        return tuple(r for r in self.routes if r.enabled)
+
+    def _routes_to_poll(self, route: Route | str | None) -> tuple[Route, ...]:
+        """Which routes this call covers: one named route, or every enabled one.
+
+        A named route is polled whether or not it is enabled — asking for it by name is the
+        deliberate act that ``--route`` is, and refusing to do what was explicitly asked for
+        while saying nothing would be worse than doing it.
+        """
+        if route is None:
+            return self.enabled_routes
+        if isinstance(route, Route):
+            return (route,)
+        wanted = str(route).strip()
+        for candidate in self.routes:
+            if candidate.name == wanted:
+                return (candidate,)
+        raise LookupError(
+            f"there is no route called {wanted!r} in this configuration — the routes it "
+            f"describes are: {', '.join(r.name for r in self.routes) or '(none)'}"
+        )
 
     # -- signals -------------------------------------------------------------------
 
@@ -221,10 +378,14 @@ class Worker:
     def run(self) -> int:
         """Poll, process and schedule until asked to stop. Returns a process exit code."""
         self.install_signal_handlers()
+        watched = self.enabled_routes
         log.info(
             "started",
-            f"polling every {self.poll_interval_s}s, {self.concurrency} at a time",
-            owner=self.owner, poll_interval_s=self.poll_interval_s, concurrency=self.concurrency,
+            f"polling {len(watched)} route(s) every {self.poll_interval_s}s, "
+            f"{self.concurrency} recording(s) at a time across all of them: "
+            + ("; ".join(r.describe() for r in watched) or "none — every route is paused"),
+            owner=self.owner, poll_interval_s=self.poll_interval_s,
+            concurrency=self.concurrency, routes=",".join(r.name for r in watched),
         )
         code = 0
         try:
@@ -245,14 +406,27 @@ class Worker:
             log.info("stopped", self._stop_reason or "the loop ended", exit_code=code)
         return code
 
-    def run_once(self, *, limit: int | None = None) -> CycleReport:
-        """One cycle: poll, drain what is claimable, run whatever scheduled job is due."""
-        report = CycleReport(started_at=utc_now_iso())
-        report.poll = self.poll()
-        if not report.poll.ok:
-            report.errors.append(report.poll.error)
+    def run_once(
+        self, *, limit: int | None = None, route: Route | str | None = None
+    ) -> CycleReport:
+        """One cycle: poll every route, drain what is claimable, run the jobs that are due.
 
-        report.outcomes = self.drain(limit)
+        ``route`` narrows the whole cycle to one route — ``once --route whatsapp``. The
+        scheduled jobs still run for the service as a whole, because a nightly sweep or a
+        morning digest that covered one folder would be a report nobody could trust.
+        """
+        report = CycleReport(started_at=utc_now_iso())
+        report.poll = self.poll(route)
+        if not report.poll.ok:
+            # One error per failed route, each naming its route, rather than one line that
+            # says "the poll failed" while three of the four folders are perfectly fine.
+            for failed in report.poll.per_route or [report.poll]:
+                if not failed.ok:
+                    report.errors.append(
+                        f"{failed.route}: {failed.error}" if failed.route else failed.error
+                    )
+
+        report.outcomes = self.drain(limit, route=route)
 
         for name, ran, error in self.run_scheduled_jobs():
             if ran:
@@ -278,29 +452,82 @@ class Worker:
 
     # -- polling -------------------------------------------------------------------
 
-    def poll(self) -> PollResult:
-        """Walk delta from the stored cursor, recording rows and cursor together."""
-        result = PollResult()
-        cursor = self.ledger.cursor_get(DELTA_CURSOR)
+    def poll(self, route: Route | str | None = None) -> PollResult:
+        """Poll every enabled route in turn, each from its own cursor.
+
+        A route that fails is written down, named and stepped over: the routes after it are
+        still polled, and their recordings still reach the ledger. The combined result
+        carries every route's own result, so the caller can report the total and still say
+        which folder is broken.
+        """
+        try:
+            routes = self._routes_to_poll(route)
+        except LookupError as exc:
+            # Asked for a route that does not exist. Visible, and not fatal: the service is
+            # fine, the request was not.
+            failed = PollResult(route=str(route), error=str(exc))
+            log.error("route-unknown", str(exc), route=str(route))
+            return PollResult.combine([failed])
+
+        if not routes:
+            message = (
+                "no route is enabled, so nothing is being watched — every route in this "
+                "configuration is paused. Nothing has been lost: their cursors and their "
+                "ledger history are untouched, and enabling one starts it where it stopped."
+            )
+            log.error("no-enabled-routes", message)
+            return PollResult(error=message)
+
+        own_outputs = _output_ids(self.ledger)
+        results = [self.poll_route(one, own_outputs=own_outputs) for one in routes]
+        combined = PollResult.combine(results)
+
+        if combined.ok:
+            # The service-wide mark means *every* route polled cleanly. Each route also has
+            # its own mark, set in poll_route, so one broken folder is visible on its own.
+            self.ledger.cursor_set(LAST_POLL_OK, utc_now_iso())
+        log.info(
+            "polled", combined.line(), pages=combined.pages, seen=combined.items_seen,
+            new=len(combined.new), routes=len(results),
+            failed_routes=",".join(combined.failed_routes),
+        )
+        return combined
+
+    def poll_route(
+        self, route: Route, *, own_outputs: frozenset[str] | None = None
+    ) -> PollResult:
+        """Walk one route's delta from that route's cursor, rows and cursor together.
+
+        The invariant is unchanged and it is now per route: ``record_page`` writes this
+        route's rows and this route's cursor in one transaction, so a page this route loses
+        cannot move any other route's mark, and no route's mark can move past a recording
+        that was not recorded.
+        """
+        result = PollResult(route=route.name)
+        cursor_name = delta_cursor_name(route.name)
+        cursor = self.ledger.cursor_get(cursor_name)
+        if own_outputs is None:
+            own_outputs = _output_ids(self.ledger)
 
         def on_resync(exc: ResyncRequired) -> None:
             result.resynced = True
             self.ledger.rewind_cursor(
-                DELTA_CURSOR,
-                "Microsoft Graph rejected the stored delta cursor (HTTP 410); "
-                "re-enumerating the folder from zero",
+                cursor_name,
+                f"Microsoft Graph rejected the stored delta cursor for route "
+                f"{route.name} (HTTP 410); re-enumerating that folder from zero",
             )
-            log.warning("delta-resync", str(exc))
+            log.warning("delta-resync", f"{route.display}: {exc}", route=route.name)
 
-        own_outputs = _output_ids(self.ledger)
         try:
-            for page in self.graph.delta_with_resync(self.source_folder_id, cursor, on_resync):
+            for page in self.graph.delta_with_resync(
+                route.source_folder_id or None, cursor, on_resync
+            ):
                 result.pages += 1
                 rows: list[DriveItem] = []
                 for item in page.items:
                     result.items_seen += 1
                     deleted = bool(getattr(item, "is_deleted", False))
-                    if not deleted and self._is_ours(item, own_outputs):
+                    if not deleted and self._is_ours(item, own_outputs, route):
                         # Only live items are filtered as ours. A deletion is tested first
                         # because ``classify`` calls one STRUCTURE before anything else, so
                         # dropping it here meant a recording deleted or moved out of /CALLS
@@ -313,28 +540,31 @@ class Worker:
                     if not str(getattr(item, "id", "") or ""):
                         log.error(
                             "delta-item-without-id",
-                            f"Graph returned an item with no id (name {getattr(item, 'name', '')!r}); "
-                            f"it cannot be tracked and has not been recorded",
+                            f"Graph returned an item with no id (name {getattr(item, 'name', '')!r}) "
+                            f"on route {route.name}; it cannot be tracked and has not been recorded",
+                            route=route.name,
                         )
                         continue
                     rows.append(DriveItem.from_graph_item(item))
 
                 if page.cursor:
-                    new = self.ledger.record_page(rows, page.cursor)
+                    new = self.ledger.record_page(rows, page.cursor, route=route.name)
                     result.recorded += len(rows)
                     result.new.extend(new)
                 else:
                     # No deltaLink and no nextLink. Record the rows; leave the cursor where
                     # it is. Re-reading a page is free; advancing past one is not.
                     for row in rows:
-                        if self.ledger.upsert_discovered(row):
+                        if self.ledger.upsert_discovered(row, route.name):
                             result.new.append(row.item_id)
                     result.recorded += len(rows)
                     result.cursor_held_back += 1
                     log.error(
                         "delta-page-without-cursor",
-                        "a delta page carried no cursor, so the rows were recorded and the "
-                        "cursor was left unchanged; the next poll re-reads this page",
+                        f"a delta page on route {route.name} carried no cursor, so the rows "
+                        f"were recorded and the cursor was left unchanged; the next poll "
+                        f"re-reads this page",
+                        route=route.name,
                     )
         except PIPELINE_FATAL_ERRORS as exc:
             # A rejected credential, an unusable configuration or a broken ledger is a fault
@@ -343,32 +573,87 @@ class Worker:
             # cycle error left the loop spinning on a failing poll indefinitely, never
             # pinging the heartbeat's failure endpoint, while the morning email said only
             # "nothing arrived yesterday". One list of fatal classes, not two.
-            raise PipelineFatal(f"{type(exc).__name__}: {exc}") from exc
-        except Exception as exc:  # noqa: BLE001 - the loop must survive one bad poll
+            #
+            # This is the one thing a route does NOT survive on its own: the credential it
+            # failed on is the credential every other route uses, so carrying on would mean
+            # reporting the same fault once per route, forever, and stopping for none of it.
+            raise PipelineFatal(f"route {route.name}: {type(exc).__name__}: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - one bad folder is not the whole service
             result.error = f"{type(exc).__name__}: {exc}"
-            log.exception("poll-failed", result.error)
+            self._remember_route_poll(route, result.error)
+            log.exception(
+                "poll-failed",
+                f"{route.display} ({route.name}) could not be polled: {result.error}. "
+                f"The other routes are unaffected and this route's cursor has not moved, so "
+                f"nothing in that folder has been skipped — it is re-read when it recovers.",
+                route=route.name,
+            )
             return result
 
-        self.ledger.cursor_set(LAST_POLL_OK, utc_now_iso())
+        self._remember_route_poll(route, "")
         for item_id in result.new:
             row = self.ledger.get(item_id)
-            log.info("discovered", row.name if row else item_id, item=item_id)
-        log.info("polled", result.line(), pages=result.pages, seen=result.items_seen,
-                 new=len(result.new))
+            log.info("discovered", row.name if row else item_id, item=item_id, route=route.name)
+        log.info(
+            "polled-route", f"{route.name}: {result.own_line()}", route=route.name,
+            pages=result.pages, seen=result.items_seen, new=len(result.new),
+        )
         return result
 
-    def _is_ours(self, item: Any, own_outputs: frozenset[str]) -> bool:
-        """Our own markdown, seen because the output folder is inside the watched tree."""
-        kind = sweep_module.classify(
-            item, output_folder_id=self.output_folder_id, own_output_ids=own_outputs
-        )
-        return kind in (sweep_module.OUR_OUTPUT, sweep_module.STRUCTURE)
+    def _remember_route_poll(self, route: Route, error: str) -> None:
+        """Write down how this route's poll went, where a restart cannot lose it.
+
+        Never raises: a mark that could not be written must not turn a working poll into a
+        failed one, and the log already carries the same fact.
+        """
+        try:
+            self.ledger.cursor_set(route_poll_error_mark(route.name), error[:400])
+            if not error:
+                self.ledger.cursor_set(route_poll_ok_mark(route.name), utc_now_iso())
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail the poll
+            log.warning("route-mark-not-recorded", f"{route.name}: {exc}", route=route.name)
+
+    def _is_ours(
+        self, item: Any, own_outputs: frozenset[str], route: Route | None = None
+    ) -> bool:
+        """Our own markdown, seen because an output folder is inside a watched tree.
+
+        Every route's output folder is considered, not only the one being polled: routes may
+        share an output folder, and the folder that sits inside somebody's watched tree is
+        not necessarily the one whose recordings we are reading. Missing one of them means
+        transcribing our own transcript.
+        """
+        for folder in self._output_folders(route):
+            kind = sweep_module.classify(
+                item, output_folder_id=folder, own_output_ids=own_outputs
+            )
+            if kind in (sweep_module.OUR_OUTPUT, sweep_module.STRUCTURE):
+                return True
+        return False
+
+    def _output_folders(self, route: Route | None = None) -> tuple[str, ...]:
+        """Every folder this service writes into, the polled route's first. Never empty."""
+        ordered = [str(getattr(route, "output_folder_id", "") or "")]
+        ordered.extend(str(r.output_folder_id or "") for r in self.routes)
+        ordered.append(self.output_folder_id)
+        return tuple(dict.fromkeys(ordered))
 
     # -- processing ----------------------------------------------------------------
 
-    def drain(self, limit: int | None = None) -> list[Outcome]:
-        """Process everything claimable, ``concurrency`` at a time, then return."""
-        rows = claimable_now(self.ledger, limit or (self.concurrency * 8), self.clock())
+    def drain(
+        self, limit: int | None = None, *, route: Route | str | None = None
+    ) -> list[Outcome]:
+        """Process everything claimable, ``concurrency`` at a time, then return.
+
+        One queue across every route on purpose. Each row carries the route that decides
+        where its outputs go, so nothing is lost by mixing them — and draining route by
+        route with its own pool would multiply the load on Graph and the engine by the
+        number of folders he happens to watch.
+        """
+        wanted = route.name if isinstance(route, Route) else (str(route) if route else None)
+        rows = claimable_now(
+            self.ledger, limit or (self.concurrency * 8), self.clock(), route=wanted
+        )
         if not rows:
             return []
         if self.stopping:
@@ -435,7 +720,7 @@ class Worker:
                 item=row.item_id,
             )
         return Outcome(item_id=row.item_id, name=row.name, result=result,
-                       state=row.state, reason=reason)
+                       state=row.state, reason=reason, route=row.route)
 
     def _process(self, row: Row) -> Outcome:
         with self._tracking(row.item_id), item_context(row.item_id):

@@ -411,41 +411,56 @@ class Ledger:
         rows: Sequence[DriveItem],
         new_cursor: str,
         *,
-        cursor_name: str = DELTA_CURSOR,
+        route: str = DEFAULT_ROUTE,
+        cursor_name: str | None = None,
     ) -> list[str]:
-        """Commit one delta page's rows **and** its cursor, or neither.
+        """Commit one route's delta page — **that route's rows and that route's cursor**, or neither.
 
-        This is the only way the delta cursor advances. Returns the ids that were new, so a
+        This is the only way a delta cursor advances. Returns the ids that were new, so a
         caller can log what arrived without a second query.
+
+        Routes did not dilute this. Each route polls its own folder with its own cursor, and
+        one transaction covers exactly one route's page: a page that fails to commit takes
+        down only its own route's rows and leaves only its own route's cursor where it was.
+        No route's mark can move because another route wrote something, and no route's mark
+        can move past a recording that was not recorded.
+
+        ``cursor_name`` is for the one caller that keeps a delta cursor which is not a
+        route's — the backfill's ``delta:backfill``. Leave it alone and the route's own live
+        cursor is what moves.
         """
         if not isinstance(new_cursor, str) or not new_cursor.strip():
             raise LedgerInvariantError(
                 "record_page needs the cursor Graph returned for this page; without it the "
                 "next poll would re-read from the old one forever"
             )
+        route_name = _cursor_route(route)
+        name = cursor_name or delta_cursor_name(route_name)
         now = utc_now_iso()
         inserted: list[str] = []
         with self._tx() as conn:
             for item in rows:
-                if self._upsert(conn, item, now):
+                if self._upsert(conn, item, now, route_name):
                     inserted.append(item.item_id)
-            self._write_cursor(conn, cursor_name, new_cursor, now)
+            self._write_cursor(conn, name, new_cursor, now)
         return inserted
 
-    def upsert_discovered(self, item: DriveItem) -> bool:
+    def upsert_discovered(self, item: DriveItem, route: str = DEFAULT_ROUTE) -> bool:
         """Record one item outside a delta page (backfill, a direct GET, a re-check).
 
         True when the row is new. Never resets an existing row's state: a file seen again is
         the same file, whatever we have since done with it.
         """
         with self._tx() as conn:
-            return self._upsert(conn, item, utc_now_iso())
+            return self._upsert(conn, item, utc_now_iso(), _cursor_route(route))
 
-    def _upsert(self, conn: sqlite3.Connection, item: DriveItem, now: str) -> bool:
+    def _upsert(
+        self, conn: sqlite3.Connection, item: DriveItem, now: str, route: str = DEFAULT_ROUTE
+    ) -> bool:
         if not item.item_id:
             raise LedgerError(f"a driveItem with no id cannot be recorded: {item.name!r}")
         existing = conn.execute(
-            "SELECT state, name, size, etag FROM items WHERE item_id=?", (item.item_id,)
+            "SELECT state, name, size, etag, route FROM items WHERE item_id=?", (item.item_id,)
         ).fetchone()
 
         if item.deleted:
@@ -464,16 +479,17 @@ class Ledger:
         if existing is None:
             conn.execute(
                 "INSERT INTO items ("
-                " item_id, name, state, size, etag, parent_id, web_url, created_at, modified_at,"
-                " discovered_at, updated_at, graph_hash"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " item_id, name, state, route, size, etag, parent_id, web_url, created_at,"
+                " modified_at, discovered_at, updated_at, graph_hash"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    item.item_id, item.name, State.DISCOVERED, int(item.size or 0), item.etag,
+                    item.item_id, item.name, State.DISCOVERED, route, int(item.size or 0), item.etag,
                     item.parent_id, item.web_url, item.created_at, item.modified_at,
                     now, now, item.best_hash,
                 ),
             )
-            self._event(conn, item.item_id, "discovered", now, None, State.DISCOVERED, item.name)
+            self._event(conn, item.item_id, "discovered", now, None, State.DISCOVERED,
+                        f"{item.name} (route {route})")
             return True
 
         conn.execute(
@@ -486,6 +502,18 @@ class Ledger:
                 item.created_at, item.modified_at, item.best_hash, now, item.item_id,
             ),
         )
+        if existing["route"] != route:
+            # The same recording turning up on a second route means it moved between watched
+            # folders. The row keeps the route it was discovered on, because that is where
+            # its outputs went and where its archive is; but a recording that appears to
+            # belong to two routes is a configuration somebody should look at, so it is
+            # written into the history rather than resolved silently.
+            self._event(
+                conn, item.item_id, "route-disagreement", now, existing["state"], existing["state"],
+                f"discovered on route {existing['route']}, seen again on route {route}; "
+                f"it stays on {existing['route']}",
+            )
+
         changed = int(existing["size"] or 0) != int(item.size or 0) or existing["etag"] != item.etag
         if changed and existing["state"] in (State.DONE, State.SKIPPED_EMPTY):
             # The bytes changed after we finished with it. Nobody is going to notice that
@@ -509,7 +537,7 @@ class Ledger:
         same transaction is the exact way a recording is lost, so there is no polite path
         to it: use :meth:`record_page`.
         """
-        if name.startswith(_GUARDED_PREFIX):
+        if is_delta_cursor(name):
             raise LedgerInvariantError(
                 f"{name!r} is a delta cursor and cannot be set on its own — it advances only "
                 "in the same transaction as the rows from its page, via record_page()"
@@ -728,6 +756,33 @@ class Ledger:
             )
             self._event(conn, item_id, "requeued", now, current["state"], state, clean)
 
+    def reassign_route(self, item_id: str, route: str, reason: str) -> None:
+        """Move one recording to a different route, deliberately and with a reason recorded.
+
+        The only way the ``route`` column changes after discovery. It is not an ordinary
+        field write because the route decides where this recording's transcript is written
+        and which archive it ages into: doing it by accident sends a finished recording's
+        outputs to a folder nobody chose, and nothing would say so.
+        """
+        target = _cursor_route(route)
+        if not (reason or "").strip():
+            raise LedgerError("moving a recording to another route is a manual act and needs a stated reason")
+        clean = self._clean(reason)
+        now = utc_now_iso()
+        with self._tx() as conn:
+            current = conn.execute(
+                "SELECT state, route FROM items WHERE item_id=?", (item_id,)
+            ).fetchone()
+            if current is None:
+                raise LedgerError(f"no ledger row for {item_id!r}")
+            conn.execute(
+                "UPDATE items SET route=?, updated_at=? WHERE item_id=?", (target, now, item_id)
+            )
+            self._event(
+                conn, item_id, "route-changed", now, current["state"], current["state"],
+                f"{current['route']} -> {target}: {clean}",
+            )
+
     def record_attempt(self, item_id: str, error: str, *, owner: str | None = None) -> int:
         """Count a failure, keep its message, and let go of the claim.
 
@@ -756,26 +811,40 @@ class Ledger:
         record = self._conn().execute("SELECT * FROM items WHERE item_id=?", (item_id,)).fetchone()
         return None if record is None else Row.from_db(record)
 
-    def unfinished(self) -> list[Row]:
-        """Everything not in a terminal state, oldest first — what the sweep re-queues."""
+    def unfinished(self, route: str | None = None) -> list[Row]:
+        """Everything not in a terminal state, oldest first — what the sweep re-queues.
+
+        ``route`` narrows it to one route, so a sweep of one route re-queues that route's
+        work and reports on that route, and a route that is failing cannot be hidden inside
+        a whole-service total.
+        """
         terminal = tuple(sorted(State.TERMINAL))
         placeholders = ",".join("?" for _ in terminal)
+        clause, params = self._route_filter(route)
         records = self._conn().execute(
-            f"SELECT * FROM items WHERE state NOT IN ({placeholders}) ORDER BY discovered_at ASC",
-            terminal,
+            f"SELECT * FROM items WHERE state NOT IN ({placeholders}){clause}"
+            " ORDER BY discovered_at ASC",
+            (*terminal, *params),
         ).fetchall()
         return [Row.from_db(r) for r in records]
 
-    def claimable(self, limit: int = 100, now: float | None = None) -> list[Row]:
-        """Unfinished rows nobody holds a live lease on, oldest first."""
+    def claimable(
+        self, limit: int = 100, now: float | None = None, route: str | None = None
+    ) -> list[Row]:
+        """Unfinished rows nobody holds a live lease on, oldest first.
+
+        Left unfiltered on purpose by the ordinary worker loop: every route's work is one
+        queue, and each row carries the route that decides where its outputs go.
+        """
         clock = time.time() if now is None else now
         active = tuple(sorted(State.ACTIVE))
         placeholders = ",".join("?" for _ in active)
+        clause, params = self._route_filter(route)
         records = self._conn().execute(
             f"SELECT * FROM items WHERE state IN ({placeholders})"
-            " AND (lease_until IS NULL OR lease_until < ?)"
+            f" AND (lease_until IS NULL OR lease_until < ?){clause}"
             " ORDER BY discovered_at ASC LIMIT ?",
-            (*active, clock, int(limit)),
+            (*active, clock, *params, int(limit)),
         ).fetchall()
         return [Row.from_db(r) for r in records]
 
@@ -813,30 +882,53 @@ class Ledger:
         ).fetchone()
         return None if record is None else str(record["item_id"])
 
-    def rows_in_state(self, state: str) -> list[Row]:
+    def rows_in_state(self, state: str, route: str | None = None) -> list[Row]:
+        clause, params = self._route_filter(route)
         records = self._conn().execute(
-            "SELECT * FROM items WHERE state=? ORDER BY discovered_at ASC", (state,)
+            f"SELECT * FROM items WHERE state=?{clause} ORDER BY discovered_at ASC",
+            (state, *params),
         ).fetchall()
         return [Row.from_db(r) for r in records]
 
-    def due_for_archive(self, older_than_days: int, now: float | None = None) -> list[Row]:
+    def routes_seen(self) -> tuple[str, ...]:
+        """Every route that has ever recorded a row, in name order.
+
+        Including routes no longer in the configuration: taking a route out of ``ROUTES``
+        stops it being watched and deletes nothing, so its history is still here to be
+        reported and still has to be findable.
+        """
+        return tuple(
+            str(r["route"])
+            for r in self._conn().execute(
+                "SELECT DISTINCT route FROM items ORDER BY route ASC"
+            ).fetchall()
+        )
+
+    def due_for_archive(
+        self, older_than_days: int, now: float | None = None, route: str | None = None
+    ) -> list[Row]:
         """Done recordings past the age, whose three outputs are recorded as present.
 
         Never a failure, never one whose outputs we cannot name: an original is only moved
         on evidence, never on the system's own belief that it finished.
+
+        ``route`` matters here more than anywhere else. Each route archives into its own
+        folder, and a recording must never be moved into a folder belonging to a route it
+        did not arrive on, so the archive pass asks one route at a time.
         """
         clock = time.time() if now is None else now
         cutoff = utc_now_iso(clock - older_than_days * 86400)
+        clause, params = self._route_filter(route)
         records = self._conn().execute(
             "SELECT * FROM items WHERE state=? AND archived_at IS NULL"
             " AND transcript_name IS NOT NULL AND summary_name IS NOT NULL AND actions_name IS NOT NULL"
-            " AND COALESCE(created_at, discovered_at) < ?"
+            f" AND COALESCE(created_at, discovered_at) < ?{clause}"
             " ORDER BY COALESCE(created_at, discovered_at) ASC",
-            (State.DONE, cutoff),
+            (State.DONE, cutoff, *params),
         ).fetchall()
         return [Row.from_db(r) for r in records]
 
-    def counts_for_day(self, day: str) -> dict:
+    def counts_for_day(self, day: str, route: str | None = None) -> dict:
         """What the digest reports: the cohort discovered on ``day`` and how it ended up.
 
         ``in_flight`` is a count of recordings from that day that are still unfinished —
@@ -846,12 +938,18 @@ class Ledger:
         ``failures`` deliberately carries **every** quarantined recording, not only that
         day's: one nobody has dealt with is still a failure this morning, and a list that
         forgets it is how it stops being anybody's job.
+
+        ``route=None`` is the whole service, which is what the subject line counts. Asked
+        one route at a time it gives the digest its per-route breakdown, so "site meetings
+        all fine, WhatsApp broken" is visible instead of averaged away in a total.
         """
         conn = self._conn()
         like = f"{day}%"
+        clause, params = self._route_filter(route)
         by_state: dict[str, int] = {}
         for record in conn.execute(
-            "SELECT state, COUNT(*) AS n FROM items WHERE discovered_at LIKE ? GROUP BY state", (like,)
+            f"SELECT state, COUNT(*) AS n FROM items WHERE discovered_at LIKE ?{clause} GROUP BY state",
+            (like, *params),
         ).fetchall():
             by_state[record["state"]] = int(record["n"])
         discovered = sum(by_state.values())
@@ -873,21 +971,27 @@ class Ledger:
                 "attempts": int(r["attempts"] or 0),
                 "web_url": r["web_url"],
                 "discovered_at": r["discovered_at"],
+                "route": r["route"],
             }
             for r in conn.execute(
-                "SELECT * FROM items WHERE state=? OR (discovered_at LIKE ? AND state NOT IN (?,?,?))"
-                " ORDER BY discovered_at ASC",
-                (State.QUARANTINED, like, State.DONE, State.QUARANTINED, State.SKIPPED_EMPTY),
+                "SELECT * FROM items WHERE (state=? OR (discovered_at LIKE ? AND state NOT IN (?,?,?)))"
+                f"{clause} ORDER BY discovered_at ASC",
+                (State.QUARANTINED, like, State.DONE, State.QUARANTINED, State.SKIPPED_EMPTY, *params),
             ).fetchall()
         ]
         done_on_day = int(
-            conn.execute("SELECT COUNT(*) AS n FROM items WHERE done_at LIKE ?", (like,)).fetchone()["n"]
+            conn.execute(
+                f"SELECT COUNT(*) AS n FROM items WHERE done_at LIKE ?{clause}", (like, *params)
+            ).fetchone()["n"]
         )
         archived = int(
-            conn.execute("SELECT COUNT(*) AS n FROM items WHERE archived_at LIKE ?", (like,)).fetchone()["n"]
+            conn.execute(
+                f"SELECT COUNT(*) AS n FROM items WHERE archived_at LIKE ?{clause}", (like, *params)
+            ).fetchone()["n"]
         )
         return {
             "day": day,
+            "route": route,
             "discovered": discovered,
             "done": done,
             "quarantined": quarantined,
@@ -899,7 +1003,7 @@ class Ledger:
             "failures": failures,
         }
 
-    def attention_for_day(self, day: str) -> dict[str, Any]:
+    def attention_for_day(self, day: str, route: str | None = None) -> dict[str, Any]:
         """What a person should look at that is not a state change, for the morning email.
 
         None of these move a row, so none of them appears in a count of states — and until
@@ -911,9 +1015,11 @@ class Ledger:
         review_rows: list[dict[str, Any]] = []
         unverified_guard = 0
         degraded = 0
+        clause, params = self._route_filter(route)
         for record in self._conn().execute(
-            "SELECT item_id, name, meta FROM items WHERE discovered_at LIKE ? ORDER BY discovered_at ASC",
-            (like,),
+            f"SELECT item_id, name, route, meta FROM items WHERE discovered_at LIKE ?{clause}"
+            " ORDER BY discovered_at ASC",
+            (like, *params),
         ).fetchall():
             meta = _decode_meta(record["meta"])
             analysis = meta.get("analysis") if isinstance(meta.get("analysis"), dict) else {}
@@ -923,6 +1029,7 @@ class Ledger:
                 review_rows.append({
                     "item_id": record["item_id"],
                     "name": record["name"],
+                    "route": record["route"],
                     "count": count,
                     # The items themselves, so the promise the summary and actions files make
                     # — "kept against this recording" — is one somebody can actually collect on.
@@ -952,8 +1059,13 @@ class Ledger:
             r["name"]: {"value_present": bool(r["value"]), "updated_at": r["updated_at"]}
             for r in conn.execute("SELECT * FROM cursors").fetchall()
         }
+        by_route: dict[str, dict[str, int]] = {}
+        for r in conn.execute(
+            "SELECT route, state, COUNT(*) AS n FROM items GROUP BY route, state"
+        ).fetchall():
+            by_route.setdefault(str(r["route"]), {})[str(r["state"])] = int(r["n"])
         oldest = conn.execute(
-            "SELECT item_id, name, discovered_at FROM items WHERE state NOT IN (?,?,?)"
+            "SELECT item_id, name, route, discovered_at FROM items WHERE state NOT IN (?,?,?)"
             " ORDER BY discovered_at ASC LIMIT 1",
             (State.DONE, State.QUARANTINED, State.SKIPPED_EMPTY),
         ).fetchone()
@@ -962,6 +1074,10 @@ class Ledger:
             "schema_version": self.schema_version(),
             "total": sum(by_state.values()),
             "by_state": by_state,
+            # Per route as well as in total, because "23 done, 3 failed" across the whole
+            # service does not say that all three failures are one folder that stopped working.
+            "by_route": by_route,
+            "routes": tuple(sorted(by_route)),
             "cursors": cursors,
             "oldest_unfinished": dict(oldest) if oldest is not None else None,
         }
@@ -980,6 +1096,17 @@ class Ledger:
         return [dict(r) for r in records]
 
     # -- internals -----------------------------------------------------------------
+
+    @staticmethod
+    def _route_filter(route: str | None) -> tuple[str, tuple[Any, ...]]:
+        """``route=None`` means every route — the whole-service view the digest still needs.
+
+        Returned as a fragment plus its parameters so the read methods stay one query each
+        rather than two spellings of the same query kept in step by hand.
+        """
+        if route is None:
+            return "", ()
+        return " AND route=?", (_cursor_route(route),)
 
     def _assignments(self, fields: Mapping[str, Any]) -> tuple[list[str], list[Any]]:
         assignments: list[str] = []

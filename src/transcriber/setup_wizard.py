@@ -6,6 +6,14 @@ question at a time, in plain words, and — the part that actually matters — *
 answer against the real service before moving on**. A wrong tenant id found here costs
 thirty seconds; found at 06:00 on a Tuesday it costs a day of recordings.
 
+Section 2 is the routes: one per kind of recording he makes, each with the folder it
+arrives in and the folder its transcripts land in. Nobody is asked to know a driveItem id —
+folders are chosen from the live drive by name — and nobody is asked to invent a structure
+either: a first run offers his three actual kinds, ready to accept. Every change is checked
+against the whole set at once, because the misconfiguration that matters is between two
+routes rather than inside one: transcripts written into a watched folder come back round as
+new recordings, and the same folder watched twice means two claims on one recording.
+
 Two rules the whole module obeys:
 
 * **A secret is never echoed, never logged, never written anywhere but ``.env``.** Typed
@@ -27,12 +35,22 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Sequence
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Mapping, Sequence
 
 from . import config as config_mod
+from .models import DEFAULT_ROUTE, Route, is_route_name, route_env_var
 
-__all__ = ["run_setup", "load_env_file", "write_env_file"]
+__all__ = [
+    "run_setup",
+    "load_env_file",
+    "write_env_file",
+    "routes_from_values",
+    "routes_to_values",
+    "route_problems",
+    "SUGGESTED_ROUTES",
+    "FEEDBACK_LOOP",
+]
 
 
 # ---------------------------------------------------------------------------------------
@@ -133,8 +151,8 @@ def write_env_file(path: str, values: dict[str, str], *, header: Sequence[str] =
         lines.append("")
 
     written: set[str] = set()
-    for group, members in _GROUPS:
-        present = [v for v in members if v in values]
+    for group, members in _effective_groups(values):
+        present = [v for v in members if v in values and v not in written]
         if not present:
             continue
         lines.append(f"# --- {group} " + "-" * max(0, 70 - len(group)))
@@ -165,11 +183,22 @@ def write_env_file(path: str, values: dict[str, str], *, header: Sequence[str] =
     os.chmod(path, 0o600)
 
 
+#: The heading the routes are written under. Named once, because
+#: :func:`_effective_groups` finds the group by this string in order to splice each route's
+#: own variables in after ``ROUTES``.
+ROUTE_GROUP = "the routes — one per kind of recording"
+
 _GROUPS: list[tuple[str, list[str]]] = [
     ("Microsoft / OneDrive", [
         "GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "GRAPH_USER_ID",
-        "GRAPH_SECRET_EXPIRES_ON",
-        "SOURCE_FOLDER_ID", "OUTPUT_FOLDER_ID", "ARCHIVE_FOLDER_ID", "ORPHAN_FOLDER_ID",
+        "GRAPH_SECRET_EXPIRES_ON", "ORPHAN_FOLDER_ID",
+    ]),
+    # ROUTES first, then each route's own six variables in the order they were asked for,
+    # then the three single-folder settings a .env written before routes existed uses. The
+    # per-route names depend on the route names, so they are spliced in at write time.
+    (ROUTE_GROUP, [
+        "ROUTES",
+        "SOURCE_FOLDER_ID", "OUTPUT_FOLDER_ID", "ARCHIVE_FOLDER_ID",
     ]),
     ("transcription", [
         "TRANSCRIBE_ENGINE", "OPENAI_API_KEY", "ELEVENLABS_API_KEY",
@@ -195,9 +224,257 @@ SECRET_VARS = {
 }
 
 
+def _route_names_in(values: Mapping[str, str]) -> list[str]:
+    """The route names ``ROUTES`` lists, in the order it lists them, without duplicates."""
+    raw = str(values.get("ROUTES") or "").strip()
+    out: list[str] = []
+    for part in raw.replace("\n", ",").split(","):
+        name = part.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _effective_groups(values: Mapping[str, str]) -> list[tuple[str, list[str]]]:
+    """``_GROUPS``, with each route's own variables spliced into the routes group.
+
+    ``ROUTE_SITE_MEETINGS_SOURCE`` cannot be listed in a static table because the name of
+    the route is half of it. Without this the route settings fall through to the "other"
+    heading at the bottom, sorted alphabetically, which scatters a route's six lines across
+    the file and puts the folders of one kind of recording next to the folders of another.
+    """
+    route_vars: list[str] = []
+    for name in _route_names_in(values):
+        route_vars.extend(route_env_var(name, suffix) for suffix in config_mod.ROUTE_SUFFIXES)
+    # Anything ROUTE_-shaped that no listed route claims: a route taken out of ROUTES by
+    # hand, most likely. Keep it with the routes rather than in "other", so the file still
+    # reads as one section per subject.
+    known = set(route_vars)
+    orphans = sorted(k for k in values if k.startswith("ROUTE_") and k not in known)
+
+    groups: list[tuple[str, list[str]]] = []
+    for group, members in _GROUPS:
+        if group == ROUTE_GROUP:
+            head = [m for m in members if m == "ROUTES"]
+            tail = [m for m in members if m != "ROUTES"]
+            groups.append((group, head + route_vars + orphans + tail))
+        else:
+            groups.append((group, list(members)))
+    return groups
+
+
+# ---------------------------------------------------------------------------------------
+# routes — reading them out of a .env, writing them back, and saying what is wrong
+# ---------------------------------------------------------------------------------------
+
+#: His three actual kinds of recording, offered on a first run so that the answer to "what
+#: routes do you want?" is a single Enter rather than an invitation to invent a structure.
+SUGGESTED_ROUTES: tuple[tuple[str, str], ...] = (
+    ("calls", "Phone calls"),
+    ("site-meetings", "Site meetings"),
+    ("whatsapp", "WhatsApp voice notes"),
+)
+
+#: The one sentence that has to be said when a route's transcripts would land in a folder
+#: something watches. Every other misconfiguration here costs a restart; this one has the
+#: service transcribing its own transcripts, for as long as nobody notices — so it is
+#: spelled out in words rather than described as a rule number.
+FEEDBACK_LOOP = "That would make the service read its own transcripts as new recordings."
+
+
+def routes_from_values(values: Mapping[str, str]) -> list[Route]:
+    """The routes a set of ``.env`` values describes, in the order they are listed.
+
+    A file with no ``ROUTES`` but the older single-folder settings is one route called
+    ``default`` — the same reading :mod:`transcriber.config` gives it, so re-running the
+    wizard over a ``.env`` written before routes existed shows him what he already has
+    instead of an empty list and a question he has answered before.
+    """
+    names = _route_names_in(values)
+    if names:
+        routes: list[Route] = []
+        for name in names:
+            def var(suffix: str, _name: str = name) -> str:
+                return str(values.get(route_env_var(_name, suffix)) or "").strip()
+
+            routes.append(
+                Route(
+                    name=name,
+                    label=var("LABEL"),
+                    source_folder_id=var("SOURCE"),
+                    output_folder_id=var("OUTPUT"),
+                    archive_folder_id=var("ARCHIVE"),
+                    engine=var("ENGINE").lower(),
+                    enabled=var("ENABLED").lower() not in ("0", "false", "no", "off"),
+                )
+            )
+        return routes
+
+    legacy = [str(values.get(key) or "").strip() for key in
+              ("SOURCE_FOLDER_ID", "OUTPUT_FOLDER_ID", "ARCHIVE_FOLDER_ID")]
+    if any(legacy):
+        return [
+            Route(
+                name=DEFAULT_ROUTE,
+                label="Recordings",
+                source_folder_id=legacy[0],
+                output_folder_id=legacy[1],
+                archive_folder_id=legacy[2],
+            )
+        ]
+    return []
+
+
+def routes_to_values(values: dict[str, str], routes: Sequence[Route]) -> dict[str, str]:
+    """Write the routes into the ``.env`` values, and take out what they replace.
+
+    Every ``ROUTE_*`` variable is cleared first, so a route he removed does not leave its
+    folders behind for a later hand-edit of ``ROUTES`` to resurrect. The three
+    single-folder settings go too: once ``ROUTES`` is set the service ignores them
+    completely, and a file that still lists them is a file that invites somebody to edit
+    the setting that does nothing.
+    """
+    for key in [k for k in values if k.startswith("ROUTE_")]:
+        del values[key]
+    for key in ("SOURCE_FOLDER_ID", "OUTPUT_FOLDER_ID", "ARCHIVE_FOLDER_ID"):
+        values.pop(key, None)
+
+    values["ROUTES"] = ",".join(route.name for route in routes)
+    for route in routes:
+        values[route_env_var(route.name, "LABEL")] = route.label
+        values[route_env_var(route.name, "SOURCE")] = route.source_folder_id
+        values[route_env_var(route.name, "OUTPUT")] = route.output_folder_id
+        values[route_env_var(route.name, "ARCHIVE")] = route.archive_folder_id
+        values[route_env_var(route.name, "ENGINE")] = route.engine
+        values[route_env_var(route.name, "ENABLED")] = "true" if route.enabled else "false"
+    return values
+
+
+def _phrase(route: Route) -> str:
+    """How a route is named in a sentence somebody reads: ``Phone calls (calls)``."""
+    label = (route.label or "").strip()
+    return f"{label} ({route.name})" if label else route.name
+
+
+def route_problems(routes: Sequence[Route]) -> list[str]:
+    """Everything wrong with a set of routes, in the words he would use.
+
+    This is the wizard's own copy of the rules so that a problem can be shown the moment it
+    is created rather than at the end of a twenty-question run. It is deliberately no more
+    permissive than :func:`transcriber.config._validate_routes`, and it is not the
+    authority: what the wizard writes is loaded back through the real ``Config`` before it
+    claims to have finished, so the two cannot quietly disagree about whether the service
+    will start.
+    """
+    problems: list[str] = []
+    if not routes:
+        problems.append(
+            "There are no routes yet, so nothing would be watched and nothing transcribed. "
+            "Add at least one."
+        )
+
+    seen: set[str] = set()
+    for route in routes:
+        if not is_route_name(route.name):
+            problems.append(
+                f"{route.name!r} will not do as a short name — lowercase letters, digits and "
+                "hyphens only, starting with a letter or a digit, like site-meetings."
+            )
+        if route.name in seen:
+            problems.append(
+                f"There are two routes called {route.name!r}. The short name is what the "
+                "ledger records against every recording, so each route needs its own."
+            )
+        seen.add(route.name)
+
+    enabled = [r for r in routes if r.enabled]
+    if routes and not enabled:
+        problems.append(
+            "Every route is paused, so nothing would be watched. Switch at least one back on."
+        )
+
+    for route in enabled:
+        if not route.source_folder_id:
+            problems.append(f"{_phrase(route)} has no folder to watch for recordings.")
+        if not route.output_folder_id:
+            problems.append(f"{_phrase(route)} has nowhere to write its transcripts.")
+
+    # The feedback loop, checked across every route whether it is paused or not: a paused
+    # route is a folder somebody switches back on later without re-reading the whole file.
+    for writer in routes:
+        if not writer.output_folder_id:
+            continue
+        for watcher in routes:
+            if writer.output_folder_id != watcher.source_folder_id or not watcher.source_folder_id:
+                continue
+            if writer.name == watcher.name:
+                problems.append(
+                    f"{_phrase(writer)} writes its transcripts into the very folder it "
+                    f"watches for recordings. {FEEDBACK_LOOP}"
+                )
+            else:
+                problems.append(
+                    f"{_phrase(writer)} writes its transcripts into the folder "
+                    f"{_phrase(watcher)} watches for recordings. {FEEDBACK_LOOP}"
+                )
+
+    # One folder, one route. Two cursors over one folder is two claims on one recording.
+    for index, first in enumerate(enabled):
+        if not first.source_folder_id:
+            continue
+        for second in enabled[index + 1:]:
+            if first.source_folder_id == second.source_folder_id:
+                problems.append(
+                    f"{_phrase(first)} and {_phrase(second)} watch the same folder. A "
+                    "recording can only belong to one of them, and whichever saw it first "
+                    "would own it while the other moved past it as though it were handled."
+                )
+
+    # Sharing an output folder is allowed on purpose — pooling several kinds of recording
+    # into one transcripts folder is a thing he asked for, so it is not checked here.
+
+    for archiver in routes:
+        if not archiver.archives:
+            continue
+        for other in routes:
+            if other.source_folder_id and archiver.archive_folder_id == other.source_folder_id:
+                where = (
+                    "the very folder it watches"
+                    if archiver.name == other.name
+                    else f"the folder {_phrase(other)} watches"
+                )
+                problems.append(
+                    f"{_phrase(archiver)} archives old recordings into {where} for "
+                    "recordings, so everything it filed away would be discovered all over "
+                    "again the moment it moved."
+                )
+            if other.output_folder_id and archiver.archive_folder_id == other.output_folder_id:
+                whose = (
+                    "its own transcripts"
+                    if archiver.name == other.name
+                    else f"the transcripts of {_phrase(other)}"
+                )
+                problems.append(
+                    f"{_phrase(archiver)} archives old recordings into the folder that "
+                    f"holds {whose}. The archive is meant to be the untouched originals, "
+                    "and mixing the two makes it neither."
+                )
+
+    return list(dict.fromkeys(problems))
+
+
 # ---------------------------------------------------------------------------------------
 # the wizard
 # ---------------------------------------------------------------------------------------
+
+#: What to say when stdin runs out mid-question. Every prompt in this module ends this way
+#: rather than looping on an input that can never arrive: a wizard spinning silently against
+#: a closed stdin looks exactly like a wizard that has hung.
+_EOF_STOP = (
+    "\n  Input ended before that question was answered. Run this in a terminal, or pipe "
+    "an answer for every question in order.\n"
+)
+
 
 @dataclass
 class _Ctx:
@@ -249,10 +526,7 @@ class _Ctx:
                     raw = input("  > ").strip()
             except EOFError:
                 if not current and required:
-                    raise SystemExit(
-                        "\n  Input ended before that question was answered. Run this in a "
-                        "terminal, or pipe an answer for every question in order.\n"
-                    )
+                    raise SystemExit(_EOF_STOP)
                 raw = ""
             if not raw and current:
                 raw = current
@@ -272,17 +546,48 @@ class _Ctx:
             self.values[name] = raw
             return raw
 
+    def ask_free(
+        self,
+        question: str,
+        *,
+        default: str = "",
+        required: bool = True,
+        help_text: str = "",
+        validate: Callable[[str], str] | None = None,
+    ) -> str:
+        """Ask for something that is not an environment variable of its own.
+
+        A route's short name and its label are answers, not settings: they end up inside
+        ``ROUTES`` and ``ROUTE_<NAME>_LABEL``, whose names are not known until the answer
+        is given. Asked through a scratch key that is removed again, so a half-answered
+        route can never leave a stray variable in the written file.
+        """
+        scratch = "__ASK__"
+        self.values.pop(scratch, None)
+        try:
+            return self.ask(
+                scratch, question, default=default, required=required,
+                help_text=help_text, validate=validate,
+            )
+        finally:
+            self.values.pop(scratch, None)
+
     def choose(self, question: str, options: Sequence[tuple[str, str]], *, current: str = "") -> str:
         self.out()
         self.out(self.style.bold(question))
         for i, (value, label) in enumerate(options, 1):
             marker = self.style.green(" (current)") if value == current else ""
             self.out(f"  {i}. {label}{marker}")
+        offered = [value for value, _ in options]
         while True:
             try:
                 raw = input("  > ").strip()
             except EOFError:
-                raw = ""
+                # No more input will ever arrive. Take the default if there is one; say so
+                # and stop if there is not, rather than re-asking a question nobody can hear.
+                if current or current in offered:
+                    return current
+                raise SystemExit(_EOF_STOP) from None
             if not raw and current:
                 return current
             if raw.isdigit() and 1 <= int(raw) <= len(options):
@@ -386,7 +691,8 @@ def _iso_date_or_blank(raw: str) -> str:
     return "Write it as YYYY-MM-DD, for example 2028-08-27 — or leave it empty."
 
 
-def _microsoft(ctx: _Ctx) -> None:
+def _microsoft(ctx: _Ctx) -> Any:
+    """Section 1, and the live client the folder questions in section 2 are asked with."""
     _section(
         ctx, 1, "Microsoft / OneDrive",
         "From the app registration in SETUP.md step 1. Nothing works without this.",
@@ -407,42 +713,13 @@ def _microsoft(ctx: _Ctx) -> None:
     client = _graph_client(ctx)
     if client is None:
         # --no-verify, or the client would not build. Either way there is no drive to list,
-        # so the ids have to be typed. Skipping them here is how the wizard used to finish
+        # so the folder ids have to be typed. Skipping them is how the wizard used to finish
         # "successfully" and still leave a .env the service refuses to start from.
-        _ask_folder_ids_by_hand(ctx)
-        return
+        return None
 
     if not ctx.check("Microsoft sign-in and drive access", lambda: _probe_graph(client)):
-        return
-    _pick_folders(ctx, client)
-
-
-def _ask_folder_ids_by_hand(ctx: _Ctx) -> None:
-    """The fallback when the drive cannot be listed for you.
-
-    Finding a driveItem id by hand is genuinely unpleasant, so say where they come from
-    rather than just demanding one.
-    """
-    ctx.out()
-    ctx.out(ctx.style.yellow(
-        "  Without a live connection the folders cannot be listed for you, so their ids\n"
-        "  have to be typed. Re-run without --no-verify once the app registration is\n"
-        "  consented and you can pick them from a list instead."))
-    for name, question, blurb in (
-        ("SOURCE_FOLDER_ID", "Recordings folder id",
-         "the folder your phone uploads into, usually CALLS"),
-        ("OUTPUT_FOLDER_ID", "Transcripts folder id",
-         "must be a different folder, or the service would read its own output"),
-        ("ARCHIVE_FOLDER_ID", "Archive folder id",
-         "where recordings move after 60 days, once their transcripts are confirmed"),
-    ):
-        ctx.ask(name, question, help_text=blurb)
-
-    chosen = [ctx.values.get(k, "") for k in
-              ("SOURCE_FOLDER_ID", "OUTPUT_FOLDER_ID", "ARCHIVE_FOLDER_ID")]
-    if len(set(chosen)) != len(chosen):
-        ctx.out(ctx.style.red("  ✗ Those must be three different folders."))
-        ctx.notes.append("The source, output and archive folders are not all different.")
+        return None
+    return client
 
 
 def _graph_client(ctx: _Ctx) -> Any:
@@ -473,49 +750,498 @@ def _probe_graph(client: Any) -> str:
     return f"{len(folders)} folders visible at the top of the drive"
 
 
-def _pick_folders(ctx: _Ctx, client: Any) -> None:
-    """Let him choose folders from a list. Nobody should have to hunt for a driveItem id."""
-    try:
-        items = client.list_children(None)
-    except Exception as exc:  # noqa: BLE001
-        ctx.out(ctx.style.yellow(f"  could not list the drive ({exc}); enter ids by hand."))
-        for name, question in (
-            ("SOURCE_FOLDER_ID", "driveItem id of the recordings folder"),
-            ("OUTPUT_FOLDER_ID", "driveItem id of the folder for transcripts"),
-            ("ARCHIVE_FOLDER_ID", "driveItem id of the archive folder"),
-        ):
-            ctx.ask(name, question)
+# ---------------------------------------------------------------------------------------
+# section 2 — the routes
+# ---------------------------------------------------------------------------------------
+
+class _Folders:
+    """The drive's folders, listed once and remembered, for every folder question asked.
+
+    A driveItem id is forty characters nobody can recognise, so nothing in this wizard ever
+    asks him to know one: folders are chosen from a live listing and shown back by name.
+    The listing is per level and cached, because the same set of routes asks about the same
+    folders several times and re-listing a drive between two questions is how a wizard
+    starts to feel slow.
+
+    With no live client — ``--no-verify``, or consent not granted yet — the very same
+    method asks for an id by hand instead. It does not skip the question. A folder that was
+    never asked for is a ``.env`` the service refuses to start from, which is exactly the
+    failure this wizard exists to prevent.
+    """
+
+    def __init__(self, client: Any = None) -> None:
+        self.client = client
+        self._children: dict[str, list[Any]] = {}
+        self._names: dict[str, str] = {}
+        self._errors: dict[str, str] = {}
+        self._warned = False
+
+    @property
+    def live(self) -> bool:
+        return self.client is not None
+
+    def children(self, folder_id: str = "") -> list[Any]:
+        """The folders inside one folder, sorted by name.
+
+        Never raises — a question he cannot answer is worse than a listing he cannot
+        see — but it never swallows the reason either: why a folder came back empty is
+        kept and printed with the empty list, so "no folders in here" and "that folder
+        refused the request" are never the same thing on screen.
+        """
+        if folder_id in self._children:
+            return self._children[folder_id]
+        items: list[Any] = []
+        if self.client is not None:
+            try:
+                raw = self.client.list_children(folder_id or None)
+            except Exception as exc:  # noqa: BLE001 - shown, not hidden; see docstring
+                self._errors[folder_id] = f"{type(exc).__name__}: {exc}"
+                raw = []
+            items = sorted(
+                (i for i in raw
+                 if getattr(i, "is_folder", False) and not getattr(i, "is_deleted", False)),
+                key=lambda i: str(getattr(i, "name", "")).lower(),
+            )
+            for item in items:
+                self._names[item.id] = item.name
+        self._children[folder_id] = items
+        return items
+
+    def describe(self, folder_id: str) -> str:
+        """A folder's name if it can be had, otherwise its id — never nothing at all."""
+        if not folder_id:
+            return "not chosen yet"
+        if folder_id not in self._names and self.client is not None:
+            try:
+                self._names[folder_id] = str(self.client.get_item(folder_id).name or "")
+            except Exception:  # noqa: BLE001 - an id we cannot resolve is still a valid id
+                self._names[folder_id] = ""
+        return self._names.get(folder_id) or folder_id
+
+    def pick(
+        self,
+        ctx: _Ctx,
+        question: str,
+        blurb: str = "",
+        *,
+        current: str = "",
+        allow_none: bool = False,
+    ) -> str:
+        if not self.live:
+            return self._ask_by_hand(ctx, question, blurb, current=current, allow_none=allow_none)
+
+        trail: list[Any] = []
+        while True:
+            here = trail[-1].id if trail else ""
+            items = self.children(here)
+            ctx.out()
+            ctx.out(ctx.style.bold(question))
+            if blurb:
+                ctx.out(ctx.style.dim("  " + blurb))
+            where = " / ".join(str(i.name) for i in trail) or "the top of the drive"
+            ctx.out(ctx.style.dim(f"  in {where}:"))
+            if not items:
+                failure = self._errors.get(here, "")
+                ctx.out(ctx.style.yellow(
+                    f"    (that folder could not be listed — {failure})" if failure
+                    else "    (no folders in here)"))
+            for number, item in enumerate(items, 1):
+                mark = ctx.style.green("   ← the one set now") if item.id == current else ""
+                ctx.out(f"    {number}. {item.name}{mark}")
+            if items:
+                ctx.out(ctx.style.dim("    o 2    look inside folder 2"))
+            if trail:
+                ctx.out(ctx.style.dim("    u      back up a level"))
+            ctx.out(ctx.style.dim("    h      type a folder id by hand"))
+            if allow_none:
+                ctx.out(ctx.style.dim("    n      no folder — leave these recordings where they are"))
+            if current:
+                ctx.out(ctx.style.dim(f"    Enter  keep {self.describe(current)}"))
+
+            try:
+                raw = input("  > ").strip()
+            except EOFError:
+                if current or allow_none:
+                    return current
+                raise SystemExit(_EOF_STOP) from None
+
+            low = raw.lower()
+            if not raw:
+                if current:
+                    return current
+                ctx.out(ctx.style.red(_no_folder_here(items)))
+                continue
+            if allow_none and low in ("n", "no", "none"):
+                return ""
+            if trail and low in ("u", "up"):
+                trail.pop()
+                continue
+            if low in ("h", "id", "hand"):
+                typed = self._ask_by_hand(
+                    ctx, question, blurb, current=current, allow_none=allow_none)
+                if typed or allow_none:
+                    return typed
+                continue
+            if items and low.startswith("o"):
+                rest = low[1:].strip()
+                if rest.isdigit() and 1 <= int(rest) <= len(items):
+                    trail.append(items[int(rest) - 1])
+                    continue
+                ctx.out(ctx.style.red("  Say which one to look inside, like o 2."))
+                continue
+            if raw.isdigit() and 1 <= int(raw) <= len(items):
+                chosen = items[int(raw) - 1]
+                ctx.out(ctx.style.green(f"  → {chosen.name}"))
+                return str(chosen.id)
+            ctx.out(ctx.style.red(_no_folder_here(items)))
+
+    def _ask_by_hand(
+        self, ctx: _Ctx, question: str, blurb: str, *, current: str, allow_none: bool
+    ) -> str:
+        if not self.live and not self._warned:
+            self._warned = True
+            ctx.out()
+            ctx.out(ctx.style.yellow(
+                "  Without a live connection the folders cannot be listed for you, so their\n"
+                "  ids have to be typed. Open the folder in OneDrive in a browser and the id\n"
+                "  is the id= part of the address. Re-run without --no-verify once the app\n"
+                "  registration is consented and you can pick them from a list instead."))
+        help_text = blurb
+        if allow_none:
+            help_text = (blurb + "  Leave it empty for none.").strip()
+        return ctx.ask_free(
+            question + "  (folder id)", default=current, required=not allow_none,
+            help_text=help_text,
+        )
+
+
+def _no_folder_here(items: Sequence[Any]) -> str:
+    """What to say when the answer given is not one of the folders on offer."""
+    if not items:
+        return ("  There are no folders here. Go back up with u, or type a folder id by "
+                "hand with h.")
+    return f"  Choose a number from 1 to {len(items)}, or one of the letters above."
+
+
+def _show_routes(ctx: _Ctx, routes: Sequence[Route], folders: _Folders) -> None:
+    ctx.out()
+    if not routes:
+        ctx.out(ctx.style.yellow("  No routes yet — nothing would be watched."))
         return
+    for route in routes:
+        head = ctx.style.bold(f"  {route.display}") + ctx.style.dim(f"   {route.name}")
+        if not route.enabled:
+            head += ctx.style.yellow("   paused")
+        ctx.out(head)
+        ctx.out(f"      recordings arrive in   {folders.describe(route.source_folder_id)}")
+        ctx.out(f"      transcripts go to      {folders.describe(route.output_folder_id)}")
+        if route.archives:
+            ctx.out(f"      archived after 60 days {folders.describe(route.archive_folder_id)}")
+        else:
+            ctx.out("      archived after 60 days no — recordings stay where they are")
+        if route.engine:
+            ctx.out(f"      transcribed by         {route.engine}")
 
-    folders = sorted((i for i in items if not i.is_file), key=lambda i: i.name.lower())
-    if not folders:
-        ctx.out(ctx.style.yellow("  no folders found at the top of that drive."))
-        return
 
-    options = [(f.id, f.name) for f in folders]
-    by_id = {f.id: f.name for f in folders}
+def _report_routes(ctx: _Ctx, routes: Sequence[Route]) -> list[str]:
+    """Say what is wrong with these routes, now, rather than at the end of the wizard."""
+    problems = route_problems(routes)
+    if not problems:
+        return problems
+    ctx.out()
+    ctx.out(ctx.style.red(ctx.style.bold("  That is not something the service can run:")))
+    for problem in problems:
+        ctx.out(ctx.style.red(f"    • {problem}"))
+    return problems
 
-    def pick(name: str, question: str, blurb: str) -> None:
-        current = ctx.values.get(name, "")
+
+def _engine_options(ctx: _Ctx) -> list[tuple[str, str]]:
+    chosen = ctx.values.get("TRANSCRIBE_ENGINE", "")
+    default = f"the same as everything else ({chosen})" if chosen else \
+        "the same as everything else — you choose which in the next section"
+    return [("", default)] + [(name, label) for name, label in _ENGINES]
+
+
+def _suggest_slug(label: str) -> str:
+    """A usable short name out of what he called it: ``Site meetings`` -> ``site-meetings``."""
+    cleaned = "".join(c if c.isalnum() else "-" for c in (label or "").strip().lower())
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    return cleaned.strip("-")
+
+
+def _ask_route_folders(ctx: _Ctx, folders: _Folders, route: Route) -> Route:
+    """Source, then output, then archive — the three folders one kind of recording uses."""
+    what = route.display
+    source = folders.pick(
+        ctx, f"{what}: which folder do they arrive in?",
+        "The folder your phone, or WhatsApp, or the recorder uploads into.",
+        current=route.source_folder_id,
+    )
+    output = folders.pick(
+        ctx, f"{what}: where should their transcripts be written?",
+        "Not the folder above. Several kinds may share one transcripts folder if you want "
+        "them together.",
+        current=route.output_folder_id,
+    )
+    archive = folders.pick(
+        ctx, f"{what}: where should they move to once they are 60 days old?",
+        "Only ever once their transcripts are confirmed present, and nothing is ever "
+        "deleted. There need not be one — they can stay where they are for good.",
+        current=route.archive_folder_id, allow_none=True,
+    )
+    return replace(
+        route, source_folder_id=source, output_folder_id=output, archive_folder_id=archive,
+    )
+
+
+def _settle_route(ctx: _Ctx, others: Sequence[Route], route: Route, folders: _Folders) -> Route:
+    """Keep asking about this route's folders until the whole set is sound, or he says stop.
+
+    A problem here is shown against the set the route is joining, not against the route on
+    its own, because the two failures that matter — writing transcripts into a watched
+    folder, and two routes watching one folder — only exist between routes.
+    """
+    while True:
+        problems = route_problems([*others, route])
+        if not problems:
+            return route
+        _report_routes(ctx, [*others, route])
+        if not ctx.confirm("Choose different folders for this one?", default=True):
+            ctx.notes.append(
+                f"{_phrase(route)} is not usable as it stands: {problems[0]}"
+            )
+            return route
+        route = _ask_route_folders(ctx, folders, route)
+
+
+def _add_route(ctx: _Ctx, routes: Sequence[Route], folders: _Folders) -> Route:
+    taken = {r.name for r in routes}
+
+    def check_slug(raw: str) -> str:
+        if not is_route_name(raw):
+            return ("Lowercase letters, digits and hyphens only, starting with a letter or "
+                    "a digit — calls, site-meetings, whatsapp.")
+        if raw in taken:
+            return f"There is already a route called {raw}. Give this one another name."
+        return ""
+
+    label = ctx.ask_free(
+        "What do you call this kind of recording?",
+        help_text="In plain words — Site meetings. This is what the morning email calls them.",
+    )
+    slug = ctx.ask_free(
+        "And a short name for it, with no spaces?",
+        default=_suggest_slug(label),
+        help_text="Press Enter to take the one offered. It is written into the ledger "
+                  "beside every recording this route handles, so it stays as it is "
+                  "afterwards.",
+        validate=check_slug,
+    )
+    route = Route(name=slug, label=label)
+    route = _ask_route_folders(ctx, folders, route)
+    route = replace(route, engine=ctx.choose(
+        f"{label}: which service should transcribe them?",
+        _engine_options(ctx), current=route.engine,
+    ))
+    return _settle_route(ctx, routes, route, folders)
+
+
+def _edit_route(ctx: _Ctx, routes: list[Route], folders: _Folders) -> list[Route]:
+    index = _choose_route(ctx, routes, "Which one do you want to change?")
+    if index is None:
+        return routes
+    route = routes[index]
+    others = [r for i, r in enumerate(routes) if i != index]
+    ctx.out()
+    ctx.out(ctx.style.dim(
+        f"  The short name stays as {route.name}: it is what the ledger has recorded "
+        "against every\n  recording this route has already handled."))
+    while True:
+        _show_routes(ctx, [route], folders)
+        what = ctx.choose(
+            f"What about {route.display} do you want to change?",
+            [
+                ("done", "nothing more — go back"),
+                ("label", "what it is called"),
+                ("folders", "its folders"),
+                ("engine", "which service transcribes it"),
+                ("enabled", "switch it back on" if not route.enabled
+                            else "pause it — stop watching, keep everything"),
+            ],
+            current="done",
+        )
+        if what == "done":
+            break
+        if what == "label":
+            route = replace(route, label=ctx.ask_free(
+                "What should it be called?", default=route.label,
+                help_text="Only the name people read. Nothing else changes."))
+        elif what == "folders":
+            route = _ask_route_folders(ctx, folders, route)
+        elif what == "engine":
+            route = replace(route, engine=ctx.choose(
+                f"{route.display}: which service should transcribe them?",
+                _engine_options(ctx), current=route.engine))
+        elif what == "enabled":
+            route = replace(route, enabled=not route.enabled)
+            ctx.out(ctx.style.green(
+                f"  → {route.display} is " + ("watched again."
+                if route.enabled else
+                "paused. Its folder is no longer watched; everything it has already "
+                "processed is kept.")))
+        _report_routes(ctx, [*others, route])
+    # No settle loop here on purpose: the edit menu he has just left is itself the way to
+    # change the folders again, and a problem like "every route is paused" is not one that
+    # asking about folders can fix. Anything still wrong is printed by the routes menu he
+    # returns to, and recorded as a note if he leaves it that way.
+    updated = list(routes)
+    updated[index] = route
+    return updated
+
+
+def _remove_route(ctx: _Ctx, routes: list[Route], folders: _Folders) -> list[Route]:
+    index = _choose_route(ctx, routes, "Which one do you want to take out?")
+    if index is None:
+        return routes
+    route = routes[index]
+    ctx.out()
+    ctx.out(ctx.style.dim(
+        f"  Taking {route.display} out stops the service watching that folder, and nothing\n"
+        "  else. The recordings in OneDrive are not touched, and the ledger keeps every row\n"
+        "  it ever wrote for them — you can look up anything it processed afterwards.\n"
+        "  If you only want it to stop for a while, change it instead and pause it: that\n"
+        "  keeps its folders in the file so switching it back on is one answer."))
+    if not ctx.confirm(f"Take {route.display} out?", default=False):
+        return routes
+    ctx.out(ctx.style.green(f"  → {route.display} taken out. Nothing was deleted."))
+    return [r for i, r in enumerate(routes) if i != index]
+
+
+def _choose_route(ctx: _Ctx, routes: Sequence[Route], question: str) -> int | None:
+    if not routes:
+        ctx.out(ctx.style.yellow("  There are no routes to choose from yet."))
+        return None
+    options = [(str(i + 1), f"{r.display}  ({r.name})") for i, r in enumerate(routes)]
+    options.append(("cancel", "never mind"))
+    picked = ctx.choose(question, options, current="cancel")
+    if picked == "cancel":
+        return None
+    return int(picked) - 1
+
+
+def _first_routes(ctx: _Ctx, folders: _Folders) -> list[Route]:
+    """The first run, where the answer to "what routes?" should be one keystroke.
+
+    He records three kinds of thing and has said so, so the wizard offers those three by
+    name rather than asking him to invent a structure. The engine is left at the service
+    default for all three: that is what an override is *for*, and asking three extra
+    questions on a first run to say "the same as everything else" three times is the kind
+    of thoroughness that gets a wizard abandoned half-done.
+    """
+    ctx.out()
+    ctx.out(ctx.style.bold("  You have not set up any folders yet."))
+    ctx.out(ctx.style.dim(
+        "  A route is one folder recordings arrive in, and the folder their transcripts go\n"
+        "  to. The service can run as many as you like — one per kind of recording, so a\n"
+        "  site meeting and a phone call need not land in the same place."))
+    ctx.out()
+    for _slug, label in SUGGESTED_ROUTES:
+        ctx.out(ctx.style.dim(f"    • {label}"))
+    ctx.out()
+    if not ctx.confirm("Set up those three now?", default=True):
+        return [_add_route(ctx, [], folders)]
+
+    shared_output = ""
+    shared_archive = ""
+    pooled = ctx.confirm(
+        "Should all three write their transcripts into one folder?", default=False)
+    if pooled:
+        shared_output = folders.pick(
+            ctx, "Which folder should all the transcripts go to?",
+            "Every kind writes here. Each one is still tracked separately, and the morning "
+            "email still reports them apart.")
+        shared_archive = folders.pick(
+            ctx, "Where should recordings move to once they are 60 days old?",
+            "The same archive for all three. Choose n to leave them where they are.",
+            allow_none=True)
+
+    routes: list[Route] = []
+    for slug, label in SUGGESTED_ROUTES:
+        route = Route(name=slug, label=label,
+                      output_folder_id=shared_output, archive_folder_id=shared_archive)
+        if pooled:
+            route = replace(route, source_folder_id=folders.pick(
+                ctx, f"{label}: which folder do they arrive in?",
+                "The folder your phone, or WhatsApp, or the recorder uploads into.",
+                current=route.source_folder_id))
+        else:
+            route = _ask_route_folders(ctx, folders, route)
+        routes.append(_settle_route(ctx, routes, route, folders))
+    return routes
+
+
+def _routes(ctx: _Ctx, client: Any) -> None:
+    _section(
+        ctx, 2, "Your folders",
+        "One route per kind of recording: where it arrives, and where its transcripts go.",
+    )
+    folders = _Folders(client)
+    routes = routes_from_values(ctx.values)
+    if routes:
         ctx.out()
-        ctx.out(ctx.style.dim("  " + blurb))
-        chosen = ctx.choose(question, options, current=current)
-        ctx.values[name] = chosen
-        ctx.out(ctx.style.green(f"  → {by_id.get(chosen, chosen)}"))
+        ctx.out(ctx.style.dim("  These are the routes this file already has:"))
+    else:
+        routes = _first_routes(ctx, folders)
 
-    pick("SOURCE_FOLDER_ID", "Which folder do your recordings land in?",
-         "The one your phone uploads to — usually CALLS.")
-    pick("OUTPUT_FOLDER_ID", "Which folder should transcripts be written to?",
-         "A different folder from the recordings. Make it in OneDrive first if it is not listed.")
-    pick("ARCHIVE_FOLDER_ID", "Which folder should recordings older than 60 days move to?",
-         "Only ever moved once their transcripts are confirmed present. Nothing is deleted.")
+    while True:
+        _show_routes(ctx, routes, folders)
+        _report_routes(ctx, routes)
+        what = ctx.choose(
+            "What now?",
+            [
+                ("keep", "keep these as they are"),
+                ("add", "add another kind of recording"),
+                ("edit", "change one of them"),
+                ("remove", "take one out"),
+                ("restart", "start the folders over from nothing"),
+            ],
+            current="keep",
+        )
+        if what == "keep":
+            break
+        if what == "add":
+            routes.append(_add_route(ctx, routes, folders))
+        elif what == "edit":
+            routes = _edit_route(ctx, routes, folders)
+        elif what == "remove":
+            routes = _remove_route(ctx, routes, folders)
+        elif what == "restart":
+            routes = _first_routes(ctx, folders)
 
-    chosen = [ctx.values.get(k, "") for k in ("SOURCE_FOLDER_ID", "OUTPUT_FOLDER_ID", "ARCHIVE_FOLDER_ID")]
-    if len(set(chosen)) != len(chosen):
-        ctx.out(ctx.style.red(
-            "  ✗ Those must be three different folders. Writing transcripts into the folder "
-            "being watched would make the service read its own output."))
-        ctx.notes.append("The source, output and archive folders are not all different — re-run setup.")
+    for problem in route_problems(routes):
+        ctx.notes.append(problem)
+    routes_to_values(ctx.values, routes)
+
+
+def _engines_in_use(ctx: _Ctx) -> list[str]:
+    """Every engine some part of this configuration needs a key for.
+
+    The service default, plus any engine a route overrides it with. Asking only for the
+    default's key is how a route set to ElevenLabs ends up with no ElevenLabs key and fails
+    on its first recording — and the run that dropped "unused" keys at the end was deleting
+    exactly the key that route needed.
+    """
+    engines = [ctx.values.get("TRANSCRIBE_ENGINE", "").strip().lower()]
+    for route in routes_from_values(ctx.values):
+        if route.enabled and route.engine:
+            engines.append(route.engine.strip().lower())
+    return list(dict.fromkeys(e for e in engines if e))
+
+
+def _routes_using(ctx: _Ctx, engine: str) -> list[Route]:
+    return [r for r in routes_from_values(ctx.values)
+            if r.enabled and r.engine.strip().lower() == engine]
 
 
 _ENGINES = [
@@ -526,23 +1252,35 @@ _ENGINES = [
 
 
 def _transcription(ctx: _Ctx) -> None:
-    _section(ctx, 2, "Transcription", "Which service turns the audio into words.")
+    _section(ctx, 3, "Transcription",
+             "Which service turns the audio into words, for every route that has not "
+             "asked for a different one.")
     engine = ctx.choose("Which transcription engine?", _ENGINES,
                         current=ctx.values.get("TRANSCRIBE_ENGINE", "openai"))
     ctx.values["TRANSCRIBE_ENGINE"] = engine
 
-    if engine == "openai":
-        ctx.ask("OPENAI_API_KEY", "OpenAI API key", secret=True,
-                help_text="platform.openai.com → API keys. Starts sk-.")
-        ctx.check("the OpenAI key", lambda: _probe_openai(ctx.values["OPENAI_API_KEY"]))
-    elif engine == "elevenlabs":
-        ctx.ask("ELEVENLABS_API_KEY", "ElevenLabs API key", secret=True,
-                help_text="elevenlabs.io → Developers → API keys.")
-        ctx.check("the ElevenLabs key", lambda: _probe_elevenlabs(ctx.values["ELEVENLABS_API_KEY"]))
-    else:
-        ctx.ask("AZURE_SPEECH_KEY", "Azure Speech key", secret=True)
-        ctx.ask("AZURE_SPEECH_REGION", "Azure Speech region",
-                help_text="e.g. southafricanorth, or westeurope.")
+    # The default is not necessarily the only one: a route may transcribe with something
+    # else, and that engine needs its own key or that route fails on its first recording.
+    for name in _engines_in_use(ctx):
+        borrowers = _routes_using(ctx, name)
+        if borrowers and name != engine:
+            ctx.out()
+            ctx.out(ctx.style.dim(
+                "  " + ", ".join(r.display for r in borrowers)
+                + f" transcribe with {name}, so it needs its own key too."))
+        if name == "openai":
+            ctx.ask("OPENAI_API_KEY", "OpenAI API key", secret=True,
+                    help_text="platform.openai.com → API keys. Starts sk-.")
+            ctx.check("the OpenAI key", lambda: _probe_openai(ctx.values["OPENAI_API_KEY"]))
+        elif name == "elevenlabs":
+            ctx.ask("ELEVENLABS_API_KEY", "ElevenLabs API key", secret=True,
+                    help_text="elevenlabs.io → Developers → API keys.")
+            ctx.check("the ElevenLabs key",
+                      lambda: _probe_elevenlabs(ctx.values["ELEVENLABS_API_KEY"]))
+        elif name == "azure":
+            ctx.ask("AZURE_SPEECH_KEY", "Azure Speech key", secret=True)
+            ctx.ask("AZURE_SPEECH_REGION", "Azure Speech region",
+                    help_text="e.g. southafricanorth, or westeurope.")
 
 
 def _probe_openai(key: str) -> str:
@@ -577,7 +1315,7 @@ _ANALYSIS_TIERS = [
 
 def _analysis(ctx: _Ctx) -> None:
     _section(
-        ctx, 3, "The AI pass",
+        ctx, 4, "The AI pass",
         "Reads each transcript and pulls out who promised what. Separate from transcription.",
     )
     ctx.values["ANALYSIS_PROVIDER"] = "anthropic"
@@ -634,7 +1372,7 @@ def _probe_anthropic(key: str, model: str) -> str:
 
 def _email(ctx: _Ctx) -> None:
     _section(
-        ctx, 4, "The morning email",
+        ctx, 5, "The morning email",
         "One message at 06:00 — sent on good days too, so silence always means something is wrong.",
     )
     ctx.ask("SMTP_HOST", "Mail server", default="smtp.office365.com",
@@ -692,7 +1430,7 @@ def _probe_smtp(ctx: _Ctx) -> str:
 
 def _heartbeat(ctx: _Ctx) -> None:
     _section(
-        ctx, 5, "Staying alive",
+        ctx, 6, "Staying alive",
         "The one alarm that still works when the service itself is dead.",
     )
     ctx.out()
@@ -717,7 +1455,7 @@ def _probe_heartbeat(url: str) -> str:
 
 
 def _local(ctx: _Ctx) -> None:
-    _section(ctx, 6, "Where it keeps its notes", "Sensible defaults; press Enter through these.")
+    _section(ctx, 7, "Where it keeps its notes", "Sensible defaults; press Enter through these.")
     ctx.ask("LEDGER_PATH", "Where should the ledger live?", default="./transcriber.db",
             help_text="The permanent record of every recording and what happened to it. "
                       "Back this up — it is the memory that stops a loss going unnoticed.")
@@ -760,7 +1498,8 @@ def run_setup(
         ctx.out(style.yellow("  Running with --no-verify: nothing will be checked against a real service."))
 
     try:
-        _microsoft(ctx)
+        client = _microsoft(ctx)
+        _routes(ctx, client)
         _transcription(ctx)
         _analysis(ctx)
         _email(ctx)
@@ -770,13 +1509,17 @@ def run_setup(
         ctx.out(style.yellow("\n\n  Stopped. Nothing was written.\n"))
         return 130
 
-    # Drop keys belonging to engines that were not chosen, so a stale key cannot be picked
-    # up later by a config change nobody remembers making.
-    engine = ctx.values.get("TRANSCRIBE_ENGINE", "")
-    for name, owner in (("ELEVENLABS_API_KEY", "elevenlabs"), ("AZURE_SPEECH_KEY", "azure")):
-        if engine != owner:
+    # Drop keys belonging to engines nothing uses, so a stale key cannot be picked up later
+    # by a config change nobody remembers making. "Uses" means the service default *or* any
+    # route that overrides it: deleting a key on the strength of the default alone is how a
+    # route set to ElevenLabs loses the key it was asked for one question earlier.
+    in_use = set(_engines_in_use(ctx))
+    for name, owner in (("OPENAI_API_KEY", "openai"),
+                        ("ELEVENLABS_API_KEY", "elevenlabs"),
+                        ("AZURE_SPEECH_KEY", "azure")):
+        if owner not in in_use:
             ctx.values.pop(name, None)
-    if engine != "azure":
+    if "azure" not in in_use:
         ctx.values.pop("AZURE_SPEECH_REGION", None)
 
     ctx.out()
@@ -810,7 +1553,12 @@ def run_setup(
         ctx.out("  Re-run " + style.bold("python3 -m transcriber setup") + " to fill in the rest.")
         return 1
 
-    ctx.out(style.green(style.bold("  Ready. Three commands, in this order:")))
+    ctx.out(style.green(style.bold("  Ready. It will watch:")))
+    for route in routes_from_values(ctx.values):
+        state = "" if route.enabled else "   (paused)"
+        ctx.out(f"    • {route.display}{state}")
+    ctx.out()
+    ctx.out(style.green(style.bold("  Three commands, in this order:")))
     ctx.out()
     ctx.out("    " + style.bold("python3 -m transcriber selftest"))
     ctx.out(style.dim("      Proves the code is sane. Touches nothing."))
