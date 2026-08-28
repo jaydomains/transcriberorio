@@ -96,6 +96,7 @@ __all__ = [
     "UploadIncompleteError",
     "refuse_held_text",
     "refuse_written_down_again",
+    "spoken_body",
     "OutputContext",
     "RenderedFile",
     "UploadedFile",
@@ -241,6 +242,16 @@ class OutputContext:
     #: ``repr=False`` and out of every rendered line: these are the words the whole gate
     #: exists to keep out of a file.
     held: tuple[Any, ...] = field(default=(), repr=False)
+    #: What to call this recording to a person, when the service worked it out rather than
+    #: reading it off the filename. Empty means the filename, which is every recording he
+    #: named himself and every one where :mod:`transcriber.autoname` refused.
+    #:
+    #: It reaches the Subject line and the heading and **nothing else**. In particular it
+    #: never reaches :attr:`names`, which stays a pure function of the recorded moment, the
+    #: source stem, the copy marker and the item id — because a failed publish is recovered
+    #: by writing the same three names again, and a name that could change between attempts
+    #: would leave three files nobody can delete and a second document in the record.
+    display_name: str = ""
 
     @property
     def names(self) -> OutputNames:
@@ -272,6 +283,8 @@ class OutputContext:
     @property
     def label(self) -> str:
         """How this recording is named to a human: the party if the filename gave one."""
+        if self.display_name:
+            return self.display_name
         if self.parsed.party:
             return f"Call with {self.parsed.party}"
         return self.parsed.stem or self.source_name or "Voice note"
@@ -332,6 +345,28 @@ class UploadResult:
 # --------------------------------------------------------------------------- rendering
 
 
+def spoken_body(transcript: Transcript) -> str:
+    """The words of the recording exactly as they are published, and nothing else.
+
+    The one definition, used by :func:`render_transcript` to write the file and by
+    :mod:`transcriber.autoname` to decide what the recording says. They must be the same
+    string, and the reason is not tidiness.
+
+    ``Transcript.text`` is the engine's own continuous prose. The published body is not
+    that: when the engine returned segments it is one line per segment, each prefixed
+    ``[MM:SS] Speaker: ``, cut on a speaker change or a pause over 0.9 s. So a two-word site
+    name spoken either side of a breath — "Beach ... Court" — is contiguous in ``text`` and
+    **split across two lines in the file**. Deciding from ``text`` would propose a title the
+    published bytes do not contain, and the record, which reads the file and not the prose,
+    would score it differently. That is not hypothetical: it is how a walk at one site got
+    filed to another in testing.
+    """
+    segments = list(transcript.segments or ())
+    if segments:
+        return "\n".join(_segment_line(s) for s in segments)
+    return (transcript.text or "").strip()
+
+
 def render_transcript(ctx: OutputContext) -> str:
     """The transcript file — the one the record ingests, and the only copy of what was said.
 
@@ -369,7 +404,7 @@ def render_transcript(ctx: OutputContext) -> str:
     body += ["", "## What was said", ""]
 
     if segments:
-        body += [_segment_line(s) for s in segments]
+        body += spoken_body(ctx.transcript).split("\n")
     else:
         body += [
             "The engine returned no segment timings, so this is the transcript as one run",
@@ -691,8 +726,23 @@ def _provenance(ctx: OutputContext) -> list[str]:
         rows.append(
             (
                 "Filename form",
-                "hand-typed, not one of the phone's call-recording names — this is how a "
-                "site meeting arrives",
+                "the voice recorder's own default name — this is a note he did not get to "
+                "naming before it uploaded"
+                if parsed.timestamp_recovered
+                else "hand-typed, not one of the phone's call-recording names — this is how "
+                "a site meeting arrives",
+            )
+        )
+    if ctx.display_name:
+        # Said out loud, in the body, because the title above is no longer the filename and
+        # a reader comparing the two would otherwise think one of them is wrong. Never a
+        # header row: the record's parser silently DELETES a seventh header key, and this
+        # file's own contract check refuses to render one.
+        rows.append(
+            (
+                "Name",
+                f"chosen by this service from the site named in the recording. The file in "
+                f"OneDrive is still called {parsed.original_name!r}",
             )
         )
     duration = ctx.duration_s

@@ -56,6 +56,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from . import logging_setup
 from . import release as release_module
+from . import sitebook
 from .heartbeat import Heartbeat, PingResult
 from .ledger import Ledger
 from .models import (
@@ -1565,6 +1566,7 @@ def build(
     # every few days until a person answers it.
     held = held_report(config, ledger, day=target, now=utc_now_iso(clock))
     disagreements = route_disagreements(ledger, target)
+    naming = naming_report(config, ledger, day=target)
     if sweep_report is None:
         sweep_report = _stored_report(ledger, "sweep")
     if archive_report is None:
@@ -1588,6 +1590,7 @@ def build(
         archive_report=archive_report,
         service_error=service_error,
         attention=attention,
+        naming=naming,
         expiries=credential_warnings(config, clock),
     )
 
@@ -1702,6 +1705,143 @@ def _service_error(ledger: Ledger) -> str:
     return " | ".join(parts)
 
 
+#: How many naming rows the email prints before it says "and N more". Five, with the count,
+#: because the existing review list five lines above prints five and then STOPS — no
+#: overflow line at all — so on a burst day fifty-five became five and silence. Copying that
+#: half of the precedent would be copying the bug.
+_NAMING_ROWS = 5
+
+
+def _naming_lines(naming: Mapping[str, Any] | None) -> list[str]:
+    """The naming part of WORTH A LOOK. Nothing here is a question.
+
+    Every recording named below was transcribed and filed on time. The only thing being
+    reported is what it ended up called, and the only action is optional: rename the audio
+    in OneDrive if he wants the two to match.
+    """
+    facts = dict(naming or {})
+    if not facts:
+        return []
+
+    unreadable = str(facts.get("unreadable") or "")
+    lines = ["", f"  {facts.get('book') or 'site list: unknown'}"]
+
+    if unreadable:
+        # A fault and a quiet day are the same empty list and must never be the same
+        # sentence. Saying "nothing came in" here would report a broken read as good news,
+        # for as long as it stayed broken.
+        lines.append(
+            "  Could not read what was named yesterday, so this part of the email is "
+            "missing rather"
+        )
+        lines.append(f"  than empty: {unreadable}")
+        return lines
+
+    if facts.get("book_fault"):
+        # Not a quiet day: the site list is missing or unreadable, so nothing can be named
+        # and nothing will be until somebody looks. Said every morning until it is fixed.
+        lines.append("  Nothing is being named until that is sorted out. Nothing else is")
+        lines.append("  affected — every recording is still transcribed and filed as usual.")
+        return lines
+
+    eligible = int(facts.get("eligible") or 0)
+    if not eligible:
+        # Nothing to say, so say nothing — this sits under "WORTH A LOOK (nothing failed)",
+        # and a section that prints every morning on every install to report that nothing
+        # happened trains him to skip the part of the email that matters.
+        #
+        # The exception is a site list that is missing or unreadable, handled above: that is
+        # not a quiet day, it is a feature that has silently stopped, and it prints.
+        return []
+
+    lines.append("")
+    for chunk in _wrap(
+        f"{eligible} recording{'s' if eligible != 1 else ''} came in with the voice "
+        f"recorder's own name. Every one of them was transcribed and filed on time — this "
+        f"is only about what they are called.",
+        width=72,
+    ):
+        lines.append(f"  {chunk}")
+    if not any(r.get("applied") for r in (facts.get("rows") or ())):
+        lines.append(
+            "  Nothing has been renamed: it is only saying what it would have called them."
+        )
+    lines.append("")
+
+    rows = list(facts.get("rows") or ())
+    for row in rows[:_NAMING_ROWS]:
+        # Never the item id as a fallback. It is 34 characters of OneDrive bookkeeping,
+        # it identifies nothing he can look up, and printing it where a filename goes makes
+        # the email read like a machine talking to itself.
+        source = str(row.get("source_name") or "").strip() or "a recording with no name of its own"
+        name = str(row.get("name") or "")
+        # From the decision, never from today's setting. He may have switched it on this
+        # morning; yesterday's recordings were still only being watched, and telling him
+        # they were named would send him looking in the record for a document that is not
+        # there. The reverse is worse: a rename reported as a suggestion is a change he
+        # does not know he made.
+        verb = "named" if row.get("applied") else "would call"
+        head = f"{source}  ->  {verb} it {name}" if name else f"{source}  ->  left as it is"
+        lines.append(f"    {head}")
+        for chunk in _wrap(str(row.get("why") or ""), width=68):
+            lines.append(f"      {chunk}")
+        if name:
+            lines.append(f"      If you want the audio to match: {name}")
+        lines.append("")
+    if len(rows) > _NAMING_ROWS:
+        lines.append(f"    ...and {len(rows) - _NAMING_ROWS} more")
+    return lines
+
+
+def naming_report(config: Any, ledger: Ledger, *, day: str) -> Mapping[str, Any]:
+    """What the service worked out to call yesterday's unnamed recordings.
+
+    Read-only, and it decides nothing. There is nothing here for him to answer: every one
+    of these recordings was transcribed and filed on time, and the only question is what it
+    is called. Returns an empty mapping when naming is off, so the section never prints.
+    """
+    if not bool(getattr(config, "naming", False)):
+        return {}
+    # Read fresh, and deliberately not shared with the worker's cached copy. The digest is
+    # built once a day, often in a different process from the one that published yesterday's
+    # recordings, and what it reports is what the site list looks like NOW — a book the
+    # worker loaded a week ago and has held ever since is exactly the thing this line exists
+    # to expose. The cost is one 80 KB read a day.
+    book = sitebook.EMPTY
+    try:
+        book = sitebook.load(str(getattr(config, "naming_sites_file", "") or ""))
+    except Exception as exc:  # noqa: BLE001 - the email must send from a sick everything
+        log.warning("could not read the site list: %s", exc)
+        # sitebook.load is documented never to raise, so this branch should be unreachable.
+        # If it ever fires, the empty book's own line reads "site list: empty, so nothing is
+        # being named" — which is what a service with no book configured says, and would
+        # report a fault as a settled choice. Say what actually happened instead.
+        book = sitebook.SiteBook(fault=f"it could not be read ({exc})")
+    unreadable = ""
+    try:
+        decisions = ledger.naming_for_day(day)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read the naming decisions for %s: %s", day, exc)
+        decisions, unreadable = [], str(exc) or exc.__class__.__name__
+    # E1 is "he named this one himself", which is most recordings and is not news.
+    eligible = [d for d in decisions if str(d.get("code") or "") not in ("E1", "E2", "off")]
+    return {
+        "book": book.line(),
+        "applying": bool(getattr(config, "naming_apply", False)),
+        "eligible": len(eligible),
+        "named": sum(1 for d in eligible if d.get("name")),
+        "rows": eligible,
+        #: The site list could not be loaded. Distinct from "nothing came in": one is a
+        #: quiet day and the other is the feature having silently stopped, and they must
+        #: never render the same way — which for a quiet day is not at all.
+        "book_fault": bool(book.fault or not book),
+        #: Set when the ledger could not be asked. Carried rather than swallowed, because
+        #: an empty list from a failed read and an empty list from a quiet day are the same
+        #: value and must never be the same sentence.
+        "unreadable": unreadable,
+    }
+
+
 def _attention(ledger: Ledger, day: str) -> Mapping[str, Any]:
     try:
         return ledger.attention_for_day(day)
@@ -1744,6 +1884,7 @@ def _render(
     older_failures: Sequence[Mapping[str, Any]],
     stats: Mapping[str, Any],
     sweep_report: Any,
+    naming: Mapping[str, Any] | None = None,
     routes: Sequence["RouteDigest"] = (),
     queue: "QueueReport | None" = None,
     held: "HeldReport | None" = None,
@@ -1907,7 +2048,9 @@ def _render(
         lines.append("")
 
     facts = dict(attention or {})
-    if facts.get("review") or facts.get("unverified_duration_guard") or facts.get("degraded_transcripts"):
+    naming_lines = _naming_lines(naming)
+    if (facts.get("review") or facts.get("unverified_duration_guard")
+            or facts.get("degraded_transcripts") or naming_lines):
         lines += ["WORTH A LOOK (nothing failed)", _RULE]
         if facts.get("review"):
             lines.append(
@@ -1936,6 +2079,7 @@ def _render(
                 f"  {facts['degraded_transcripts']} transcript(s) were produced with some engine"
             )
             lines.append("  settings stripped, so they may be less accurate than usual.")
+        lines += naming_lines
         lines.append("")
 
     if sweep_report is not None:

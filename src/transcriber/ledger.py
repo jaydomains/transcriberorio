@@ -1003,6 +1003,42 @@ class Ledger:
         ).fetchall()
         return [Row.from_db(r) for r in records]
 
+    def naming_for_day(self, day: str, route: str | None = None) -> list[dict[str, Any]]:
+        """Every naming decision on the recordings that FINISHED on ``day``.
+
+        Keyed on ``done_at``, not ``discovered_at``, and the difference is not a detail.
+        The digest is built for yesterday and every other cohort in it is selected by
+        discovery — but a naming decision is written when the recording publishes, so a
+        recording discovered at 21:31 and published at 09:12 the next morning would be
+        selected by a digest built before its decision existed, and by no later one. Its
+        name would appear in no email, ever. That is exactly the deferred, backed-off,
+        burst-day population where a name is most likely to be wrong, so it is exactly the
+        population that must not be invisible.
+
+        (``done_at`` is UTC and the digest targets a local day, so a decision can be
+        reported up to two hours early. Every row is still reported exactly once. Same skew
+        the rest of the digest already carries; noted rather than papered over.)
+        """
+        conn = self._conn()
+        like = f"{day}%"
+        clause, params = self._route_filter(route)
+        out: list[dict[str, Any]] = []
+        rows = conn.execute(
+            f"SELECT item_id, name, route, meta FROM items "
+            f"WHERE done_at LIKE ?{clause} ORDER BY done_at ASC",
+            (like, *params),
+        ).fetchall()
+        for row in rows:
+            decision = _decode_meta(row["meta"]).get("naming")
+            if not isinstance(decision, dict) or not decision.get("decided"):
+                continue
+            entry = dict(decision)
+            entry["item_id"] = row["item_id"]
+            entry["source_name"] = row["name"]
+            entry["route"] = row["route"]
+            out.append(entry)
+        return out
+
     def counts_for_day(self, day: str, route: str | None = None) -> dict:
         """What the digest reports: the cohort discovered on ``day`` and how it ended up.
 

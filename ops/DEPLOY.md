@@ -167,6 +167,25 @@ The ledger volume is not optional. It is the only proof a recording ever existed
   token scoped to that one repository, *Contents: read and write*, and **that token expires
   too** — when it does, the record stops receiving transcripts while this service keeps
   reporting perfect mornings, because from here everything genuinely did work.
+- **The nightly site list**, if you want unnamed recordings given a title. One cron line,
+  hung off the entry that already rebuilds the record, so the list is written from a build
+  that has just succeeded:
+
+  ```
+  30 4 * * *  cd /srv/kbc-site-memory && make build && \
+              /srv/transcriber/ops/build-site-book.py . /var/lib/transcriber/sites.json
+  ```
+
+  The `make build` half is the record's own existing nightly job, not something added here;
+  the line after it reads what that build produced and writes one file into the
+  transcriber's own directory. Nothing in this service ever writes to the record's
+  repository.
+
+  Then `NAMING_SITES_FILE=/var/lib/transcriber/sites.json`. **Nothing breaks if this stops
+  running**: an old list describes the sites as they were, so a job it has never heard of
+  gets no name, and a missing one names nothing at all — which is the behaviour without the
+  feature. A missing or unreadable list is said out loud in the morning email, every
+  morning, until it is fixed.
 - **An existing pile of recordings.** `transcriber backfill` walks history newest-first in
   its own lane, yielding whenever the live path has work waiting. Start it after the live
   path has been running cleanly for a day.
@@ -197,7 +216,8 @@ ledger records every step *before* the work that follows it.
 ## Backing up
 
 Two files: whatever `LEDGER_PATH` points at, and — once the gate is armed —
-`GATE_HELD_STORE`. Both are SQLite in WAL mode and both are backed up the same way. The held
+`GATE_HELD_STORE`. (Not the site list: it is rebuilt from the record every night, so a lost
+copy costs one night of plainer titles.) Both are SQLite in WAL mode and both are backed up the same way. The held
 store matters as much as the ledger and for a sharper reason: a passage waiting for approval
 has been cut out of the transcript, so that database and the original recording are the only
 two places those words exist.

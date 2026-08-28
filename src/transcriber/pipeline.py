@@ -72,10 +72,12 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 from . import audio as audio_probe
-from . import completeness, naming, outputs, plausibility, redact, sensitivity
+from . import autoname, completeness, naming, outputs, plausibility, redact, sensitivity
+from . import sitebook
 from .engines import (
     EngineAudioTooLarge,
     EngineAuthError,
@@ -168,6 +170,23 @@ _META_GATE_FIRST_SEEN = "gate_first_seen"
 #: categories and hold references only — never a word of what was held. It is also what stops
 #: a retry counting the same recording twice in the measurement the arming decision rests on.
 _META_SENSITIVITY = "sensitivity"
+_META_NAMING = "naming"
+#: When the recording was made, pinned on the row the first time it is worked out.
+#:
+#: The three output filenames open with this moment, so anything that changes how it is
+#: DERIVED changes the names — and a recording republished across such a change writes three
+#: new files while the three it already wrote stay in OneDrive forever. Nothing can clean
+#: them up: the ledger row has been overwritten with the new names, the collision guard only
+#: looks at other rows, Graph has no delete here, and the sweep never enumerates an output
+#: folder. Downstream the record keys a document on its date and its bytes, so it logs a
+#: second document, in a different month, with a second row in the site's log.
+#:
+#: This is not hypothetical: the change that added it moved this moment for exactly the
+#: recordings it targets — an unnamed one used to be dated by when OneDrive finished
+#: receiving it. Pinned here, the names are a function of the row rather than of whichever
+#: build happens to be running.
+_META_RECORDED_AT = "recorded_at"
+_META_RECORDED_NOTE = "recorded_at_note"
 
 _UNSAFE_PATH = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -386,8 +405,47 @@ class Pipeline:
         self._withheld = withheld
         self._build_lock = threading.Lock()
         self._rng = random.Random()
+        #: The record's site list, for naming a recording that arrived without a name.
+        #: Loaded on first use and re-read only when the file's modification time changes,
+        #: so the nightly rebuild is picked up without a restart and without a read per
+        #: recording. Never fatal: an unreadable list is an empty one, and an empty one
+        #: means nothing is named — exactly the behaviour before naming existed.
+        self._site_book = sitebook.EMPTY
+        self._site_book_lock = threading.Lock()
 
     # -- lazily built collaborators ------------------------------------------------
+
+    @property
+    def site_book(self) -> sitebook.SiteBook:
+        """The record's sites, re-read when the nightly build has rewritten them.
+
+        Wrapped whole, and :func:`transcriber.sitebook.load` does not raise either. Two
+        layers for one file because this is read on the path that publishes a recording,
+        and the worst outcome it may ever cause is a plainer title.
+        """
+        path = str(getattr(self.config, "naming_sites_file", "") or "").strip()
+        if not path:
+            return sitebook.EMPTY
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            mtime = 0.0
+        with self._site_book_lock:
+            book = self._site_book
+            if book.path == path and book.mtime == mtime and (book or book.fault):
+                return book
+            try:
+                book = sitebook.load(path)
+            except Exception as exc:                                # pragma: no cover
+                book = sitebook.SiteBook(path=path, fault=f"could not be read ({exc})")
+            # Stamp the mtime we looked at, even on a fault. Without it a corrupt-but-present
+            # file never matches the cache key, so every recording re-reads and re-parses it
+            # — blocking file I/O on the publish path, behind a lock every worker shares.
+            book = replace(book, mtime=mtime, path=path)
+            self._site_book = book
+            if book.fault:
+                log.warning("site-list", book.line(), path=path)
+            return book
 
     @property
     def engine(self) -> Any:
@@ -689,11 +747,30 @@ class Pipeline:
         # --- 7. store the held words, then cut them out ---------------------------
         gate = self._withhold(row, route, transcript, extraction, report)
 
+        # --- 7a. what to call it, if anything -------------------------------------
+        # BEFORE the ANALYSED write, because the decision is stored on that write and a
+        # decision made after it would be serialised nowhere — silently, with no error and
+        # no symptom, and the stickiness that stops two attempts disagreeing would simply
+        # not exist. Wrapped whole: the only thing this can do for a recording is give it a
+        # better title, and nothing about a better title is worth a transcript.
+        # The same notes the publish will carry, computed once. The probe MUST render the
+        # bytes the record is actually handed: notes are rendered into the transcript, so a
+        # probe without them scores a file that does not exist, and the one check that asks
+        # the record instead of reasoning about it would be asking about the wrong file.
+        publish_notes = _engine_notes(engine_meta) + gate.notes
+        decision = self._name(row, parsed, gate, info, route, notes=publish_notes)
+
         # --- 8. persist ANALYSED --------------------------------------------------
         # The redacted analysis, deliberately: `_review_row` keeps an unverifiable quote in
         # the row so `transcriber status` can show a person what the model produced, and the
         # ledger is printed. A held passage must not reach it any more than it reaches a file.
-        changes: dict[str, Any] = {"analysis": _analysis_note(gate.extraction)}
+        pinned_at, pinned_note = self._recorded_at(row, parsed)
+        changes: dict[str, Any] = {
+            "analysis": _analysis_note(gate.extraction),
+            _META_NAMING: decision.as_meta(),
+            _META_RECORDED_AT: pinned_at.isoformat(),
+            _META_RECORDED_NOTE: pinned_note,
+        }
         if gate.note:
             # Only when the gate actually read the recording. An empty entry on every row in
             # ``off`` would read like a gate that ran and found nothing, which is a different
@@ -704,8 +781,9 @@ class Pipeline:
 
         # --- 9. write the three files, confirm them, then persist DONE ------------
         result = self._publish(row, parsed, gate.transcript, gate.extraction, info, route,
-                               notes=_engine_notes(engine_meta) + gate.notes,
-                               held=gate.held)
+                               notes=publish_notes,
+                               held=gate.held,
+                               display_name=decision.name if decision.applied else "")
         self.ledger.advance(
             row.item_id,
             State.DONE,
@@ -1078,32 +1156,114 @@ class Pipeline:
         recipients = tuple(getattr(self.config, "smtp_to", ()) or ())
         return str(recipients[0]).strip() if recipients else ""
 
-    def _publish(
+    def _name(
+        self,
+        row: Row,
+        parsed: naming.ParsedName,
+        gate: Any,
+        info: AudioInfo,
+        route: Route,
+        *,
+        notes: tuple[str, ...] = (),
+    ) -> autoname.NameDecision:
+        """What to call this recording, or nothing. **Never raises, never delays.**
+
+        Every failure — the site list missing, the renderer throwing, an unreadable stored
+        decision, anything at all — comes back as "no name", which is the behaviour before
+        this existed: the file keeps the voice recorder's own name and the transcript is
+        written on time. Nothing here can hold a recording up, because the whole feature is
+        worth less than one recording.
+
+        A decision already on the row is reused rather than made again. A publish that
+        failed halfway and is retried the next morning must write the same subject line, or
+        the record ends up holding two documents for one recording with no way to tell they
+        are the same.
+        """
+        # The stored answer FIRST, above the switch. A recording whose transcript already
+        # reached OneDrive under a worked-out subject line, and whose publish then half
+        # failed, must republish under that same subject line — even if he saw a title he
+        # did not like at 06:00 and switched naming off while it was still in flight. The
+        # record keys a document on its bytes, so republishing the same recording under a
+        # different subject is a second document, and overwriting the stored decision would
+        # destroy the only evidence that the first one was ever published.
+        stored = autoname.NameDecision.from_meta(row.meta.get(_META_NAMING))
+        if stored is not None:
+            return stored
+
+        if not bool(getattr(self.config, "naming", False)):
+            return autoname.NO_NAME
+
+        try:
+            probe = self._context(row, parsed, gate.transcript, gate.extraction, info,
+                                  notes=tuple(notes), held=tuple(gate.held))
+            return autoname.decide(
+                parsed=parsed,
+                extraction=gate.extraction,
+                spoken=outputs.spoken_body(gate.transcript),
+                duration_s=probe.duration_s,
+                book=self.site_book,
+                render=lambda name: outputs.render_transcript(
+                    replace(probe, display_name=name)
+                ),
+                apply=bool(getattr(self.config, "naming_apply", False)),
+                min_seconds=int(getattr(self.config, "naming_min_seconds", 120) or 120),
+                opening_seconds=float(
+                    getattr(self.config, "naming_opening_seconds", 60) or 60
+                ),
+            )
+        except Exception as exc:
+            log.warning(
+                "naming",
+                "could not work out what to call this recording; publishing it under the "
+                "name it arrived with",
+                item=row.item_id, route=route.name, error=str(exc),
+            )
+            return autoname.NameDecision(
+                decided=True, code="error",
+                why="something went wrong working out a name for it",
+            )
+
+    def _recorded_at(self, row: Row, parsed: naming.ParsedName) -> tuple[datetime, str]:
+        """When the recording was made — the row's own answer once it has one.
+
+        Worked out once and pinned, because the output filenames are built from it. See
+        :data:`_META_RECORDED_AT` for what a moment that moves between attempts costs.
+        """
+        stored = str(row.meta.get(_META_RECORDED_AT) or "")
+        if stored:
+            try:
+                return (
+                    datetime.fromisoformat(stored),
+                    str(row.meta.get(_META_RECORDED_NOTE) or "") or "read from the filename",
+                )
+            except (TypeError, ValueError):
+                # Unreadable rather than absent. Fall through and work it out again: a
+                # wrong-looking prefix is recoverable, a crash in the publish path is not.
+                log.warning("recorded-at", "the stored moment could not be read; working it "
+                            "out again", item=row.item_id, stored=stored)
+        return naming.resolve_timestamp(parsed, row.created_at)
+
+    def _context(
         self,
         row: Row,
         parsed: naming.ParsedName,
         transcript: Transcript,
         extraction: Extraction,
         info: AudioInfo,
-        route: Route,
         *,
         notes: tuple[str, ...] = (),
         held: Sequence[HeldSpan] = (),
-    ) -> outputs.UploadResult:
-        # The route's folder, and only ever the route's folder. Not a service-wide default,
-        # not the first route's, not the folder the recording came from. Asked before
-        # anything is rendered, so a route that cannot say where its outputs go costs
-        # nothing and touches nothing.
-        parent = str(route.output_folder_id or "")
-        if not parent:
-            raise _RouteFault(
-                f"the route {route.name!r} ({route.display}) has no output folder, so there "
-                f"is nowhere to write this recording's three files. Set "
-                f"{route.env_var('OUTPUT')} in the .env — or move this recording to a route "
-                f"that has one. Nothing was written and nothing was moved."
-            )
-        recorded_at, note = naming.resolve_timestamp(parsed, row.created_at)
-        ctx = outputs.OutputContext(
+        display_name: str = "",
+    ) -> outputs.OutputContext:
+        """Everything the three files are rendered from.
+
+        Lifted out of :meth:`_publish` so that the naming step can render the very same
+        files a few lines earlier to check its own answer, without a second code path that
+        could drift from the one that actually publishes. ``resolve_timestamp`` is pure, so
+        building this twice costs nothing.
+        """
+        recorded_at, note = self._recorded_at(row, parsed)
+        return outputs.OutputContext(
             item_id=row.item_id,
             source_name=row.name,
             parsed=parsed,
@@ -1121,7 +1281,37 @@ class Pipeline:
             # of the three files if one of those passages survived into one of them. Empty
             # in every mode but ``on``: nothing was cut, so nothing can have leaked.
             held=tuple(held),
+            display_name=display_name,
         )
+
+    def _publish(
+        self,
+        row: Row,
+        parsed: naming.ParsedName,
+        transcript: Transcript,
+        extraction: Extraction,
+        info: AudioInfo,
+        route: Route,
+        *,
+        notes: tuple[str, ...] = (),
+        held: Sequence[HeldSpan] = (),
+        display_name: str = "",
+    ) -> outputs.UploadResult:
+        # The route's folder, and only ever the route's folder. Not a service-wide default,
+        # not the first route's, not the folder the recording came from. Asked before
+        # anything is rendered, so a route that cannot say where its outputs go costs
+        # nothing and touches nothing.
+        parent = str(route.output_folder_id or "")
+        if not parent:
+            raise _RouteFault(
+                f"the route {route.name!r} ({route.display}) has no output folder, so there "
+                f"is nowhere to write this recording's three files. Set "
+                f"{route.env_var('OUTPUT')} in the .env — or move this recording to a route "
+                f"that has one. Nothing was written and nothing was moved."
+            )
+        ctx = self._context(row, parsed, transcript, extraction, info,
+                            notes=tuple(notes), held=tuple(held),
+                            display_name=display_name)
         self._refuse_name_collision(row, ctx)
         log.info("publishing", f"three files into the {route.display} output folder",
                  route=route.name, parent=parent)

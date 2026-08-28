@@ -10,6 +10,14 @@ files that need it most. Every name parses here: the two call forms yield a part
 timestamp, and everything else is a first-class result with ``timestamp=None``, for the
 caller to fall back to the item's created time.
 
+There is a third machine-written form, and missing it cost every unnamed recording its
+real date: the recorder's own default, ``Voice 260806_162219.m4a``. The digits are the same
+``YYMMDD_HHMMSS`` the call form writes, but a space stands where the call form has an
+underscore, so it fell through to the hand-typed branch and was dated by when OneDrive
+finished receiving it — hours late for a walk uploaded on the drive home, and across
+midnight often enough to file it on a day it did not happen. It is read now, and only for
+that exact anchored shape.
+
 The trailing digits on a hand-typed name are *not* read as a timestamp. ``270826`` on that
 site walk is 27 August written the way a person writes it; read as ``YYMMDD`` it would be
 2027, and the recording would file itself a year into the future where nobody would look
@@ -82,6 +90,21 @@ ACTIONS_SUFFIX = "-actions.md"
 #: the stem so the party may itself contain underscores and digits.
 _STAMPED_TAIL_RE = re.compile(r"^(?P<lead>.*)_(?P<date>\d{6})_(?P<time>\d{6})$")
 
+#: The voice recorder's own default name, for a recording he did not get to naming:
+#: ``Voice 260806_162219``. The same handset writes ``Call +27…_260420_133533``, so the
+#: digits are the same machine-written ``YYMMDD_HHMMSS`` — but a SPACE stands where the
+#: call form has an underscore, and :data:`_STAMPED_TAIL_RE` needs two underscores. So
+#: every recording he did not name was dated by when OneDrive finished RECEIVING it, which
+#: for a site walk uploaded on the drive home is hours late and can cross midnight into a
+#: day the recording did not happen on. The record derives its month folder and its item id
+#: from that date.
+#:
+#: Read here, and only here: this shape is machine-written and unambiguous, unlike the
+#: trailing digits of a hand-typed name, which :data:`_STAMPED_TAIL_RE`'s comment explains
+#: are never read. ``241121`` as YYMMDD is 2024-11-21; day-first it would be November 2021,
+#: before any of this existed.
+_RECORDER_DEFAULT_RE = re.compile(r"^Voice (?P<date>\d{6})_(?P<time>\d{6})$")
+
 #: "Call", optionally "Call recording", then the party. The party group is optional so that
 #: a nameless "Call recording_260827_143005" does not come back with a party of "recording",
 #: and ``recording`` is a named group so a name like "Call recordings Ltd" — where the word
@@ -138,6 +161,10 @@ class ParsedName:
     timestamp: datetime | None = None
     copy_marker: int | None = None   # the n from a OneDrive "(n)" duplicate suffix
     timestamp_note: str = ""         # plain words for the output body
+    #: True when the moment came from the voice recorder's default name rather than from
+    #: the call form. :func:`resolve_timestamp` checks it against the item's created time,
+    #: because this is the one timestamp source that was inferred rather than agreed.
+    timestamp_recovered: bool = False
 
     @property
     def matched_call_form(self) -> bool:
@@ -194,6 +221,17 @@ def parse_source_name(name: str) -> ParsedName:
             # nothing at all rather than nudged into the nearest valid date.
             bad_stamp = f"{tail.group('date')}_{tail.group('time')}"
 
+    # The recorder's own default, read only when the call form did not match. A file he
+    # named himself never reaches this: the shape is anchored at both ends and is
+    # case-sensitive, so "VOICE NOTE FOR CAREL" and "Voice 260806_162219 CANTERBURY" both
+    # fall through to the hand-typed branch and keep their timestamp of None.
+    recovered = False
+    if timestamp is None and not bad_stamp:
+        default = _RECORDER_DEFAULT_RE.match(stem)
+        if default:
+            timestamp = _to_datetime(default.group("date"), default.group("time"))
+            recovered = timestamp is not None
+
     lead = tail.group("lead") if tail else stem
     call = _CALL_PREFIX_RE.match(lead.strip())
 
@@ -201,6 +239,15 @@ def parse_source_name(name: str) -> ParsedName:
         form = FORM_CALL_RECORDING if call.group("recording") else FORM_CALL
         party = _clean_party(call.group("party"))
         note = "read from the filename"
+    elif recovered:
+        # The voice recorder's default name. Machine-written and unambiguous, but nobody
+        # agreed it: the note says where it came from so a reader can weigh it.
+        form = FORM_FREE_TEXT
+        party = None
+        note = (
+            "read from the voice recorder's own default name, which is when the recording "
+            "was made rather than when it finished uploading"
+        )
     elif timestamp is not None:
         # The machine-written tail without the "Call" prefix. The stamp is still
         # unambiguous; the party is not stated, so none is claimed.
@@ -224,6 +271,7 @@ def parse_source_name(name: str) -> ParsedName:
         form=form,
         party=party,
         timestamp=timestamp,
+        timestamp_recovered=recovered,
         copy_marker=copy_marker,
         timestamp_note=note,
     )
@@ -243,11 +291,28 @@ def resolve_timestamp(
     in the output either way, so a reader can see which one was used.
     """
     zone = tz or SAST
+    created = parse_graph_datetime(created_at)
 
     if parsed.timestamp is not None:
-        return parsed.timestamp.replace(tzinfo=zone), parsed.timestamp_note
+        local = parsed.timestamp.replace(tzinfo=zone)
+        # A moment recovered from the recorder's default name is the one timestamp source
+        # nobody agreed to, so it is checked against the one fact that cannot be argued
+        # with: a recording cannot have been made after it was uploaded. Later than that by
+        # more than a day means the digits are not what they look like — a differently
+        # configured handset, a name coincidentally in the shape — and the created time,
+        # late as it is, is the safer answer. Being EARLIER is normal and is the whole
+        # point: that is the drive home.
+        if parsed.timestamp_recovered and created is not None:
+            if local > created + timedelta(hours=24):
+                return created.astimezone(zone), (
+                    f"the name looks like the voice recorder's default but reads as "
+                    f"{local.strftime('%Y-%m-%d %H:%M:%S')}, which is after OneDrive "
+                    f"received the file, so it is not a moment this recording could have "
+                    f"been made; this is when OneDrive recorded the file as created "
+                    f"({created.strftime('%Y-%m-%d %H:%M:%S')} UTC)"
+                )
+        return local, parsed.timestamp_note
 
-    created = parse_graph_datetime(created_at)
     if created is None:
         raise TimestampUnavailable(
             f"{parsed.original_name!r} has no timestamp in its name and Graph reported no "

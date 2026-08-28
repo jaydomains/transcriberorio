@@ -290,6 +290,86 @@ running, it says so and says not to switch it on.
 
 ---
 
+## Step 8b — Let it name the notes you didn't get to name (optional)
+
+**Skip this whole step if you want.** Everything works without it; you just keep naming site
+notes yourself, as you do now.
+
+The problem it solves: you record a site walk, it uploads before you get to name it, and it
+lands as `Voice 260806_162219.m4a`. That is what it stays called, forever, and nothing in the
+record ever says which site it was.
+
+What it does about it: it listens for what you say at the top — *"this is a site walk of
+Beach Court, general inspection"* — and titles the note the way you already name them:
+`BEACH COURT SITE WALK`. On the ones where you forgot to announce it, it goes by which site
+the conversation is mostly about instead. **It only ever touches a file still called
+`Voice <numbers>_<numbers>`.**
+Anything you named yourself is left completely alone, and so is a call, which your phone
+already names.
+
+It needs one thing: a list of your sites, so it can only ever propose a site you actually
+have. That list comes out of the record's own nightly build.
+
+**1. Point it at the record and build the list.** On the machine that runs the service:
+
+```
+/srv/transcriber/ops/build-site-book.py /srv/kbc-site-memory /var/lib/transcriber/sites.json
+```
+
+It should print something like `56 sites -> /var/lib/transcriber/sites.json`.
+
+**2. Have it rebuilt each night, right after the record rebuilds.** Add one line to the same
+cron entry that already rebuilds the record:
+
+```
+30 4 * * *  cd /srv/kbc-site-memory && make build && \
+            /srv/transcriber/ops/build-site-book.py . /var/lib/transcriber/sites.json
+```
+
+Nothing breaks if this stops running, and nothing is ever named wrongly because of it — an
+old list simply describes the sites as they were, so a new job it has never heard of gets no
+name. The morning email prints the list's date whenever it has anything to say, and says so
+loudly every morning if the file has gone missing altogether.
+
+**3. Tell the service where it is.** The wizard in the next step asks. If you skipped it
+there, it takes **two** settings, not one — skipping the wizard question switches the whole
+thing off, so pointing at the file alone would leave it off:
+
+```
+transcriber config set NAMING_SITES_FILE /var/lib/transcriber/sites.json
+transcriber config set NAMING true
+```
+
+**It starts by only telling you what it would do.** For the first few weeks the morning
+email says *"this one came in without a name and I would have called it BEACH COURT"* — and
+the file keeps the name it arrived with. Nothing in the record changes. You read that for a
+month, and if the names look right:
+
+```
+transcriber config set NAMING_APPLY true
+```
+
+I would genuinely leave it reporting for a few weeks first. Nobody has measured how often
+this fires or how often it gets it right — the first weeks are that measurement, and the
+cost of waiting is a plainer title on a handful of notes.
+
+**Two things worth knowing before you switch it on:**
+
+- It **never renames anything in OneDrive** — not the audio, not the transcript files. The
+  name goes into the transcript's subject line, which is what the record reads and what it
+  shows you. If you want the audio file to match, the email tells you what to rename it to
+  and you do it by hand.
+- **A title cannot be corrected afterwards.** The record works out a document's identity
+  partly from its subject line, so re-publishing a corrected one files a second copy rather
+  than fixing the first. That is why it refuses whenever it is not certain, and why nothing
+  is applied until you say so.
+
+**When it is not sure, it says nothing and moves on.** No question, no queue, nothing
+waiting for you. The recording is transcribed and filed on time exactly as it is today; it
+just keeps its plain name. That is the intended outcome for most of them.
+
+---
+
 ## Step 9 — Run the setup wizard
 
 Don't edit any files. Run this:
