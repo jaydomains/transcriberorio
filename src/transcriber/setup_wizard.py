@@ -1604,8 +1604,56 @@ def _probe_heartbeat(url: str) -> str:
         return f"pinged, {resp.status} — the check should now show as up"
 
 
+def _naming(ctx: _Ctx) -> None:
+    """Whether to name a recording that arrived under the voice recorder's own name.
+
+    Asked rather than left to a hand-edit, because a setting nobody is told about is a
+    setting nobody uses. It is entirely optional and the question says so: skipping it costs
+    nothing at all, because the only thing it changes is what a handful of notes are called.
+    """
+    _section(ctx, 7, "Naming the notes you did not get to name",
+             "Optional. Press Enter to skip the whole thing.")
+    ctx.out("  A site note that uploads before you name it arrives as the recorder's own")
+    ctx.out("  name — Voice 260806_162219.m4a — and stays that way. This can read the site")
+    ctx.out("  out of the recording and title it for you. It never touches a name you typed,")
+    ctx.out("  never renames anything in OneDrive, and when it is not sure it says nothing.")
+    ctx.out()
+
+    path = ctx.ask(
+        "NAMING_SITES_FILE",
+        "Where is the site list? (Enter to skip — nothing will be named)",
+        default=str(ctx.values.get("NAMING_SITES_FILE", "") or ""),
+        required=False,
+        help_text=(
+            "The file ops/build-site-book.py writes from the record's nightly build, e.g. "
+            "/var/lib/transcriber/sites.json. It exists so the service can only ever "
+            "propose a site you actually have. Leave it empty and no recording is ever "
+            "named — which is exactly how things work today."
+        ),
+    ).strip()
+
+    if not path:
+        # Not a note. He was offered it and said no, which is a complete answer.
+        ctx.values["NAMING"] = "false"
+        ctx.values.pop("NAMING_APPLY", None)
+        return
+
+    ctx.values["NAMING"] = "true"
+    ctx.values["NAMING_APPLY"] = "false"
+    if not os.path.exists(path):
+        ctx.notes.append(
+            f"The site list {path} is not there yet. Nothing is named until it is, and "
+            f"nothing else is affected. Build it with: ops/build-site-book.py "
+            f"<the record's folder> {path}"
+        )
+    ctx.out()
+    ctx.out("  Set up to work out names and report them in the morning email, without")
+    ctx.out("  writing any of them. Read that email for a few weeks; when the names look")
+    ctx.out("  right, turn it on with:  transcriber config set NAMING_APPLY true")
+
+
 def _local(ctx: _Ctx) -> None:
-    _section(ctx, 7, "Where it keeps its notes", "Sensible defaults; press Enter through these.")
+    _section(ctx, 8, "Where it keeps its notes", "Sensible defaults; press Enter through these.")
     ctx.ask("LEDGER_PATH", "Where should the ledger live?", default="./transcriber.db",
             help_text="The permanent record of every recording and what happened to it. "
                       "Back this up — it is the memory that stops a loss going unnoticed.")
@@ -1654,6 +1702,7 @@ def run_setup(
         _analysis(ctx)
         _email(ctx)
         _heartbeat(ctx)
+        _naming(ctx)
         _local(ctx)
     except KeyboardInterrupt:
         ctx.out(style.yellow("\n\n  Stopped. Nothing was written.\n"))

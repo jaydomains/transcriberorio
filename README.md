@@ -379,6 +379,101 @@ categories look right, and the model read effectively all of the recordings, set
 
 ---
 
+## Naming a recording that arrived without a name
+
+A site note recorded and uploaded before he got to naming it arrives as the voice recorder's
+own default — `Voice 260806_162219.m4a` — and stays that way. Nothing in the record ever says
+which site it was.
+
+**Only that exact shape is ever considered.** `^Voice \d{6}_\d{6}$`, anchored and
+case-sensitive. Everything else he named himself, and the service never touches a name a
+person chose. That includes the ones that look nameless to a machine and are not:
+`CJ.m4a`, `Q.m4a`, `JORDS.m4a`, `Morne Interview.m4a` — those are what he calls those
+people. The tempting rule, *"no recognisable site in the name, so suggest one"*, is wrong on
+every one of them. A device whose default name this does not recognise gets zero
+suggestions, which is the right cost: the other direction is renaming something he chose.
+
+**Two outcomes and no third: a name, or no name.** No name is exactly the behaviour before
+this existed. Nothing is ever held, delayed, queued or waiting on an answer, and there is
+nothing to approve — an unnamed recording is not a problem to be resolved, it is a recording
+with a plain title. The morning email says one line about it and moves on.
+
+### What it takes to earn a name
+
+Nine conditions, all mechanical, every one failing towards no name. Two of them carry the
+weight and neither is obvious:
+
+**The site must be named in the published body, not in the engine's prose.** Those are
+different strings. `Transcript.text` is the engine's continuous prose; the published body is
+one line per segment, each prefixed `[MM:SS] Speaker: `, cut on a speaker change or a pause
+over 0.9 s. So "Beach Court" said either side of a breath is contiguous in the prose and
+**split across two lines in the file**. Deciding from the prose proposes a title the file
+does not contain — and in testing that filed a walk at one site under a different one.
+
+**Adding the name must not change which site the record files it under.** The title is part
+of the bytes the record scores. Measured against the real 56 sites: a body that binds
+cleanly to Milton Court binds to *nothing at all* once `CANTERBURY` is in its subject line.
+A wrong name does not merely mislabel a note — it unfiles it. So the file is rendered twice,
+with the name and without, through the record's own site-matching vendored into
+`sitebook.py`, and the name is refused unless the answer is identical. That check cannot
+disagree with the filing because it *is* the filing.
+
+The rest: the site is not a placeholder ("the site", "here"); the words look like a name; the
+record binds the transcript to exactly one site; the span names that site and no other in the
+record's own vocabulary — which is what stops `House`, `North`, `Green` and `Beach` becoming
+names, since the record discards any term it uses of more than two sites; the site is named
+twice or more, in the first quarter, and spread across at least 40% of the recording; and the
+recording is longer than two minutes.
+
+That last one is not arbitrary. Forty seconds of wind noise comes back from a Whisper-family
+engine as *"Canterbury Square. Thank you for watching. Canterbury Square, thank you for
+watching"* — which passes every plausibility floor this service has, satisfies "mentioned
+twice" and satisfies "mentioned early". **The two conditions that look like evidence are the
+hallucination's own signature.** Length is the only cheap thing that separates them.
+
+### What it changes, and what it does not
+
+| | Renamed? |
+| --- | --- |
+| The audio in OneDrive | **Never.** Not automatically, not at any confidence. |
+| The three output filenames | **Never.** They stay a pure function of the recorded moment, the source stem, the copy marker and the item id. |
+| The transcript's `Subject:` line | Yes, when `NAMING_APPLY` is on. |
+| Its `# ` heading | Yes, the same substitution. |
+| Anything at all after publishing | **Never.** |
+
+The output filenames are left alone for a specific reason: a half-failed publish is recovered
+by writing the same three names again. A name that could differ between attempts — because
+the site list was rebuilt overnight — would leave three files nothing can delete and a second
+document in the record. And the title is not corrected later either: the record derives a
+document's identity partly from its subject, so re-publishing a corrected one files a second
+copy rather than fixing the first. Get it right on the first pass or leave it.
+
+### It ships working it out and writing nothing
+
+`NAMING=true`, `NAMING_APPLY=false`. It decides, records the decision, and prints it in the
+morning email; the transcript keeps the name it arrived with. Nobody has measured how often
+this fires or how often it is right — there is no corpus in either repository to measure it
+against — so the shipped default is the measurement, on the population it actually runs on.
+
+Two booleans rather than one mode word, deliberately. The sensitivity gate has three call
+sites that read an unrecognised mode word as `on`; a fourth mode word reaching them by a typo
+would arm the thing the typo was meant to disarm. A boolean cannot be misread that way.
+
+### The site list
+
+`ops/build-site-book.py` projects the eight fields the record's own vocabulary reads out of
+its nightly `build/spine.json` — 80 KB for 56 sites — and the service reads that file, re-read
+only when its modification time changes. No network call, no dependency on a git checkout
+being present, and no change to the record's repository, which is read-only to this service.
+
+Every failure ends in fewer names and never in different ones: a missing file, an unreadable
+one, one written against a contract this code does not know, a site the record has no folder
+for. The morning email prints the list's date every day, including on a day with nothing to
+report, so a list that quietly stopped being written says so rather than reading as a quiet
+fortnight.
+
+---
+
 ## Running it for a team
 
 One person recording a few calls a day needs none of this: the settings below already have
@@ -538,6 +633,15 @@ start without it — and it reports *every* missing variable at once, not one pe
 | `ARCHIVE_FOLDER_ID` | Where recordings older than 60 days are moved, in that same shape. Nothing is ever deleted. |
 | `ORPHAN_FOLDER_ID` | Optional. If an upload half-finishes, the stray files are moved here rather than left in the output folder. Leave it empty and the strays are named in the error and replaced on the next attempt. **Never point this at the archive folder** — nothing ever looks in there. |
 
+### Naming a recording that arrived without a name
+
+| Variable | Meaning |
+| --- | --- |
+| `NAMING` | Work out a name and report it in the morning email. Default `true`. |
+| `NAMING_APPLY` | Write that name into the transcript's subject line and heading. Default `false` — report only, and nothing in the record changes. |
+| `NAMING_SITES_FILE` | The site list written by `ops/build-site-book.py`. Without it nothing is ever named, which is safe. |
+| `NAMING_MIN_SECONDS` | Shortest recording that may be named. Default `120`. |
+
 ### The routes — one entry per kind of recording
 
 Written by `transcriber setup` and `transcriber routes`; you should rarely need to edit
@@ -679,6 +783,9 @@ is the transcript plausible for the length of the audio?
    ↓
 read by the AI pass  ← every proposal must quote words that are genuinely in the transcript
    ↓
+what should it be called?  ← only if it still carries the voice recorder's own name. The
+   ↓                          answer is stored before the files are written, so a retry
+   ↓                          writes the same subject line rather than a second document
 three files written to OneDrive, all three read back
    ↓
 marked done
