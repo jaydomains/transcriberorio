@@ -983,3 +983,29 @@ class TheLedgerFileIsNotWorldReadable(unittest.TestCase):
                     self.assertEqual(
                         ledger.cursor_get("worker:last_cycle_error_detail"), "x"
                     )
+
+    def test_a_refused_chmod_is_said_out_loud_exactly_once(self) -> None:
+        """The gap this method closes was itself closing silently.
+
+        An earlier version swallowed the failure with a comment claiming config reported
+        it. Config only warns about the work directory, so nothing anywhere said the ledger
+        had been left readable — in a change whose entire point is that the file is
+        sensitive. Found by a review bot on the pull request, which was right.
+        """
+        import logging as _logging
+        import tempfile as _tempfile
+        from unittest import mock
+
+        with _tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.sqlite3")
+            with mock.patch("transcriber.ledger.os.chmod", side_effect=OSError("read-only")):
+                with self.assertLogs("transcriber.ledger", level=_logging.WARNING) as caught:
+                    with Ledger(path) as ledger:
+                        # Several connections and several writes: the warning is once per
+                        # ledger, not once per connection, or it becomes noise nobody reads.
+                        ledger.cursor_set("worker:last_cycle_error_detail", "x")
+                        ledger.cursor_set("worker:last_cycle_error_detail", "y")
+
+        said = [line for line in caught.output if "readable by other users" in line]
+        self.assertEqual(len(said), 1, f"expected exactly one warning, got: {caught.output}")
+        self.assertIn("readable by other users", said[0])

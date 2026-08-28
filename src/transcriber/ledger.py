@@ -283,6 +283,8 @@ class Ledger:
         # being permanent.
         self._scrub = scrub if callable(scrub) else None
         self._memory = path == ":memory:" or path.startswith("file::memory:")
+        #: Said once per ledger, not per connection — see _restrict_permissions.
+        self._permission_warning_given = False
         self._local = threading.local()
         self._shared: sqlite3.Connection | None = None
         self._lock = threading.RLock()
@@ -335,10 +337,22 @@ class Ledger:
             try:
                 if os.path.exists(target):
                     os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
-            except OSError:
-                # Reported once at startup by config, not per connection: a warning on every
-                # database open would be noise nobody reads.
-                pass
+            except OSError as exc:
+                # Said once, not per connection: a warning on every database open is noise
+                # nobody reads, and noise nobody reads is how a real warning gets missed.
+                # But it MUST be said — an earlier version claimed config reported this,
+                # and config only warns about the work directory, so the one gap this
+                # method exists to close was itself closing silently.
+                if not self._permission_warning_given:
+                    self._permission_warning_given = True
+                    log.warning(
+                        "ledger-permissions",
+                        "could not restrict the ledger to this account only; it holds "
+                        "fragments of what was said and may be readable by other users "
+                        "on this machine",
+                        file=os.path.basename(target),
+                        error=str(exc),
+                    )
 
     def _conn(self) -> sqlite3.Connection:
         # An in-memory database is per-connection, so threads must share one; a file
