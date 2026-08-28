@@ -975,6 +975,16 @@ def redact_extraction(extraction: Any, redaction: Redaction) -> tuple[Any, list[
     Proposals whose quote is wholly inside a held passage are taken out of the proposal
     list and named in the notes, which every one of the three files prints. Held, visible,
     and requestable — never silently absent.
+
+    **The limit of this, said out loud: it masks quotations, not restatements.** Every pass
+    below is a search for the held words — whole, or as a run of them. Prose that says the
+    same thing in different words shares none of them and comes through untouched, and a
+    model summarising a held passage reuses the facts far more readily than the phrasing.
+    That case is not solvable here and is not solved here: it is addressed in the prompt,
+    which requires the model to keep ``summary_en`` and every item's prose clear of anything
+    it returns under a held category, and backstopped by
+    :func:`transcriber.outputs.refuse_written_down_again`, which re-reads the rendered files
+    with the mechanical rules. Do not read this function as covering it.
     """
     if not redaction.armed:
         return extraction, []

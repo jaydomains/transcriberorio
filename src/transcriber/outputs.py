@@ -83,6 +83,7 @@ from .models import (
 )
 from .naming import OutputNames, ParsedName, output_names
 from . import redact
+from . import sensitivity
 from .redact import contains_any_held, held_words_in
 
 # extract.Extraction and its proposals are read by attribute rather than imported. The
@@ -94,6 +95,7 @@ __all__ = [
     "HeldTextWouldLeak",
     "UploadIncompleteError",
     "refuse_held_text",
+    "refuse_written_down_again",
     "OutputContext",
     "RenderedFile",
     "UploadedFile",
@@ -525,6 +527,9 @@ def render_all(ctx: OutputContext) -> tuple[RenderedFile, ...]:
         RenderedFile("actions", names.actions, render_actions(ctx)),
     )
     refuse_held_text(files, ctx.held, source_name=ctx.source_name)
+    refuse_written_down_again(
+        files, source_name=ctx.source_name, armed=bool(ctx.held)
+    )
     return files
 
 
@@ -553,6 +558,18 @@ def refuse_held_text(
     they are free to restate in other words what the transcript no longer says. They are
     masked upstream by searching for the held words; this is what catches the occasion when
     that search missed.
+
+    **What it does not catch, stated plainly because the docstring used to imply otherwise:
+    a restatement.** This is a search for the held *words*. A model summarising a held staff
+    matter in its own prose — "there is a hearing for Marius on Friday and he will probably
+    lose his job", against a held "Marius has his disciplinary hearing on Friday" — shares
+    neither the whole passage nor a run of five consecutive words, and passes here. The two
+    things that address it are :data:`transcriber.prompts.SENSITIVITY_NOTE`, which requires
+    the model to keep its own prose clear of what it flags, and
+    :func:`refuse_written_down_again`, which re-reads the derived files with the mechanical
+    rules and so catches the part of a rewriting that is mechanically decidable. Neither is
+    sufficient and both are needed; a word search is not the last line and must not be read
+    as one.
 
     Empty ``held`` is a pass, not a skip: nothing was cut, so there is nothing that could
     have survived a cut. That is the state of every recording in ``shadow`` and ``off``.
@@ -586,6 +603,65 @@ def refuse_held_text(
         "uploaded, nothing was moved and nothing was deleted; the passages are in the held "
         "queue and the recording is where it was.",
         refs=tuple(dict.fromkeys(refs)),
+        files=tuple(dict.fromkeys(leaking)),
+    )
+
+
+def refuse_written_down_again(
+    files: Sequence[RenderedFile],
+    *,
+    source_name: str = "",
+    armed: bool = False,
+) -> None:
+    """Re-read the finished files with the mechanical rules, not with a word search.
+
+    The second backstop, and it exists because the first one cannot see the case that
+    matters. :func:`refuse_held_text` searches for the held *words*; a model restating a
+    held passage in its own prose shares none of them, satisfies neither the whole-passage
+    match nor the five-consecutive-word run, and is written to OneDrive. The summary and the
+    proposals are both written by a model reading the unredacted transcript, and both go
+    into the route's output folder — which is where James looks — so decision 6 is broken
+    for a staff member's passage by a paraphrase alone.
+
+    What this catches is the part that is mechanically decidable in a rewriting: an explicit
+    request that something not be written down, restated, and a bare identity or account
+    number, which survives a paraphrase intact because a number cannot be paraphrased. It
+    cannot catch a reworded staff matter — nothing here can, and the honest place that is
+    solved is the prompt, which now tells the model to keep its prose clear of what it
+    flagged. Both are needed and neither is sufficient; this one is here because it is the
+    half that does not depend on a model doing as it was asked.
+
+    Runs only when the gate is armed. In ``shadow`` and ``off`` nothing was withheld, and a
+    check that stopped a publish would be a measurement changing what reaches the record.
+    """
+    if not armed:
+        return
+    problems: list[str] = []
+    leaking: list[str] = []
+    for rendered in files:
+        if rendered.kind == "transcript":
+            # The transcript is the recording's own words, cut on exact offsets. A rule
+            # firing on it would be firing on the marker's neighbours or on something the
+            # classifier deliberately let through, and refusing there would quarantine
+            # ordinary recordings.
+            continue
+        for finding in sensitivity.rule_findings(rendered.text):
+            if not finding.held:
+                continue
+            problems.append(
+                f"the {rendered.kind} file ({rendered.name}) states something that must not "
+                f"be written down — {finding.subject} — even though it is not a quotation of "
+                f"a held passage, so it was not caught by masking"
+            )
+            leaking.append(rendered.name)
+    if not problems:
+        return
+    raise HeldTextWouldLeak(
+        f"{source_name or 'this recording'} produced a summary or a proposal restating "
+        f"something that must not be written down, in words of its own rather than the "
+        f"recording's, so none of the three files has been written: " + "; ".join(problems)
+        + ". Nothing was uploaded, nothing was moved and nothing was deleted.",
+        refs=(),
         files=tuple(dict.fromkeys(leaking)),
     )
 
@@ -1116,6 +1192,7 @@ def upload_outputs(
     # costs one pass over three small strings and it is the only thing standing between a
     # masking bug and a held passage in the record, from which nothing can take it back.
     refuse_held_text(files, held)
+    refuse_written_down_again(files, armed=bool(held))
 
     uploaded: list[UploadedFile] = []
     remaining = [f.name for f in files]
