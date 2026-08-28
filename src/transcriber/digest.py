@@ -1802,11 +1802,21 @@ def naming_report(config: Any, ledger: Ledger, *, day: str) -> Mapping[str, Any]
     """
     if not bool(getattr(config, "naming", False)):
         return {}
+    # Read fresh, and deliberately not shared with the worker's cached copy. The digest is
+    # built once a day, often in a different process from the one that published yesterday's
+    # recordings, and what it reports is what the site list looks like NOW — a book the
+    # worker loaded a week ago and has held ever since is exactly the thing this line exists
+    # to expose. The cost is one 80 KB read a day.
     book = sitebook.EMPTY
     try:
         book = sitebook.load(str(getattr(config, "naming_sites_file", "") or ""))
     except Exception as exc:  # noqa: BLE001 - the email must send from a sick everything
         log.warning("could not read the site list: %s", exc)
+        # sitebook.load is documented never to raise, so this branch should be unreachable.
+        # If it ever fires, the empty book's own line reads "site list: empty, so nothing is
+        # being named" — which is what a service with no book configured says, and would
+        # report a fault as a settled choice. Say what actually happened instead.
+        book = sitebook.SiteBook(fault=f"it could not be read ({exc})")
     unreadable = ""
     try:
         decisions = ledger.naming_for_day(day)
