@@ -171,6 +171,11 @@ _SPEC: tuple[_Var, ...] = (
     _Var("gate_held_store", "GATE_HELD_STORE", "str", "", "path to the store of held passages — the only copy of that text outside the audio, so it is never put in the work directory; empty means held.sqlite3 beside the ledger"),
     _Var("gate_review_base_url", "GATE_REVIEW_BASE_URL", "str", "", "https address of the page where held passages are approved, linked from the morning email; required before the gate can be switched on"),
     _Var("analysis_key_expires_on", "ANALYSIS_KEY_EXPIRES_ON", "str", "", "ISO date the analysis API key expires, if it has one (optional)"),
+    # --- naming a recording that arrived without one ----------------------------------
+    _Var("naming", "NAMING", "bool", True, "work out what to call a recording that arrived under the voice recorder's own default name, from the site spoken in it, and say so in the morning email"),
+    _Var("naming_apply", "NAMING_APPLY", "bool", False, "write that name into the transcript's subject line and heading; off means it is only reported and nothing in the record changes"),
+    _Var("naming_sites_file", "NAMING_SITES_FILE", "str", "", "path to the site list written by ops/build-site-book.py from the record's nightly build; without it no recording is ever named"),
+    _Var("naming_min_seconds", "NAMING_MIN_SECONDS", "int", 120, "shortest recording that may be named — below this an engine's own repetitions are indistinguishable from a site being named twice"),
     # --- digest email ----------------------------------------------------------------
     _Var("smtp_host", "SMTP_HOST", "str", _REQUIRED, "SMTP host for the morning digest"),
     _Var("smtp_port", "SMTP_PORT", "int", 587, "SMTP port"),
@@ -261,6 +266,18 @@ class Config:
     #: :attr:`held_store_path`, which is what everything should read.
     gate_held_store: str = ""
     gate_review_base_url: str = ""
+    # naming a recording that arrived without one
+    #: Whether to work out a name at all. On by default because it only ever *reports*
+    #: until :attr:`naming_apply` is set as well.
+    naming: bool = True
+    #: Whether the worked-out name reaches the transcript's subject line and heading.
+    #: **Off by default, and deliberately two settings rather than one word.** The gate
+    #: learned this the hard way: three call sites override an unrecognised mode word to
+    #: "on", so a typo in a mode word arms the thing it was meant to disarm. A boolean
+    #: cannot be misread that way.
+    naming_apply: bool = False
+    naming_sites_file: str = ""
+    naming_min_seconds: int = 120
     #: route name -> the address that reviews that route's held passages; a route absent
     #: from here, or present with an empty value, is reviewed by the service owner. A staff
     #: member reviews their own held passages: he sees the count and the site, never the
@@ -686,6 +703,28 @@ class Config:
                     f"No reviewer is named for: {named}. Nothing is being withheld in "
                     f"shadow, so nothing is going anywhere yet. {plain} Set them before "
                     "switching the gate on."
+                )
+
+        # Naming. Never a problem — a missing site list means no recording is ever named,
+        # which is exactly the behaviour before this existed. A notice, so that a list that
+        # quietly stopped being written does not read as a quiet fortnight.
+        if bool(values.get("naming", True)):
+            book_path = str(values.get("naming_sites_file") or "").strip()
+            if not book_path:
+                notices.append(
+                    "No site list is configured (NAMING_SITES_FILE), so no recording will "
+                    "be given a name. Everything else is unaffected. Point it at the file "
+                    "ops/build-site-book.py writes from the record's nightly build."
+                )
+            elif not os.path.exists(book_path):
+                notices.append(
+                    f"The site list {book_path} is not there, so no recording will be "
+                    f"given a name. Everything else is unaffected."
+                )
+            if bool(values.get("naming_apply")) and not book_path:
+                notices.append(
+                    "NAMING_APPLY is on but there is no site list, so there is nothing to "
+                    "apply."
                 )
 
         configured_reviewer_vars = {route_env_var(r.name, "REVIEWER") for r in routes}

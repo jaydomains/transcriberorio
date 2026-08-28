@@ -172,6 +172,8 @@ GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     )),
     ("what it expects to hear", ("LANGUAGES", "VOCABULARY", "VOCABULARY_FILE")),
     ("the sensitivity gate", ("GATE_MODE", "GATE_HELD_STORE", "GATE_REVIEW_BASE_URL")),
+    ("naming a recording that arrived without one", (
+        "NAMING", "NAMING_APPLY", "NAMING_SITES_FILE", "NAMING_MIN_SECONDS")),
     ("http and logging", ("HTTP_TIMEOUT_S", "MAX_RETRIES", "LOG_LEVEL", "LOG_FORMAT")),
 )
 
@@ -422,6 +424,15 @@ def check_value(name: str, raw: str, env: Mapping[str, str]) -> str:
         return (
             "GATE_REVIEW_BASE_URL must start with https:// — approvals, and the held "
             "passages behind them, travel over it"
+        )
+
+    if name == "NAMING_APPLY" and value.lower() in ("1", "true", "yes", "on") and not str(
+        current.get("NAMING_SITES_FILE") or ""
+    ).strip():
+        raise ConfigError(
+            "NAMING_APPLY writes a worked-out name into the transcript's subject line, and "
+            "the name can only come from the record's site list. Set NAMING_SITES_FILE "
+            "first, to the file ops/build-site-book.py writes."
         )
 
     if name == "GATE_MODE" and value.lower() == "on" and not str(
