@@ -103,9 +103,11 @@ STOP_SITES = frozenset({
 _MIN_NAME = 3
 _MAX_NAME = 66
 
-#: What the date and time cost, so the site and the activity can be trimmed to fit rather
-#: than the date being dropped — he asked for the date, and a title without one is the thing
-#: he asked to have fixed.
+#: What the date and time cost. Reserved out of the ceiling at N4, so the room for the date
+#: is taken before anything else is measured and the date can never be the thing that gets
+#: dropped to make a name fit — he asked for the date, and a title without one is the thing
+#: he asked to have fixed. Fifty-four characters are left for the site, against a longest
+#: real name of forty-nine.
 _STAMP_ROOM = len(" 060826 1622")
 
 #: How early the first mention must fall, and how far apart the first and last must be, as
@@ -308,10 +310,19 @@ def decide(
                                 f"nothing in the recording to take the name from")
     span = _normalise(spoken[match[0]:match[1]])
 
-    # N4 — the span looks like a name.
-    if not _NAME_SHAPE.fullmatch(span) or not (_MIN_NAME <= len(span) <= _MAX_NAME):
+    # N4 — the span looks like a name, and leaves room for the date on the end.
+    #
+    # The room is reserved HERE rather than trimmed later, because the only two ways to
+    # make an over-long name fit are both wrong: dropping the date is dropping the thing he
+    # asked for, and cutting a site name short names somewhere else or nowhere. A site whose
+    # name will not fit in fifty-four characters is refused, plainly, and his longest real
+    # one is forty-nine.
+    if not _NAME_SHAPE.fullmatch(span) or len(span) < _MIN_NAME:
         return NameDecision(decided=True, code="N4", span=span, book=book_name,
                             why="the words it is named by do not read as a name")
+    if len(span) > _MAX_NAME - _STAMP_ROOM:
+        return NameDecision(decided=True, code="N4", span=span, book=book_name,
+                            why=f"{span!r} is too long to be a title with the date on it")
 
     # N6 — the span names exactly one site the record knows about.
     #
@@ -398,7 +409,11 @@ def decide(
         # asked to have fixed.
         candidate = " ".join(part for part in (span.upper(), stamp) if part)
         activity = ""
-    if naming.safe_stem(candidate) != candidate or is_recorder_default(candidate):
+    if (naming.safe_stem(candidate) != candidate or is_recorder_default(candidate)
+            or len(candidate) > _MAX_NAME):
+        # The length is re-checked here as well as reserved at N4. Belt and braces on the
+        # one number that protects the record's ninety-character subject cut: a name over it
+        # is cut, and a cut name is two rows in a site's log that read the same.
         return NameDecision(decided=True, code="N8", site=site_slug, span=span,
                             mentions=mine, book=book_name,
                             why="the name would have to be changed to be usable, so it is "
