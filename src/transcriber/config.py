@@ -53,6 +53,7 @@ log = logging.getLogger("transcriber.config")
 __all__ = [
     "Config",
     "ConfigError",
+    "nested_folder_problems",
     "ENGINES",
     "ENGINE_KEY_VARS",
     "ROUTE_SUFFIXES",
@@ -305,6 +306,10 @@ class Config:
             object.__setattr__(self, "routes", (first, *self.routes[1:]))
             return
         object.__setattr__(self, name, value)
+        if name == "routes" and getattr(self, "_routes_ready", False) and self.routes:
+            # Replacing the routes wholesale — the wizard, a test — has to take the derived
+            # attributes with it, or the two halves of one fact go out of step.
+            self._mirror_first_route()
 
     @property
     def enabled_routes(self) -> tuple[Route, ...]:
@@ -827,6 +832,80 @@ def _validate_routes(
                     f"{_route_phrase(route)} archives recordings into — the archive is "
                     "for finished originals, not for the wreckage of a failed write"
                 )
+
+
+def nested_folder_problems(
+    routes: Sequence[Route], ancestors_of: Any
+) -> list[str]:
+    """The overlaps folder **ids** cannot show: one route's folder inside another's.
+
+    Graph's ``/items/{id}/delta`` is a subtree feed, so a route watching ``/Recordings``
+    is also watching ``/Recordings/SiteMeetings`` inside it — and a site meeting recorded
+    into the second folder is claimed by whichever route polls first, transcribed into that
+    route's output folder, and sixty days later moved into that route's archive. Both
+    folders are pickable, both ids are different, and nothing in an id says one contains the
+    other, which is why :func:`_validate_routes` cannot catch this and the wizard can: the
+    wizard is standing at the live tree when the ids are chosen.
+
+    ``ancestors_of(folder_id)`` returns that folder's ancestor ids, nearest first, and an
+    empty sequence when the answer is not known. Not knowing is never reported as a
+    problem — a refusal invented from a Graph call that failed would be worse than the bug.
+    """
+    enabled = [r for r in routes if r.enabled]
+    chain: dict[str, tuple[str, ...]] = {}
+
+    def above(folder_id: str) -> tuple[str, ...]:
+        wanted = (folder_id or "").strip()
+        if not wanted:
+            return ()
+        if wanted not in chain:
+            try:
+                chain[wanted] = tuple(str(f) for f in (ancestors_of(wanted) or ()) if f)
+            except Exception:  # noqa: BLE001 - an unanswerable question is not a problem
+                chain[wanted] = ()
+        return chain[wanted]
+
+    problems: list[str] = []
+    for index, first in enumerate(enabled):
+        for second in enabled[index + 1:]:
+            outer, inner = None, None
+            if first.source_folder_id and first.source_folder_id in above(second.source_folder_id):
+                outer, inner = first, second
+            elif second.source_folder_id and second.source_folder_id in above(first.source_folder_id):
+                outer, inner = second, first
+            if outer is None or inner is None:
+                continue
+            problems.append(
+                f"the folder {_route_phrase(inner)} watches is inside the folder "
+                f"{_route_phrase(outer)} watches. OneDrive reports changes for a folder and "
+                f"everything under it, so {_route_phrase(outer)} would see "
+                f"{_route_phrase(inner)}'s recordings too and could claim them first: their "
+                f"transcripts would be written to the wrong folder and the recordings "
+                f"themselves would eventually be filed in the wrong archive. Put the two "
+                f"folders side by side rather than one inside the other"
+            )
+
+    for archiver in routes:
+        if not archiver.archives:
+            continue
+        for watcher in enabled:
+            if not watcher.source_folder_id:
+                continue
+            if watcher.source_folder_id not in above(archiver.archive_folder_id):
+                continue
+            whose = (
+                "the very folder it watches"
+                if archiver.name == watcher.name
+                else f"the folder {_route_phrase(watcher)} watches"
+            )
+            problems.append(
+                f"{_route_phrase(archiver)} archives its old recordings into a folder inside "
+                f"{whose}. OneDrive reports a folder and everything under it, so filing a "
+                "recording away would not take it out of the watched folder at all — it "
+                "would still be enumerated every night. Put the archive folder outside the "
+                "folder being watched"
+            )
+    return problems
 
 
 def _env_of(name: str) -> str:

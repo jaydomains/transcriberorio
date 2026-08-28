@@ -1,10 +1,17 @@
 """The command line: ``once``, ``run``, ``sweep``, ``digest``, ``archive``, ``backfill``,
-``selftest``, ``status``.
+``selftest``, ``status``, ``routes``, ``config``.
 
     python3 -m transcriber run          the service
     python3 -m transcriber once         one poll and one drain, then exit
     python3 -m transcriber status       what a person actually wants to know
     python3 -m transcriber selftest     prove the deploy is sane, offline
+    python3 -m transcriber routes       the watched folders, and how to change them
+    python3 -m transcriber config       one setting, read or changed, without an editor
+
+Every command that acts on recordings — ``once``, ``sweep``, ``archive``, ``backfill``,
+``status`` — takes ``--route <name>`` to act on one route rather than all of them. Omitted
+means all, which is what the service itself does; naming a route that does not exist is
+answered with a sentence and a non-zero exit, never with an empty run that reads as success.
 
 ``selftest`` is the important one. It proves parsing, the ledger's state machine, quote
 verification, the markdown output contract, the truncation detector, the split guard and
@@ -28,18 +35,20 @@ import os
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from . import archive as archive_module
 from . import audio as audio_module
-from . import naming, outputs, plausibility, sweep as sweep_module
+from . import config_cmd, naming, outputs, plausibility, routes_cmd, sweep as sweep_module
 from .config import Config, ConfigError
-from .ledger import DELTA_CURSOR, Ledger, SWEEP_CURSOR
+from .ledger import DELTA_CURSOR, Ledger, delta_cursor_name, sweep_cursor_name
 from .logging_setup import configure as configure_logging
 from .models import (
     AudioInfo,
+    DEFAULT_ROUTE,
     DriveItem,
     Hints,
+    Route,
     Row,
     Segment,
     State,
@@ -55,6 +64,8 @@ from .worker import (
     LAST_POLL_OK,
     Worker,
     claimable_now,
+    route_poll_error_mark,
+    route_poll_ok_mark,
     run_digest,
 )
 
@@ -90,6 +101,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_FAILED
 
 
+#: The one help string for ``--route``, so five subcommands cannot describe it five ways.
+_ROUTE_HELP = (
+    "act on this route only, by its short name (see `transcriber routes`). "
+    "Omitted means every route."
+)
+
+
+def _add_route_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--route", default=None, metavar="SLUG", help=_ROUTE_HELP)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="transcriber", description=(__doc__ or "").strip().split("\n")[0]
@@ -101,6 +123,7 @@ def _parser() -> argparse.ArgumentParser:
 
     once = sub.add_parser("once", help="one poll and one drain, then exit")
     once.add_argument("--limit", type=int, default=None, help="at most this many recordings")
+    _add_route_option(once)
     once.set_defaults(handler=cmd_once)
 
     run = sub.add_parser("run", help="the service loop")
@@ -108,6 +131,7 @@ def _parser() -> argparse.ArgumentParser:
 
     sweep = sub.add_parser("sweep", help="re-enumerate the folder and re-queue anything unfinished")
     sweep.add_argument("--dry-run", action="store_true")
+    _add_route_option(sweep)
     sweep.set_defaults(handler=cmd_sweep)
 
     digest = sub.add_parser("digest", help="send the morning digest now")
@@ -119,6 +143,7 @@ def _parser() -> argparse.ArgumentParser:
     archive.add_argument("--dry-run", action="store_true")
     archive.add_argument("--limit", type=int, default=None)
     archive.add_argument("--age-days", type=int, default=None)
+    _add_route_option(archive)
     archive.set_defaults(handler=cmd_archive)
 
     backfill = sub.add_parser("backfill", help="work through history, newest first, in its own lane")
@@ -131,6 +156,7 @@ def _parser() -> argparse.ArgumentParser:
                           help="pause this long whenever the live lane has work waiting")
     backfill.add_argument("--enumerate-only", action="store_true",
                           help="record what is there and stop, processing nothing")
+    _add_route_option(backfill)
     backfill.set_defaults(handler=cmd_backfill)
 
     requeue = sub.add_parser(
@@ -144,11 +170,28 @@ def _parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="what is known, done, failed, and when it last worked")
     status.add_argument("--json", dest="as_json", action="store_true")
     status.add_argument("--day", default=None, help="the day to count (YYYY-MM-DD, default today)")
+    _add_route_option(status)
     status.set_defaults(handler=cmd_status)
 
     selftest = sub.add_parser("selftest", help="prove the deploy offline, with no credential")
     selftest.add_argument("--verbose", action="store_true", help="print every check, not only failures")
     selftest.set_defaults(handler=cmd_selftest)
+
+    routes = sub.add_parser(
+        "routes",
+        help="the watched folders: list, add, edit, remove, enable, disable",
+        description=(routes_cmd.__doc__ or "").strip().split("\n\n")[0],
+    )
+    routes_cmd.add_arguments(routes)
+    routes.set_defaults(handler=cmd_routes)
+
+    settings = sub.add_parser(
+        "config",
+        help="read or change one setting, checked before it is written",
+        description=(config_cmd.__doc__ or "").strip().split("\n\n")[0],
+    )
+    config_cmd.add_arguments(settings)
+    settings.set_defaults(handler=cmd_config)
 
     setup = sub.add_parser(
         "setup", help="interactive wizard — asks for everything, checks it, writes .env"
@@ -194,11 +237,26 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return run_setup(env_path=args.env, verify=not args.no_verify, assume_yes=args.yes)
 
 
+def cmd_routes(args: argparse.Namespace) -> int:
+    """Manage the watched folders.
+
+    Like ``setup``, this must NOT go through ``_config()``: it edits the very file whose
+    incompleteness would make ``Config.from_env`` refuse, and a command that cannot run
+    until the configuration is already correct is no use for making it correct.
+    """
+    return routes_cmd.run(args)
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Read or change one setting. Same reason as above for not loading the config first."""
+    return config_cmd.run(args)
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     config, ledger, graph = _service(args)
     with ledger:
         worker = Worker(config, ledger, graph)
-        report = worker.run_once(limit=args.limit)
+        report = worker.run_once(limit=args.limit, route=args.route)
         print(report.line())
         for outcome in report.outcomes:
             print("  " + outcome.line())
@@ -216,7 +274,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_sweep(args: argparse.Namespace) -> int:
     config, ledger, graph = _service(args)
     with ledger:
-        report = sweep_module.sweep(config, ledger, graph, dry_run=args.dry_run)
+        report = sweep_module.sweep(
+            config, ledger, graph, dry_run=args.dry_run, route=args.route
+        )
         print(report.render())
         return EXIT_OK if report.ok else EXIT_FAILED
 
@@ -236,7 +296,8 @@ def cmd_archive(args: argparse.Namespace) -> int:
     config, ledger, graph = _service(args)
     with ledger:
         report = archive_module.archive(
-            config, ledger, graph, dry_run=args.dry_run, limit=args.limit, age_days=args.age_days
+            config, ledger, graph, dry_run=args.dry_run, limit=args.limit,
+            age_days=args.age_days, route=args.route,
         )
         print(report.render())
         return EXIT_OK if report.ok else EXIT_FAILED
@@ -249,14 +310,35 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     while the phone is writing. Ordering is newest first because the most recent history is
     the most likely to be asked about. Resumption needs no bookmark: the ledger already
     says which recordings are finished, so a re-run continues rather than restarts.
+
+    Every enabled route is enumerated, each from its own backfill cursor, and each route's
+    rows are recorded **as that route's** — which is what makes the transcripts come out in
+    the folder that route writes to rather than the first one's. ``--route`` narrows it to
+    one. A route whose folder cannot be enumerated is named and stepped over: the rest are
+    still walked, and the run still exits non-zero so nobody reads it as a clean sweep.
     """
     config, ledger, graph = _service(args)
     with ledger:
-        seen = _enumerate_all(ledger, graph, config)
-        print(f"enumerated {seen} item(s) from the source folder")
-        if args.enumerate_only:
-            return EXIT_OK
+        routes, problems = sweep_module.select_routes(config, args.route)
+        for problem in problems:
+            print(f"  ! {problem}", file=sys.stderr)
+        if not routes:
+            return EXIT_CONFIG
 
+        seen, failures = _enumerate_all(ledger, graph, routes)
+        for route in routes:
+            if route.name in failures:
+                continue
+            print(f"{sweep_module.route_display(route)}: enumerated "
+                  f"{seen.get(route.name, 0)} item(s) from its source folder")
+        for name, error in failures.items():
+            print(f"  ERROR {name}: could not be enumerated — {error}", file=sys.stderr)
+        if args.enumerate_only:
+            return EXIT_FAILED if failures else EXIT_OK
+
+        # Only the routes actually walked. A paused route's history is not this lane's
+        # work, and a route that failed to enumerate has not been counted yet.
+        covered = {r.name for r in routes}
         cutoff = time.time() - max(0, args.min_age_days) * 86400.0
         cutoff_iso = utc_now_iso(cutoff)
         worker = Worker(config, ledger, graph)
@@ -265,7 +347,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         processed = 0
         quarantined = 0
         while not worker.stopping:
-            pending = _backfill_queue(ledger, cutoff_iso)
+            pending = _backfill_queue(ledger, cutoff_iso, covered)
             if not pending:
                 break
             if _live_work_waiting(ledger, cutoff_iso):
@@ -287,58 +369,108 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             if args.limit is not None and processed >= args.limit:
                 break
 
-        remaining = len(_backfill_outstanding(ledger, cutoff_iso))
-        if not remaining:
+        outstanding = _backfill_outstanding(ledger, cutoff_iso, covered)
+        # "Finished" is a claim about the whole backfill, so it is only made when the whole
+        # backfill is what ran: every route, none of them failing, nothing left. A run
+        # narrowed to one route that finishes it has finished that route, not the history.
+        whole_service = args.route is None and not failures
+        if not outstanding and whole_service:
             ledger.cursor_set(BACKFILL_FINISHED, utc_now_iso())
         print(
-            f"backfill: {processed} processed, {quarantined} quarantined, {remaining} still "
-            f"to do (older than {args.min_age_days} day(s))"
+            f"backfill: {processed} processed, {quarantined} quarantined, "
+            f"{len(outstanding)} still to do (older than {args.min_age_days} day(s))"
         )
+        by_route = _count_by_route(outstanding)
+        if len(covered) > 1 and by_route:
+            print("  still to do, by route: "
+                  + ", ".join(f"{name} {count}" for name, count in sorted(by_route.items())))
         worker.release_claims()
-        return EXIT_OK if quarantined == 0 else EXIT_FAILED
+        return EXIT_OK if (quarantined == 0 and not failures) else EXIT_FAILED
 
 
-def _enumerate_all(ledger: Ledger, graph: Any, config: Config) -> int:
-    """Delta from a zero cursor, rows and cursor committed page by page."""
-    seen = 0
-    for page in graph.delta(config.source_folder_id or None, None):
-        rows = [
-            DriveItem.from_graph_item(item)
-            for item in page.items
-            if str(getattr(item, "id", "") or "") and not getattr(item, "is_folder", False)
-        ]
-        seen += len(rows)
-        if page.cursor:
-            ledger.record_page(rows, page.cursor, cursor_name=BACKFILL_CURSOR)
-        else:
-            for row in rows:
-                ledger.upsert_discovered(row)
-    return seen
+def backfill_cursor_name(route: str) -> str:
+    """This lane's own delta cursor for one route: ``delta:backfill:calls``.
+
+    Every route, ``default`` included. The bare ``delta:backfill`` this lane used to keep
+    for the one route a pre-routes ``.env`` has was also, letter for letter, the live delta
+    cursor of a route named ``backfill`` — and nothing refused that name. The two lanes
+    would have shared one token: the ``backfill`` route would have polled Graph with a
+    cursor belonging to a different folder's change feed and advanced it as though its own
+    recordings had been seen. Schema step 3 carries the old value across to
+    ``delta:backfill:default``, so an installation half way through its history does not
+    start again from zero.
+    """
+    return f"{BACKFILL_CURSOR}:{route}"
 
 
-def _backfill_queue(ledger: Ledger, cutoff_iso: str) -> list[Row]:
-    """Unfinished recordings older than the cutoff, newest first."""
+def _enumerate_all(
+    ledger: Ledger, graph: Any, routes: Sequence[Route]
+) -> tuple[dict[str, int], dict[str, str]]:
+    """Delta from a zero cursor for each route: rows and that route's cursor, page by page.
+
+    Returns what each route saw, and what went wrong on the ones that failed. The
+    invariant is per route and unchanged by being run in a loop: one ``record_page`` call
+    covers exactly one route's page, so a route that throws half way leaves its own cursor
+    where it was and leaves every other route's alone.
+    """
+    seen: dict[str, int] = {}
+    failures: dict[str, str] = {}
+    for route in routes:
+        count = 0
+        try:
+            for page in graph.delta(route.source_folder_id or None, None):
+                rows = [
+                    DriveItem.from_graph_item(item)
+                    for item in page.items
+                    if str(getattr(item, "id", "") or "") and not getattr(item, "is_folder", False)
+                ]
+                count += len(rows)
+                if page.cursor:
+                    ledger.record_page(
+                        rows, page.cursor,
+                        route=route.name, cursor_name=backfill_cursor_name(route.name),
+                    )
+                else:
+                    for row in rows:
+                        ledger.upsert_discovered(row, route=route.name)
+        except Exception as exc:  # noqa: BLE001 - one folder's failure is not the others'
+            failures[route.name] = f"{type(exc).__name__}: {exc}"
+        seen[route.name] = count
+    return seen, failures
+
+
+def _backfill_queue(ledger: Ledger, cutoff_iso: str, routes: Iterable[str]) -> list[Row]:
+    """Unfinished recordings older than the cutoff, on these routes, newest first."""
+    wanted = set(routes)
     rows = [
         row
         for row in claimable_now(ledger, 10_000, time.time())
-        if (row.created_at or row.discovered_at or "") < cutoff_iso
+        if row.route in wanted and (row.created_at or row.discovered_at or "") < cutoff_iso
     ]
     rows.sort(key=lambda r: (r.created_at or r.discovered_at or ""), reverse=True)
     return rows
 
 
-def _backfill_outstanding(ledger: Ledger, cutoff_iso: str) -> list[Row]:
+def _backfill_outstanding(ledger: Ledger, cutoff_iso: str, routes: Iterable[str]) -> list[Row]:
     """Everything in this lane that has not finished — including what is between attempts.
 
     Counted separately from the queue on purpose: a recording waiting out its backoff is
     still unfinished, and reporting it as nothing left to do is exactly the kind of quiet
     wrong answer this service exists to remove.
     """
+    wanted = set(routes)
     return [
         row
         for row in ledger.unfinished()
-        if (row.created_at or row.discovered_at or "") < cutoff_iso
+        if row.route in wanted and (row.created_at or row.discovered_at or "") < cutoff_iso
     ]
+
+
+def _count_by_route(rows: Iterable[Row]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.route] = counts.get(row.route, 0) + 1
+    return counts
 
 
 def _live_work_waiting(ledger: Ledger, cutoff_iso: str) -> bool:
@@ -375,10 +507,14 @@ def cmd_requeue(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Counts, failures with their reasons, and when this last worked.
+    """Counts, failures with their reasons, and when this last worked — per route.
 
     Runs even when the configuration is broken — that is often exactly when somebody runs
     it — but says so loudly and exits non-zero rather than pretending the service is fine.
+
+    The per-route table is the point of it now. "23 done, 3 failed" across the whole
+    service does not say that all three failures are one folder that stopped working a week
+    ago, and that sentence is the one a person needs.
     """
     config: Config | None = None
     problems = ""
@@ -402,8 +538,18 @@ def cmd_status(args: argparse.Namespace) -> int:
     day = args.day or datetime.date.today().isoformat()
     with Ledger(ledger_path, scrub=getattr(config, "scrub", None)) as ledger:
         stats = ledger.stats()
-        counts = ledger.counts_for_day(day)
-        attention = ledger.attention_for_day(day)
+        routes = _route_status(config, ledger, stats)
+        wanted = (args.route or "").strip() or None
+        if wanted and not any(r["route"] == wanted for r in routes):
+            known = ", ".join(r["route"] for r in routes) or "none"
+            print(f"there is no route called {wanted!r}, in the configuration or in the "
+                  f"ledger. The ones there are: {known}", file=sys.stderr)
+            return EXIT_FAILED
+        if wanted:
+            routes = [r for r in routes if r["route"] == wanted]
+
+        counts = ledger.counts_for_day(day, wanted)
+        attention = ledger.attention_for_day(day, wanted)
         marks = {
             name: ledger.cursor_get(name)
             for name in (LAST_CYCLE_OK, LAST_CYCLE_ERROR, LAST_POLL_OK,
@@ -413,20 +559,151 @@ def cmd_status(args: argparse.Namespace) -> int:
                          "sweep:last_error", "sweep:last_report_at",
                          "archive:last_report_at")
         }
-        cursors = stats.get("cursors", {})
 
         if args.as_json:
             print(json.dumps(
                 {"ledger": stats, "day": counts, "marks": marks, "attention": attention,
+                 "routes": routes, "route": wanted,
                  "config_problems": problems.splitlines()},
                 indent=1, default=str,
             ))
         else:
-            _print_status(ledger_path, stats, counts, marks, cursors, day, attention)
+            _print_status(ledger_path, stats, counts, marks, day, attention,
+                          routes=routes, only=wanted)
 
     if problems:
         return EXIT_CONFIG
     return EXIT_FAILED if (counts.get("failures") or []) else EXIT_OK
+
+
+def _route_status(config: Config | None, ledger: Ledger, stats: dict[str, Any]) -> list[dict[str, Any]]:
+    """One row per route, configured or merely remembered, in configuration order.
+
+    A route taken out of ``ROUTES`` keeps every ledger row it ever wrote, so it is listed
+    here too and marked as no longer watched. Dropping it would make its recordings
+    disappear from the only place a person looks for them, which is the same thing as
+    losing them.
+    """
+    configured: list[Route] = list(sweep_module.routes_of(config)) if config is not None else []
+    by_route: dict[str, dict[str, int]] = dict(stats.get("by_route") or {})
+    # Recordings two routes have both claimed. Written into the event log since routes
+    # existed and read by nobody, which meant a recording being transcribed into the wrong
+    # folder — and eventually archived into the wrong folder — was invisible unless somebody
+    # opened SQLite by hand.
+    try:
+        clashes = ledger.route_disagreement_counts()
+    except Exception:  # noqa: BLE001 - status must still print from a sick ledger
+        clashes = {}
+
+    ordered: list[str] = [r.name for r in configured]
+    ordered.extend(name for name in sorted(by_route) if name not in ordered)
+
+    known_routes = {r.name: r for r in configured}
+    out: list[dict[str, Any]] = []
+    for name in ordered:
+        route = known_routes.get(name)
+        states = by_route.get(name, {})
+        total = sum(states.values())
+        done = states.get(State.DONE, 0)
+        quarantined = states.get(State.QUARANTINED, 0)
+        silent = states.get(State.SKIPPED_EMPTY, 0)
+        out.append({
+            "route": name,
+            "label": (route.label if route is not None else "") or "",
+            "configured": route is not None,
+            "enabled": bool(route.enabled) if route is not None else False,
+            "source_folder_id": route.source_folder_id if route is not None else "",
+            "output_folder_id": route.output_folder_id if route is not None else "",
+            "archive_folder_id": route.archive_folder_id if route is not None else "",
+            "known": total,
+            "done": done,
+            "failed": quarantined,
+            "verified_silence": silent,
+            "working": total - done - quarantined - silent,
+            "last_success": ledger.cursor_get(route_poll_ok_mark(name)) or "",
+            "last_error": ledger.cursor_get(route_poll_error_mark(name)) or "",
+            "delta_cursor_set": bool(
+                (stats.get("cursors", {}).get(delta_cursor_name(name)) or {}).get("value_present")
+            ),
+            "route_disagreements": int(clashes.get(name, 0)),
+            "sweep_cursor_at": (
+                stats.get("cursors", {}).get(sweep_cursor_name(name)) or {}
+            ).get("updated_at") or "",
+        })
+    return out
+
+
+def _short_id(value: str) -> str:
+    """A driveItem id at a width a table can carry, still recognisable against the .env."""
+    text = str(value or "")
+    if not text:
+        return "—"
+    return text if len(text) <= 16 else text[:9] + "…" + text[-4:]
+
+
+def _print_route_table(routes: Sequence[dict[str, Any]]) -> None:
+    """Route, folders, known, done, failed, last success — the whole point of `status`."""
+    if not routes:
+        print("\n  no routes: nothing is configured and the ledger has no history")
+        return
+
+    header = ("route", "watches", "writes to", "known", "done", "failed", "clashes",
+              "last success")
+    rows: list[tuple[str, ...]] = []
+    for route in routes:
+        name = route["route"]
+        if not route["configured"]:
+            name += " (gone)"
+        elif not route["enabled"]:
+            name += " (paused)"
+        rows.append((
+            name,
+            _short_id(route["source_folder_id"]),
+            _short_id(route["output_folder_id"]),
+            str(route["known"]),
+            str(route["done"]),
+            str(route["failed"]),
+            str(route.get("route_disagreements", 0)),
+            route["last_success"] or "never",
+        ))
+    widths = [max(len(header[i]), *(len(r[i]) for r in rows)) for i in range(len(header))]
+    # The counts read as numbers, so they line up as numbers.
+    numeric = {3, 4, 5, 6}
+
+    def cell(index: int, text: str) -> str:
+        return text.rjust(widths[index]) if index in numeric else text.ljust(widths[index])
+
+    print("\n  routes")
+    print("    " + "  ".join(cell(i, h) for i, h in enumerate(header)).rstrip())
+    for row in rows:
+        print("    " + "  ".join(cell(i, c) for i, c in enumerate(row)).rstrip())
+
+    for route in routes:
+        name = route["route"]
+        if route["last_error"]:
+            print(f"    ! {name} last failed to poll: {route['last_error']}")
+        if route["configured"] and route["enabled"] and not route["delta_cursor_set"]:
+            print(f"    ! {name} has no change-feed cursor stored — its next poll "
+                  "enumerates that folder from zero")
+        if route["configured"] and not route["enabled"]:
+            print(f"    - {name} is paused: its folder is not being watched. Its cursor and "
+                  "its history are untouched.")
+        if not route["configured"]:
+            print(f"    - {name} is no longer one of the configured routes. Its "
+                  f"{route['known']} row(s) are kept, and nothing of it was deleted.")
+    # Said once, however many routes are named in it: it is one fact about a pair of
+    # routes, and repeating the whole explanation per route buries the counts above it.
+    clashing = [r for r in routes if r.get("route_disagreements")]
+    if clashing:
+        named = ", ".join(f"{r['route']} ({r['route_disagreements']})" for r in clashing)
+        print(f"    ! recordings claimed by two routes at once: {named}")
+        print("      Either they were moved between watched folders, or one route's folder "
+              "sits inside")
+        print("      another's — OneDrive reports a folder and everything under it. Until "
+              "that is sorted")
+        print("      out their transcripts may be going to the wrong folder, and they are "
+              "held back from")
+        print("      archiving. Run: transcriber routes")
 
 
 def _print_status(
@@ -434,12 +711,15 @@ def _print_status(
     stats: dict[str, Any],
     counts: dict[str, Any],
     marks: dict[str, Any],
-    cursors: dict[str, Any],
     day: str,
     attention: dict[str, Any] | None = None,
+    routes: Sequence[dict[str, Any]] = (),
+    only: str | None = None,
 ) -> None:
     by_state = stats.get("by_state", {})
     print(f"transcriber — {ledger_path}")
+    if only:
+        print(f"  (route {only} only; the totals below are the whole ledger)")
     print(f"  known            {stats.get('total', 0):>6}  recordings, all time")
     print(f"  done             {by_state.get(State.DONE, 0):>6}")
     print(f"  verified silence {by_state.get(State.SKIPPED_EMPTY, 0):>6}")
@@ -451,14 +731,19 @@ def _print_status(
         if by_state.get(state):
             print(f"      {state.lower():<14} {by_state[state]:>6}")
 
+    _print_route_table(routes)
+
     print(f"\n  {day}: {counts.get('discovered', 0)} arrived, {counts.get('done', 0)} done, "
-          f"{counts.get('quarantined', 0)} quarantined, {counts.get('in_flight', 0)} unfinished")
+          f"{counts.get('quarantined', 0)} quarantined, {counts.get('in_flight', 0)} unfinished"
+          + (f"  (route {only})" if only else ""))
 
     failures = counts.get("failures") or []
     if failures:
         print(f"\n  {len(failures)} failure(s) waiting for a person:")
         for failure in failures[:25]:
-            print(f"    {failure.get('name') or failure.get('item_id')}  [{failure.get('state')}]")
+            where = f"  [{failure.get('route')}]" if failure.get("route") else ""
+            print(f"    {failure.get('name') or failure.get('item_id')}  "
+                  f"[{failure.get('state')}]{where}")
             print(f"      {failure.get('reason')}")
             if failure.get("web_url"):
                 print(f"      {strip_owner_paths(str(failure['web_url']))}")
@@ -485,7 +770,7 @@ def _print_status(
 
     print("")
     _print_mark("last successful cycle", marks.get(LAST_CYCLE_OK))
-    _print_mark("last successful poll", marks.get(LAST_POLL_OK))
+    _print_mark("last successful poll of every route", marks.get(LAST_POLL_OK))
     if marks.get(LAST_CYCLE_ERROR):
         _print_mark("last failed cycle", marks.get(LAST_CYCLE_ERROR))
         if marks.get("worker:last_cycle_error_detail"):
@@ -503,15 +788,17 @@ def _print_status(
         finished = marks.get(BACKFILL_FINISHED)
         print(f"  backfill: {'finished ' + finished if finished else 'last at ' + str(marks[BACKFILL_POSITION])}")
 
-    live = cursors.get(DELTA_CURSOR) or {}
-    print(f"  change feed cursor: "
-          f"{'stored, updated ' + str(live.get('updated_at')) if live.get('value_present') else 'NOT SET — the next poll enumerates from zero'}")
-    swept = cursors.get(SWEEP_CURSOR) or {}
+    swept = [r for r in routes if r.get("sweep_cursor_at")]
     if swept:
-        print(f"  sweep cursor updated {swept.get('updated_at')}")
+        print("  last nightly re-enumeration: "
+              + ", ".join(f"{r['route']} {r['sweep_cursor_at']}" for r in swept))
+    # A whole-ledger fact, so it is left out of a run narrowed to one route rather than
+    # printed under a heading that says "whatsapp" while naming a recording from calls.
     oldest = stats.get("oldest_unfinished")
-    if oldest:
-        print(f"  oldest unfinished: {oldest.get('name')} (discovered {oldest.get('discovered_at')})")
+    if oldest and not only:
+        print(f"  oldest unfinished: {oldest.get('name')} "
+              f"[{oldest.get('route', DEFAULT_ROUTE)}] "
+              f"(discovered {oldest.get('discovered_at')})")
 
 
 def _print_mark(label: str, value: Any) -> None:
@@ -600,6 +887,9 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 
         _selftest_naming(checks)
         _selftest_ledger(checks, os.path.join(tmp, "state.sqlite3"))
+        _selftest_routes(checks, tmp)
+        _selftest_route_cursors(checks, os.path.join(tmp, "routes.sqlite3"))
+        _selftest_settings(checks, tmp)
         _selftest_audio(checks)
         _selftest_plausibility(checks)
         _selftest_quotes(checks)
@@ -731,6 +1021,259 @@ def _selftest_ledger(checks: _Checks, path: str) -> None:
                      ledger.record_attempt("item-1", "a made-up failure") == 1
                      and (ledger.get("item-1") or Row("")).claimed_by is None)
         checks.check("unfinished() reports what never finished", ledger.unfinished() == [])
+
+
+# -- 2a. routes: parsing, and the validation that prevents a destructive misconfiguration
+
+
+def _selftest_env(work_dir: str, **extra: str) -> dict[str, str]:
+    """A complete, obviously-fake environment, so route parsing is proved through the real Config.
+
+    Everything here is deliberately not a credential. The point is to exercise the same
+    ``Config.from_env`` the service starts with rather than a private parsing helper: a
+    route that parses in the selftest and not at startup would be worse than no check.
+    """
+    env = {
+        "GRAPH_TENANT_ID": "offline-tenant",
+        "GRAPH_CLIENT_ID": "offline-client",
+        "GRAPH_CLIENT_SECRET": "offline-not-a-secret",
+        "GRAPH_USER_ID": "offline-user",
+        "TRANSCRIBE_ENGINE": "openai",
+        "OPENAI_API_KEY": "offline-not-a-key",
+        "ANALYSIS_API_KEY": "offline-not-a-key",
+        "SMTP_HOST": "localhost",
+        "SMTP_USER": "offline",
+        "SMTP_PASSWORD": "offline-not-a-secret",
+        "SMTP_FROM": "offline@invalid",
+        "SMTP_TO": "offline@invalid",
+        "HEARTBEAT_URL": "https://example.invalid/heartbeat",
+        "LEDGER_PATH": os.path.join(work_dir, "selftest-routes.sqlite3"),
+        "WORK_DIR": os.path.join(work_dir, "work"),
+    }
+    env.update(extra)
+    return env
+
+
+def _config_problems_for(env: dict[str, str]) -> list[str]:
+    try:
+        Config.from_env(env)
+    except ConfigError as exc:
+        return list(exc.problems)
+    return []
+
+
+def _selftest_routes(checks: _Checks, work_dir: str) -> None:
+    checks.section("routes: how they are read, and what is refused")
+
+    # 1. The shape every installation in the field has: no ROUTES at all.
+    legacy = Config.from_env(_selftest_env(
+        work_dir, SOURCE_FOLDER_ID="src-1", OUTPUT_FOLDER_ID="out-1", ARCHIVE_FOLDER_ID="arc-1",
+    ))
+    checks.check(
+        "a .env written before routes existed is exactly one route called 'default'",
+        len(legacy.routes) == 1 and legacy.routes[0].name == DEFAULT_ROUTE,
+        ", ".join(r.name for r in legacy.routes),
+    )
+    checks.check(
+        "that route's folders are the three single-folder settings",
+        (legacy.routes[0].source_folder_id, legacy.routes[0].output_folder_id,
+         legacy.routes[0].archive_folder_id) == ("src-1", "out-1", "arc-1"),
+        repr(legacy.routes[0]),
+    )
+    checks.check(
+        "the old attribute names still read as that route's folders",
+        legacy.source_folder_id == "src-1" and legacy.output_folder_id == "out-1",
+        legacy.source_folder_id,
+    )
+
+    # 2. Declared routes, including the hyphen-to-underscore variable naming.
+    declared = Config.from_env(_selftest_env(
+        work_dir,
+        ROUTES="calls,site-meetings,whatsapp",
+        ROUTE_CALLS_LABEL="Phone calls",
+        ROUTE_CALLS_SOURCE="calls-src", ROUTE_CALLS_OUTPUT="pool-out",
+        ROUTE_CALLS_ARCHIVE="calls-arc",
+        ROUTE_SITE_MEETINGS_LABEL="Site meetings",
+        ROUTE_SITE_MEETINGS_SOURCE="meet-src", ROUTE_SITE_MEETINGS_OUTPUT="pool-out",
+        ROUTE_WHATSAPP_LABEL="WhatsApp voice notes",
+        ROUTE_WHATSAPP_SOURCE="wa-src", ROUTE_WHATSAPP_OUTPUT="wa-out",
+        ROUTE_WHATSAPP_ENABLED="false",
+    ))
+    checks.check("ROUTES names every route, in order",
+                 declared.route_names == ("calls", "site-meetings", "whatsapp"),
+                 str(declared.route_names))
+    checks.check("a hyphenated route reads its folders from ROUTE_SITE_MEETINGS_*",
+                 (declared.route("site-meetings") or Route("")).source_folder_id == "meet-src")
+    checks.check("ENABLED=false pauses a route without removing it",
+                 declared.route_names == ("calls", "site-meetings", "whatsapp")
+                 and tuple(r.name for r in declared.enabled_routes) == ("calls", "site-meetings"))
+    checks.check("two routes may share one output folder — pooling is allowed on purpose",
+                 declared.route("calls").output_folder_id
+                 == declared.route("site-meetings").output_folder_id == "pool-out")
+    checks.check("with ROUTES set, the legacy attributes mirror the FIRST route",
+                 declared.source_folder_id == "calls-src", declared.source_folder_id)
+
+    # 3. The feedback loop — the one misconfiguration that is silently destructive.
+    loop = _config_problems_for(_selftest_env(
+        work_dir,
+        ROUTES="calls,site-meetings",
+        ROUTE_CALLS_SOURCE="calls-src", ROUTE_CALLS_OUTPUT="meet-src",
+        ROUTE_SITE_MEETINGS_SOURCE="meet-src", ROUTE_SITE_MEETINGS_OUTPUT="meet-out",
+    ))
+    checks.check(
+        "a route writing its transcripts into a folder something watches is refused",
+        any("read its own transcripts" in p for p in loop),
+        "; ".join(loop) or "it was accepted",
+    )
+    checks.check(
+        "and the refusal names both routes, so it is fixable without guessing",
+        any("calls" in p and "site-meetings" in p for p in loop),
+        "; ".join(loop),
+    )
+    own = _config_problems_for(_selftest_env(
+        work_dir, ROUTES="calls",
+        ROUTE_CALLS_SOURCE="calls-src", ROUTE_CALLS_OUTPUT="calls-src",
+    ))
+    checks.check("a route writing into the folder it watches is refused too",
+                 any("read its own transcripts" in p for p in own),
+                 "; ".join(own) or "it was accepted")
+
+    # 4. Two cursors over one folder is two claims on one recording.
+    shared = _config_problems_for(_selftest_env(
+        work_dir, ROUTES="calls,other",
+        ROUTE_CALLS_SOURCE="one-src", ROUTE_CALLS_OUTPUT="calls-out",
+        ROUTE_OTHER_SOURCE="one-src", ROUTE_OTHER_OUTPUT="other-out",
+    ))
+    checks.check("the same source folder on two enabled routes is refused",
+                 any("watch" in p and "same folder" in p for p in shared),
+                 "; ".join(shared) or "it was accepted")
+
+    # 5. Everything else that must be said rather than guessed at.
+    checks.check("a route name that cannot be a cursor key or a variable name is refused",
+                 any("not a usable route name" in p for p in _config_problems_for(
+                     _selftest_env(work_dir, ROUTES="Site Meetings"))),
+                 "it was accepted")
+    checks.check("an enabled route with no output folder is refused",
+                 any("nowhere to write its transcripts" in p for p in _config_problems_for(
+                     _selftest_env(work_dir, ROUTES="calls", ROUTE_CALLS_SOURCE="calls-src"))),
+                 "it was accepted")
+    checks.check("every route switched off is refused, rather than started watching nothing",
+                 any("switched off" in p for p in _config_problems_for(_selftest_env(
+                     work_dir, ROUTES="calls", ROUTE_CALLS_SOURCE="s", ROUTE_CALLS_OUTPUT="o",
+                     ROUTE_CALLS_ENABLED="false"))),
+                 "it was accepted")
+    both = Config.from_env(_selftest_env(
+        work_dir, ROUTES="calls", ROUTE_CALLS_SOURCE="calls-src", ROUTE_CALLS_OUTPUT="calls-out",
+        SOURCE_FOLDER_ID="stale-src",
+    ))
+    checks.check("ROUTES alongside the old settings is said out loud, not silently preferred",
+                 any("ignored completely" in n for n in both.notices),
+                 "; ".join(both.notices) or "nothing was said")
+
+
+# -- 2b. one cursor per route, and no route able to move another's
+
+
+def _selftest_route_cursors(checks: _Checks, path: str) -> None:
+    checks.section("per-route cursors: the invariant, once per route")
+
+    with Ledger(path) as ledger:
+        calls = _drive_item("calls-1", "Call Ulrich_260827_090000.m4a", b"a" * 1024)
+        meets = _drive_item("meet-1", "Beach Court walkthrough.m4a", b"b" * 2048)
+
+        ledger.record_page([calls], "cursor-calls-1", route="calls")
+        checks.check("a route's page moves that route's cursor",
+                     ledger.cursor_get(delta_cursor_name("calls")) == "cursor-calls-1")
+        checks.check("and moves nobody else's",
+                     ledger.cursor_get(delta_cursor_name("site-meetings")) is None,
+                     str(ledger.cursor_get(delta_cursor_name("site-meetings"))))
+        checks.check("the recording is recorded as that route's",
+                     (ledger.get("calls-1") or Row("")).route == "calls")
+
+        ledger.record_page([meets], "cursor-meet-1", route="site-meetings")
+        checks.check("a second route keeps its own cursor",
+                     ledger.cursor_get(delta_cursor_name("site-meetings")) == "cursor-meet-1"
+                     and ledger.cursor_get(delta_cursor_name("calls")) == "cursor-calls-1")
+
+        # The load-bearing invariant, per route: the cursor cannot move on its own.
+        checks.raises(
+            "a route's delta cursor cannot be set without its rows",
+            Exception,
+            lambda: ledger.cursor_set(delta_cursor_name("calls"), "cursor-calls-2"),
+        )
+        checks.raises(
+            "and a page with no cursor is refused rather than committed half way",
+            Exception,
+            lambda: ledger.record_page([calls], "", route="calls"),
+        )
+        checks.check("the refused writes left the cursor exactly where it was",
+                     ledger.cursor_get(delta_cursor_name("calls")) == "cursor-calls-1")
+
+        # One route failing must not carry another past a recording it never saw.
+        broken = DriveItem(item_id="", name="nameless.m4a")
+        try:
+            ledger.record_page([meets, broken], "cursor-meet-2", route="site-meetings")
+        except Exception:  # noqa: BLE001 - the failure is the point of the check
+            pass
+        checks.check("a page that could not be committed leaves its own route's cursor alone",
+                     ledger.cursor_get(delta_cursor_name("site-meetings")) == "cursor-meet-1",
+                     str(ledger.cursor_get(delta_cursor_name("site-meetings"))))
+        checks.check("and leaves the other route's cursor alone as well",
+                     ledger.cursor_get(delta_cursor_name("calls")) == "cursor-calls-1")
+
+        checks.check("unfinished() answers per route",
+                     [r.item_id for r in ledger.unfinished("calls")] == ["calls-1"]
+                     and [r.item_id for r in ledger.unfinished("site-meetings")] == ["meet-1"])
+        day = (ledger.get("calls-1") or Row("")).discovered_at[:10]
+        checks.check("so does the day's count the digest reads",
+                     ledger.counts_for_day(day, "calls")["discovered"] == 1
+                     and ledger.counts_for_day(day)["discovered"] == 2,
+                     str(ledger.counts_for_day(day, "calls")))
+        checks.check("every route that has recorded anything is findable",
+                     ledger.routes_seen() == ("calls", "site-meetings"),
+                     str(ledger.routes_seen()))
+
+
+# -- 2c. `config set` refuses before it writes
+
+
+def _selftest_settings(checks: _Checks, work_dir: str) -> None:
+    checks.section("config set: refused before anything is written")
+
+    env = {
+        "ANALYSIS_MODEL_STRONG": "claude-opus-5",
+        "ANALYSIS_MODEL_CHEAP": "claude-haiku-4-5",
+        "DIGEST_HOUR": "6",
+    }
+    checks.check("a setting this service does not read is refused",
+                 "not a setting this service reads" in config_cmd.check_value("ANALISIS_KEY", "x", env))
+    checks.check("a model id nobody documented is refused, with the real ones named",
+                 all(model in config_cmd.check_value("ANALYSIS_MODEL_STRONG", "claude-sonnet-9", env)
+                     for model in config_cmd.ANALYSIS_MODELS),
+                 config_cmd.check_value("ANALYSIS_MODEL_STRONG", "claude-sonnet-9", env))
+    checks.check("a documented model id is accepted",
+                 config_cmd.check_value("ANALYSIS_MODEL_STRONG", "claude-opus-5", env) == "",
+                 config_cmd.check_value("ANALYSIS_MODEL_STRONG", "claude-opus-5", env))
+    checks.check("an hour outside 0-23 is refused",
+                 "23" in config_cmd.check_value("DIGEST_HOUR", "25", env),
+                 config_cmd.check_value("DIGEST_HOUR", "25", env))
+    checks.check("a number where a number belongs is not",
+                 config_cmd.check_value("DIGEST_HOUR", "7", env) == "")
+    checks.check("an engine nobody implements is refused, with the real ones named",
+                 "elevenlabs" in config_cmd.check_value("TRANSCRIBE_ENGINE", "whisper.cpp", env))
+    checks.check("a route variable is answered with the command that owns it",
+                 "transcriber routes" in config_cmd.check_value("ROUTE_CALLS_SOURCE", "x", env))
+    checks.check("a single-folder setting is refused once routes have taken over",
+                 "routes edit" in config_cmd.check_value(
+                     "SOURCE_FOLDER_ID", "x", {"ROUTES": "calls"}))
+    checks.check("every setting is printed by `config list` — none is unreachable",
+                 not [n for n, s in config_cmd.SETTINGS.items() if s.group == "other"],
+                 ", ".join(n for n, s in config_cmd.SETTINGS.items() if s.group == "other"))
+    checks.check("no secret is ever shown in full",
+                 all("offline-not-a-key" not in config_cmd._shown(config_cmd.SETTINGS[name],
+                                                                 "offline-not-a-key")
+                     for name in ("OPENAI_API_KEY", "ANALYSIS_API_KEY", "GRAPH_CLIENT_SECRET",
+                                  "SMTP_PASSWORD", "SMTP_TO", "GRAPH_USER_ID")))
 
 
 # -- 3. the audio itself -----------------------------------------------------------

@@ -19,6 +19,13 @@ Failures come first, above the counts, in plain English, each with a link to the
 raw error is kept underneath as a technical detail rather than dropped: the plain sentence
 is for reading, the technical line is for fixing.
 
+**The subject line stays one line about the whole service; the body counts every route on
+its own.** Averaged into a total, "site meetings all fine, WhatsApp broken" reads as "23
+arrived, 20 done" and looks like an ordinary morning. So under the counts there is a line
+per route — including a line for a route that processed nothing yesterday, because that is
+the signal that used to be missing: a route quietly receiving nothing looks exactly like a
+route nobody mentioned.
+
 Three things this email never contains:
 
   * **A secret.** Everything rendered goes through ``Config.scrub`` before it is sent.
@@ -56,12 +63,13 @@ from .models import (
     strip_owner_paths,
     utc_now_iso,
 )
-from .sweep import local_now, parse_stamp
+from .sweep import local_now, parse_stamp, routes_of
 
 log = logging.getLogger("transcriber.digest")
 
 __all__ = [
     "Digest",
+    "RouteDigest",
     "credential_warnings",
     "SendResult",
     "DigestResult",
@@ -191,6 +199,116 @@ def subject_for(counts: DigestCounts, open_failures: int) -> str:
     return f"Recordings: {counts.done} done, {open_failures} FAILED"
 
 
+# --------------------------------------------------------------------------- routes
+
+
+@dataclass(frozen=True)
+class RouteDigest:
+    """One route's day, counted on its own.
+
+    ``configured`` false is a route the ledger has history for that is no longer in
+    ``ROUTES``. Taking a route out stops it being watched and deletes nothing, so its
+    recordings are still here to be reported on, and a quarantined one on it is still
+    somebody's job this morning.
+    """
+
+    name: str
+    label: str
+    counts: DigestCounts
+    enabled: bool = True
+    configured: bool = True
+
+    @property
+    def display(self) -> str:
+        label = (self.label or "").strip()
+        return f"{label} ({self.name})" if label and label != self.name else self.name
+
+    @property
+    def open_failures(self) -> int:
+        return self.counts.quarantined + self.counts.in_flight
+
+    @property
+    def needs_a_person(self) -> bool:
+        return self.open_failures > 0
+
+    def line(self) -> str:
+        """One plain sentence about this route.
+
+        A route that processed nothing says so. It is not omitted: a missing line reads as
+        "fine" and means nothing of the sort, and "no recordings arrived on the WhatsApp
+        route yesterday" is exactly the sentence that was missing when a folder stopped
+        syncing.
+        """
+        counts = self.counts
+        if not self.configured:
+            state = " (not in the configuration any more; its history is kept)"
+        elif not self.enabled:
+            state = " (switched off)"
+        else:
+            state = ""
+        if counts.quarantined or counts.in_flight:
+            parts = [f"{counts.discovered} arrived", f"{counts.done} done"]
+            if counts.quarantined:
+                parts.append(f"{counts.quarantined} STOPPED FOR YOU")
+            if counts.in_flight:
+                parts.append(f"{counts.in_flight} still in progress")
+            body = ", ".join(parts)
+        elif counts.discovered == 0:
+            body = "nothing arrived"
+        elif counts.skipped_empty:
+            body = f"all {counts.discovered} done ({counts.skipped_empty} silent)"
+        else:
+            body = f"all {counts.discovered} done"
+        return f"{self.display}{state}: {body}"
+
+
+def _counts_for(ledger: Ledger, day: str, route: str) -> DigestCounts:
+    """One route's counts, or an empty day. A route the ledger cannot answer for is not
+    allowed to stop the morning email going out at all."""
+    try:
+        return DigestCounts.from_counts(day, ledger.counts_for_day(day, route=route))
+    except Exception as exc:  # noqa: BLE001 - the digest must be sendable from a sick ledger
+        log.warning("could not count the day %s for the route %r: %s", day, route, exc)
+        return DigestCounts(day=day)
+
+
+def route_digests(config: Any, ledger: Ledger, day: str) -> tuple[RouteDigest, ...]:
+    """Every route worth a line this morning, configured ones first and in order.
+
+    Routes the ledger knows and the configuration does not are appended, but only when they
+    actually have something to say — a route removed months ago with nothing outstanding is
+    history, not news.
+    """
+    out: list[RouteDigest] = []
+    named: set[str] = set()
+    for route in routes_of(config):
+        name = str(getattr(route, "name", "") or "").strip()
+        if not name or name in named:
+            continue
+        named.add(name)
+        out.append(
+            RouteDigest(
+                name=name,
+                label=str(getattr(route, "label", "") or ""),
+                counts=_counts_for(ledger, day, name),
+                enabled=bool(getattr(route, "enabled", True)),
+            )
+        )
+    try:
+        seen = ledger.routes_seen()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not list the routes in the ledger: %s", exc)
+        seen = ()
+    for name in seen:
+        if name in named:
+            continue
+        counts = _counts_for(ledger, day, name)
+        if counts.discovered == 0 and not counts.failures:
+            continue
+        out.append(RouteDigest(name=name, label="", counts=counts, enabled=False, configured=False))
+    return tuple(out)
+
+
 # --------------------------------------------------------------------------- records
 
 
@@ -204,10 +322,21 @@ class Digest:
     new_failures: int = 0
     service_error: str = ""
     credential_warning: str = ""
+    #: The same morning, counted one route at a time. The subject line is still the whole
+    #: service; this is what the body breaks it down into.
+    routes: tuple[RouteDigest, ...] = ()
+    #: Recordings two routes have both claimed. Not a failure — the recording is being
+    #: processed — but the transcript may be landing in the wrong folder, and that is only
+    #: ever fixed by a person looking at the folders.
+    route_disagreements: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def needs_a_person(self) -> bool:
-        return self.open_failures > 0 or self.counts.nothing_arrived
+        return (
+            self.open_failures > 0
+            or self.counts.nothing_arrived
+            or bool(self.route_disagreements)
+        )
 
     @property
     def alarm(self) -> bool:
@@ -280,6 +409,8 @@ def build(
     # one person who can fix it was told the phone might not have synced.
     service_error = _service_error(ledger)
     attention = _attention(ledger, target)
+    routes = route_digests(config, ledger, target)
+    disagreements = route_disagreements(ledger, target)
     if sweep_report is None:
         sweep_report = _stored_report(ledger, "sweep")
     if archive_report is None:
@@ -294,6 +425,8 @@ def build(
         today_failures=today_failures,
         older_failures=older_failures,
         stats=ledger.stats(),
+        routes=routes,
+        disagreements=disagreements,
         sweep_report=sweep_report,
         archive_report=archive_report,
         service_error=service_error,
@@ -336,6 +469,8 @@ def build(
         new_failures=len(today_failures),
         service_error=service_error,
         credential_warning=warnings[0][1] if warnings else "",
+        routes=routes,
+        route_disagreements=disagreements,
     )
 
 
@@ -408,6 +543,22 @@ def _attention(ledger: Ledger, day: str) -> Mapping[str, Any]:
         return {}
 
 
+def route_disagreements(ledger: Ledger, day: str) -> tuple[Mapping[str, Any], ...]:
+    """Recordings two routes have both claimed, from the reported day onwards.
+
+    A disagreement is either a recording he moved between two watched folders or two routes
+    watching folders one of which is inside the other — OneDrive reports a folder and
+    everything under it. The second sends a transcript to the wrong folder and would, at
+    sixty days, move the original into the wrong archive, so it belongs in the one thing he
+    reads every morning rather than only in the event log.
+    """
+    try:
+        return tuple(ledger.route_disagreements(since=day))
+    except Exception as exc:  # noqa: BLE001 - the digest must be sendable from a sick ledger
+        log.warning("could not read the route disagreements: %s", exc)
+        return ()
+
+
 def _stored_report(ledger: Ledger, name: str) -> str:
     """Last night's rendered report, read back after a restart lost the in-memory one."""
     try:
@@ -426,6 +577,8 @@ def _render(
     older_failures: Sequence[Mapping[str, Any]],
     stats: Mapping[str, Any],
     sweep_report: Any,
+    routes: Sequence["RouteDigest"] = (),
+    disagreements: Sequence[Mapping[str, Any]] = (),
     archive_report: Any,
     service_error: str = "",
     attention: Mapping[str, Any] | None = None,
@@ -489,10 +642,13 @@ def _render(
     if today_failures or older_failures:
         total = len(today_failures) + len(older_failures)
         lines += [f"NEEDS YOU — {total} recording(s) did not finish", _RULE]
+        # Which route a failure arrived on, but only when there is more than one: on a
+        # single-route service it would be the same word under every failure.
+        route_labels = {r.name: r.display for r in routes} if len(routes) > 1 else {}
         index = 0
         for failure in list(today_failures) + list(older_failures):
             index += 1
-            lines += _failure_block(index, failure, counts.day)
+            lines += _failure_block(index, failure, counts.day, route_labels)
         lines.append("")
     else:
         lines += ["Nothing needs you this morning.", ""]
@@ -509,6 +665,43 @@ def _render(
         f"  finished yesterday (whenever they arrived): {counts.done_on_day}",
         "",
     ]
+
+    if routes:
+        # One line per route, every route, every morning. The totals above are the whole
+        # service; these are what they are made of, and a route with nothing on it is listed
+        # saying so rather than left out to be read as "fine".
+        lines += ["BY ROUTE", _RULE]
+        for entry in routes:
+            marker = "!" if entry.needs_a_person else " "
+            lines.append(f"  {marker} {entry.line()}")
+        lines.append("")
+
+    if disagreements:
+        # Next to the per-route breakdown, because it is a fact about two routes rather than
+        # about one recording. Nothing here is decided: which of the two routes a recording
+        # belongs to is exactly the question, and only a person can answer it.
+        lines += [f"TWO ROUTES CLAIMED THE SAME RECORDING — {len(disagreements)}", _RULE]
+        for chunk in _wrap(
+            "Each of these was seen on one route and then seen again on another. Either you "
+            "moved it between two watched folders, or one route's folder is inside another "
+            "route's folder — OneDrive reports a folder and everything underneath it, so "
+            "both routes see the same recording."
+        ):
+            lines.append(f"  {chunk}")
+        lines.append("")
+        for event in list(disagreements)[:10]:
+            what = str(event.get("item_name") or event.get("item_id") or "a recording")
+            lines.append(f"  - {what}: {event.get('detail') or 'seen on two routes'}")
+        if len(disagreements) > 10:
+            lines.append(f"  - and {len(disagreements) - 10} more")
+        lines.append("")
+        for chunk in _wrap(
+            "Its transcript went to the folder of the route it stayed on, which may not be "
+            "the right one, and it will not be archived until this is sorted out. Run "
+            "`transcriber routes` to see which folders each route watches."
+        ):
+            lines.append(f"  {chunk}")
+        lines.append("")
 
     facts = dict(attention or {})
     if facts.get("review") or facts.get("unverified_duration_guard") or facts.get("degraded_transcripts"):
@@ -575,7 +768,12 @@ def _render(
     return "\n".join(lines)
 
 
-def _failure_block(index: int, failure: Mapping[str, Any], day: str) -> list[str]:
+def _failure_block(
+    index: int,
+    failure: Mapping[str, Any],
+    day: str,
+    route_labels: Mapping[str, str] | None = None,
+) -> list[str]:
     name = str(failure.get("name") or failure.get("item_id") or "an unnamed recording")
     attempts = int(failure.get("attempts") or 0)
     discovered = str(failure.get("discovered_at") or "")
@@ -583,6 +781,9 @@ def _failure_block(index: int, failure: Mapping[str, Any], day: str) -> list[str
     block = [f"{index}. {name}"]
     for chunk in _wrap(plain_reason(failure)):
         block.append(f"     {chunk}")
+    route = str(failure.get("route") or "").strip()
+    if route and route_labels:
+        block.append(f"     Which route: {route_labels.get(route, route)}.")
     if discovered and not discovered.startswith(day):
         block.append(f"     Still open from {discovered[:10]}.")
     if attempts:

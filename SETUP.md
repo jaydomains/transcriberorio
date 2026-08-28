@@ -15,7 +15,7 @@ says "copy this", it means copy it into your password manager or a note on your 
 | # | Step | Time | Who |
 |---|---|---|---|
 | 1 | Give the service permission to read your OneDrive | 20 min | **may need your IT admin** |
-| 2 | Make two folders in OneDrive | 2 min | you |
+| 2 | Decide your folders — one set per kind of recording | 10 min | you |
 | 3 | Get a transcription key | 10 min | you |
 | 4 | Get a key for the AI pass | 5 min | you |
 | 5 | Set up the morning email | 10 min | you |
@@ -94,15 +94,43 @@ whether one already exists before making a new one.
 
 ---
 
-## Step 2 — Make two folders in OneDrive
+## Step 2 — Decide your folders, and what goes where
 
-In the same OneDrive as `/CALLS`:
+You don't record one kind of thing, so the transcriber doesn't watch one folder. You give it a
+**route** for each kind of recording: *the folder those recordings arrive in, and the folder their
+transcripts should go to*. Phone calls, site meetings, WhatsApp voice notes, and whatever the next
+recorder drops somewhere else.
 
-- **`/TRANSCRIBED`** — where the transcriber writes finished transcripts, summaries and action lists.
-- **`/CALLS ARCHIVE`** — where recordings older than 60 days move to, once their transcripts are
-  confirmed present. Nothing recent is ever touched and nothing is ever deleted.
+For each kind you want handled, decide three things:
 
-Make them at the top level, next to `/CALLS`. Tell me the exact names if you choose different ones.
+1. **Where those recordings arrive.** The folder your phone, or WhatsApp, or the recorder writes into.
+2. **Where their transcripts should be written.** Its own folder, or — if you'd rather have them
+   together — the same folder another kind uses. Sharing is allowed and nothing collides.
+3. **Where the originals should move to once they're 60 days old**, if anywhere. This one is
+   optional: leave it out and that kind of recording simply stays where it is, for good. Nothing is
+   ever deleted either way, and nothing moves until its transcript has been confirmed present.
+
+A starting point that matches how you already work:
+
+| Kind | Arrives in | Transcripts to | Archived to |
+| --- | --- | --- | --- |
+| Phone calls | `/CALLS` | `/TRANSCRIBED` | `/CALLS ARCHIVE` |
+| Site meetings | `/SITE MEETINGS` | `/TRANSCRIBED` (shared, on purpose) | `/SITE ARCHIVE` |
+| WhatsApp voice notes | `/WHATSAPP` | `/TRANSCRIBED` | — none; they stay put |
+
+Three rules, and the wizard checks all three while you pick the folders rather than letting you find
+out later:
+
+- **A transcripts folder must never be a recordings folder.** The service would read its own
+  transcripts back in as new recordings and transcribe them again, over and over.
+- **Two kinds must not arrive in the same folder.** A recording can only belong to one kind.
+- **One recordings folder must not sit inside another.** OneDrive reports a folder *and everything
+  underneath it*, so a kind watching `/RECORDINGS` would also pick up everything in
+  `/RECORDINGS/SITE MEETINGS` and file it as the wrong kind. Keep them side by side, at the top
+  level, rather than nested.
+
+Make the folders at the top level of the same OneDrive, and tell me the names you chose. You can add
+another kind later in one command — you don't have to decide all of them now.
 
 ---
 
@@ -209,8 +237,12 @@ of a day of recordings later.
 
 What it does that saves you the fiddly parts:
 
-- **Signs in to Microsoft and then lists your OneDrive folders**, so you pick the recordings folder
-  from a numbered menu instead of hunting for a folder id.
+- **Signs in to Microsoft and then lists your OneDrive folders**, so you pick each folder from a
+  numbered menu instead of hunting for a folder id.
+- **Walks you through your routes** — the kinds of recording from step 2 — one at a time: what you
+  call it, which folder it arrives in, where its transcripts go, whether it gets archived. It offers
+  *Phone calls*, *Site meetings* and *WhatsApp voice notes* to start from, and it tells you straight
+  away if two folders would clash rather than letting the service fail at 06:00.
 - **Tests each API key** by making one real call, and tells you plainly if a key is wrong.
 - **Sends you a test email**, so you know the morning report can reach you before you rely on it.
 - **Pings the healthchecks alarm** to prove it's wired up.
@@ -218,6 +250,25 @@ What it does that saves you the fiddly parts:
   message.
 - Writes `.env` readable only by you, and re-running it keeps your previous answers as the defaults,
   so changing one thing later means pressing Enter through the rest.
+
+### Changing your routes afterwards
+
+You never have to re-run the whole wizard to add a kind of recording or move a folder:
+
+```
+transcriber routes                    list them, with the real folder names from OneDrive
+transcriber routes add                add a kind — it asks the questions and shows you the folders
+transcriber routes edit calls         change one
+transcriber routes disable whatsapp   stop watching that folder, keep everything else
+transcriber routes remove whatsapp    take it out altogether — deletes nothing, ever
+```
+
+`disable` is the gentle one and usually the one you want: it stops watching the folder and leaves
+everything else exactly as it is, including recordings part-way through. `remove` also deletes
+nothing, but any recording of that kind that hasn't finished yet gets set aside for a person instead
+of being transcribed — it tells you the number before it asks you to confirm.
+
+The service reads the file once, when it starts, so restart it after a change.
 
 Two flags worth knowing:
 
@@ -276,7 +327,8 @@ Only after those three do we turn on the loop.
 
 - [ ] **Step 1** — start the app registration, and if you're not the admin, send section 1 to whoever
       is. This is the only thing that can hold everything else up.
-- [ ] **Step 2** — make the two folders. Two minutes.
+- [ ] **Step 2** — decide which kinds of recording you want handled, and make their folders. Ten
+      minutes, and you can add more kinds later in one command.
 - [ ] **Step 6** — set up the healthchecks alarm. Five minutes, free, and it's the one that catches
       everything else failing.
 - [ ] Tell me whether you have an **Azure subscription**, so we can settle step 7.

@@ -21,6 +21,14 @@ recording; a fault in the *service* — a rejected credential, an unusable confi
 broken ledger — stops the service. Quarantining a thousand recordings because a key expired
 would bury the one fact anybody needs, so those raise :class:`PipelineFatal` and the worker
 shuts down saying why.
+
+**Where a recording's outputs go is decided by its route, and by nothing else.** The row
+carries the route it was discovered on; the route carries the output folder and, when it
+overrides it, the transcription engine. Nothing here reads a service-wide output folder, and
+nothing here falls back to one: a row whose route is no longer in the configuration is
+quarantined, loudly, naming the route and the routes that do exist. Writing a site meeting's
+transcript into the phone-calls folder because the route it named had been renamed is
+exactly the kind of quiet wrongness this service exists to make impossible.
 """
 
 from __future__ import annotations
@@ -34,7 +42,7 @@ import shutil
 import socket
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from . import audio as audio_probe
@@ -65,7 +73,18 @@ from .graph import (
 )
 from .ledger import Ledger, LedgerError, LedgerStateError
 from .logging_setup import get_logger, item_context
-from .models import AUDIO_EXTENSIONS, AudioInfo, Hints, Row, Segment, State, Transcript, utc_now_iso
+from .models import (
+    AUDIO_EXTENSIONS,
+    DEFAULT_ROUTE,
+    AudioInfo,
+    Hints,
+    Route,
+    Row,
+    Segment,
+    State,
+    Transcript,
+    utc_now_iso,
+)
 from .naming import TimestampUnavailable
 from .outputs import OutputContractError, UploadIncompleteError
 
@@ -135,6 +154,9 @@ class Outcome:
     attempts: int = 0
     elapsed_s: float = 0.0
     outputs: dict[str, str] = field(default_factory=dict)
+    #: The route this recording arrived on, carried out with the result so a report can be
+    #: broken down per route without going back to the ledger for every row.
+    route: str = ""
 
     @property
     def ok(self) -> bool:
@@ -172,14 +194,51 @@ def build_graph(config: Any, **overrides: Any) -> GraphClient:
     return GraphClient(**kwargs)
 
 
-def build_engine(config: Any, graph: Any = None) -> Any:
-    """The configured transcription engine, wired for Graph if it needs a content URL.
+def engine_config_for(config: Any, route: Route | None) -> Any:
+    """The config an engine factory should read for this route.
+
+    A route may transcribe with a different engine from the service default, and the
+    factories all read ``config.engine`` and ``config.engine_key``. Rather than teach three
+    engines about routes, the route's choice is written into a copy of the config here — one
+    place, so a route override cannot be honoured by one engine and ignored by another.
+
+    ``ENGINE_BASE_URL`` and the Azure region describe the *service* engine's endpoint, so
+    they are dropped when a route asks for a different engine: pointing ElevenLabs at an
+    OpenAI-compatible URL somebody set months ago would fail in a way nobody could read.
+    """
+    wanted = (getattr(route, "engine", "") or "").strip().lower()
+    default = (getattr(config, "engine", "") or "").strip().lower()
+    if not wanted or wanted == default:
+        return config
+    key_for = getattr(config, "engine_key_for", None)
+    key = key_for(route) if callable(key_for) else ""
+    if not key:
+        raise EngineConfigError(
+            f"the route {getattr(route, 'name', '?')!r} transcribes with {wanted!r} instead "
+            f"of the service default {default!r}, and no API key for {wanted!r} is "
+            f"configured, so nothing on that route can be transcribed"
+        )
+    try:
+        return replace(config, engine=wanted, engine_key=key, engine_base_url="", azure_region=(
+            getattr(config, "azure_region", "") if wanted == "azure" else ""
+        ))
+    except TypeError:
+        # A stand-in config that is not a dataclass. Say so rather than quietly transcribing
+        # this route with the wrong engine.
+        raise EngineConfigError(
+            f"this configuration cannot be specialised for route "
+            f"{getattr(route, 'name', '?')!r}, which asks for the {wanted!r} engine"
+        ) from None
+
+
+def build_engine(config: Any, graph: Any = None, route: Route | None = None) -> Any:
+    """The transcription engine for this route, wired for Graph if it needs a content URL.
 
     Azure's batch API fetches the audio itself and never receives an upload, so it needs a
     URL rather than a path. Only the pipeline knows the Graph item id behind a local file, so
     the mapping is supplied here.
     """
-    engine = create_engine(config)
+    engine = create_engine(engine_config_for(config, route))
     if graph is not None and hasattr(engine, "with_content_url_provider"):
         def provider(path: str) -> str:
             item_id = _item_id_of_local(path)
@@ -244,6 +303,10 @@ class Pipeline:
             os.path.abspath("."), ".transcriber-work"
         )
         self._engine = engine
+        #: One engine per engine *name*, not per route: two routes that both use the service
+        #: default share one client and one connection pool, which is what the concurrency
+        #: limit assumes. Keyed by name so a route override builds its own, once.
+        self._engines: dict[str, Any] = {}
         self._extractor = extractor
         self._build_lock = threading.Lock()
         self._rng = random.Random()
@@ -252,15 +315,57 @@ class Pipeline:
 
     @property
     def engine(self) -> Any:
-        """Built on first use so ``status`` and ``selftest`` need no engine credential."""
-        if self._engine is None:
-            with self._build_lock:
-                if self._engine is None:
-                    try:
-                        self._engine = build_engine(self.config, self.graph)
-                    except EngineConfigError as exc:
-                        raise PipelineFatal(f"the transcription engine is not usable: {exc}") from exc
-        return self._engine
+        """The service default engine, built on first use.
+
+        ``status`` and ``selftest`` therefore need no engine credential. A recording is
+        transcribed by :meth:`engine_for`, which honours its route's override; this is what
+        that falls back to and what a caller with no route in hand gets.
+        """
+        return self.engine_for(None)
+
+    def engine_for(self, route: Route | None) -> Any:
+        """The engine that transcribes this route: its override, or the service default.
+
+        An engine passed to the constructor is a forced one — a test, the selftest, ``once
+        --engine`` — and it is used for every route, because being told which engine to use
+        outranks a configuration file.
+        """
+        if self._engine is not None:
+            return self._engine
+        name = (getattr(route, "engine", "") or "").strip().lower() or str(
+            getattr(self.config, "engine", "") or ""
+        ).strip().lower()
+        found = self._engines.get(name)
+        if found is not None:
+            return found
+        with self._build_lock:
+            found = self._engines.get(name)
+            if found is None:
+                try:
+                    found = build_engine(self.config, self.graph, route)
+                except EngineConfigError as exc:
+                    raise self._engine_fault(route, exc) from exc
+                self._engines[name] = found
+        return found
+
+    def _engine_fault(self, route: Route | None, exc: Exception) -> Exception:
+        """Whose fault an unusable engine is: this route's, or the whole service's.
+
+        The service default being unusable stops the service — every recording would fail
+        the same way and quarantining the backlog would bury the one fact anybody needs. One
+        route's *override* being unusable is that route's problem, and it must not take the
+        other routes down with it, so its recordings quarantine and the rest keep running.
+        """
+        override = (getattr(route, "engine", "") or "").strip().lower()
+        default = str(getattr(self.config, "engine", "") or "").strip().lower()
+        if override and override != default:
+            return _RouteFault(
+                f"the route {getattr(route, 'name', '?')!r} is set to transcribe with "
+                f"{override!r} instead of the service default {default!r}, and that engine is "
+                f"not usable: {exc}. Only this route is affected — every other route is still "
+                f"running. Nothing was written, moved or deleted."
+            )
+        return PipelineFatal(f"the transcription engine is not usable: {exc}")
 
     @property
     def extractor(self) -> Any:
@@ -272,6 +377,34 @@ class Pipeline:
                     except AnalysisConfigError as exc:
                         raise PipelineFatal(f"the analysis pass is not usable: {exc}") from exc
         return self._extractor
+
+    # -- the route -----------------------------------------------------------------
+
+    def route_of(self, row: Row) -> Route:
+        """The route this recording arrived on, from the configuration. Never a guess.
+
+        Raises :class:`_RouteFault` when the row names a route the configuration no longer
+        describes — he removed or renamed it while this file was in flight. There is no
+        fallback on purpose: the alternative to a loud stop is writing a site meeting's
+        transcript into whichever folder happened to be first, which nothing downstream
+        would ever notice.
+        """
+        name = str(getattr(row, "route", "") or "").strip() or DEFAULT_ROUTE
+        lookup = getattr(self.config, "route", None)
+        found = lookup(name) if callable(lookup) else None
+        if isinstance(found, Route):
+            return found
+        known = ", ".join(
+            str(getattr(r, "name", "")) for r in (getattr(self.config, "routes", ()) or ())
+        )
+        raise _RouteFault(
+            f"this recording arrived on the route {name!r}, and there is no route called "
+            f"{name!r} in the configuration any more, so there is nowhere it may be written. "
+            f"The routes that do exist are: {known or '(none)'}. Nothing has been written, "
+            f"moved or deleted — the recording is where it was. Either put that route back "
+            f"in ROUTES, or move this recording to one of the routes above, and it will be "
+            f"picked up again."
+        )
 
     # -- entry point ---------------------------------------------------------------
 
@@ -345,8 +478,12 @@ class Pipeline:
     # -- the walk ------------------------------------------------------------------
 
     def _walk(self, row: Row, started: float) -> Outcome:
-        log.info("processing", f"{row.name or row.item_id} from {row.state}",
-                 state=row.state, attempts=row.attempts)
+        # Where this recording's outputs go is settled before a byte is downloaded. A row on
+        # a route the configuration no longer has fails here, having cost nothing and having
+        # touched nothing, rather than after the engine has been paid.
+        route = self.route_of(row)
+        log.info("processing", f"{row.name or row.item_id} from {row.state} on {route.display}",
+                 state=row.state, attempts=row.attempts, route=route.name)
 
         parsed = naming.parse_source_name(row.name)
         if parsed.extension not in AUDIO_EXTENSIONS:
@@ -399,11 +536,12 @@ class Pipeline:
 
         # --- 4. transcribe, then persist TRANSCRIBED ------------------------------
         hints = self._hints(row, parsed, info)
-        transcript = self._transcribe(row, audio_path, info, hints)
+        engine = self.engine_for(route)
+        transcript = self._transcribe(row, audio_path, info, hints, engine)
 
         verdict = plausibility.assess(transcript, info)
         fields: dict[str, Any] = {
-            "engine": transcript.engine or str(getattr(self.engine, "name", "") or ""),
+            "engine": transcript.engine or str(getattr(engine, "name", "") or ""),
             "language": transcript.language,
             "word_count": verdict.words,
         }
@@ -449,7 +587,7 @@ class Pipeline:
         row = self.ledger.get(row.item_id) or row
 
         # --- 6. write the three files, confirm them, then persist DONE ------------
-        result = self._publish(row, parsed, transcript, extraction, info,
+        result = self._publish(row, parsed, transcript, extraction, info, route,
                                notes=_engine_notes(engine_meta))
         self.ledger.advance(
             row.item_id,
@@ -461,7 +599,8 @@ class Pipeline:
         )
         self._cleanup(row.item_id)
         row = self.ledger.get(row.item_id) or row
-        log.info("done", ", ".join(sorted(result.names.values())), **result.names)
+        log.info("done", ", ".join(sorted(result.names.values())),
+                 route=route.name, **result.names)
         return self._outcome(row, RESULT_DONE, "three files written and confirmed", started,
                              outputs=result.names)
 
@@ -531,8 +670,11 @@ class Pipeline:
         )
         return path
 
-    def _transcribe(self, row: Row, path: str, info: AudioInfo, hints: Hints) -> Transcript:
-        """The engine, or the cached answer from a run that crashed after paying for it."""
+    def _transcribe(
+        self, row: Row, path: str, info: AudioInfo, hints: Hints, engine: Any = None
+    ) -> Transcript:
+        """This route's engine, or the cached answer from a run that crashed after paying."""
+        engine = self.engine if engine is None else engine
         cache = self._transcript_cache(row.item_id)
         cached = _load_transcript(cache, row.content_hash)
         if cached is not None:
@@ -543,7 +685,7 @@ class Pipeline:
 
         duration = float(info.duration_s or 0.0)
         transcript = run_engine(
-            self.engine,
+            engine,
             path,
             hints,
             duration_s=duration if duration > 0 and audio_probe.duration_is_known(info) else None,
@@ -582,9 +724,22 @@ class Pipeline:
         transcript: Transcript,
         extraction: Extraction,
         info: AudioInfo,
+        route: Route,
         *,
         notes: tuple[str, ...] = (),
     ) -> outputs.UploadResult:
+        # The route's folder, and only ever the route's folder. Not a service-wide default,
+        # not the first route's, not the folder the recording came from. Asked before
+        # anything is rendered, so a route that cannot say where its outputs go costs
+        # nothing and touches nothing.
+        parent = str(route.output_folder_id or "")
+        if not parent:
+            raise _RouteFault(
+                f"the route {route.name!r} ({route.display}) has no output folder, so there "
+                f"is nowhere to write this recording's three files. Set "
+                f"{route.env_var('OUTPUT')} in the .env — or move this recording to a route "
+                f"that has one. Nothing was written and nothing was moved."
+            )
         recorded_at, note = naming.resolve_timestamp(parsed, row.created_at)
         ctx = outputs.OutputContext(
             item_id=row.item_id,
@@ -602,11 +757,8 @@ class Pipeline:
             notes=tuple(notes),
         )
         self._refuse_name_collision(row, ctx)
-        parent = str(getattr(self.config, "output_folder_id", "") or "")
-        if not parent:
-            raise PipelineFatal(
-                "OUTPUT_FOLDER_ID is not set, so there is nowhere to write the three files"
-            )
+        log.info("publishing", f"three files into the {route.display} output folder",
+                 route=route.name, parent=parent)
         return outputs.publish(
             self.graph,
             parent,
@@ -714,6 +866,7 @@ class Pipeline:
             result=result,
             state=row.state,
             reason=reason,
+            route=str(getattr(row, "route", "") or ""),
             attempts=extra.pop("attempts", row.attempts),
             elapsed_s=round(self.clock() - started, 3),
             outputs=extra.pop("outputs", {}),
@@ -800,6 +953,16 @@ class _LeaseKeeper:
 
 class _ItemFault(RuntimeError):
     """A fault in this recording that will not come right by being retried."""
+
+
+class _RouteFault(_ItemFault):
+    """This recording's route cannot say where its outputs go.
+
+    Deliberately not fatal. A route he removed or renamed while a file was mid-flight is one
+    route's problem: the recording is quarantined with the route named, in words, and every
+    other route keeps running. Deliberately not retried either — the configuration will not
+    change by being asked again, and a person has to decide where that recording belongs.
+    """
 
 
 class _DownloadNotVerified(RuntimeError):
