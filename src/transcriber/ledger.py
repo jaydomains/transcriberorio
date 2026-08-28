@@ -1019,15 +1019,15 @@ class Ledger:
         reported up to two hours early. Every row is still reported exactly once. Same skew
         the rest of the digest already carries; noted rather than papered over.)
         """
+        conn = self._conn()
         like = f"{day}%"
-        clause, params = ("", ()) if route is None else (" AND route=?", (route,))
+        clause, params = self._route_filter(route)
         out: list[dict[str, Any]] = []
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT item_id, name, route, meta FROM items "
-                f"WHERE done_at LIKE ?{clause} ORDER BY done_at ASC",
-                (like, *params),
-            ).fetchall()
+        rows = conn.execute(
+            f"SELECT item_id, name, route, meta FROM items "
+            f"WHERE done_at LIKE ?{clause} ORDER BY done_at ASC",
+            (like, *params),
+        ).fetchall()
         for row in rows:
             decision = _decode_meta(row["meta"]).get("naming")
             if not isinstance(decision, dict) or not decision.get("decided"):

@@ -1724,6 +1724,19 @@ def _naming_lines(naming: Mapping[str, Any] | None) -> list[str]:
         return []
 
     lines = ["", f"  {facts.get('book') or 'site list: unknown'}"]
+
+    unreadable = str(facts.get("unreadable") or "")
+    if unreadable:
+        # A fault and a quiet day are the same empty list and must never be the same
+        # sentence. Saying "nothing came in" here would report a broken read as good news,
+        # for as long as it stayed broken.
+        lines.append(
+            "  Could not read what was named yesterday, so this part of the email is "
+            "missing rather"
+        )
+        lines.append(f"  than empty: {unreadable}")
+        return lines
+
     eligible = int(facts.get("eligible") or 0)
     if not eligible:
         # Printed on a quiet day too, so silence never means "working" and "the site list
@@ -1731,7 +1744,6 @@ def _naming_lines(naming: Mapping[str, Any] | None) -> list[str]:
         lines.append("  Nothing came in under the voice recorder's own name.")
         return lines
 
-    verb = "named" if facts.get("applying") else "would call"
     lines.append("")
     for chunk in _wrap(
         f"{eligible} recording{'s' if eligible != 1 else ''} came in with the voice "
@@ -1740,7 +1752,7 @@ def _naming_lines(naming: Mapping[str, Any] | None) -> list[str]:
         width=72,
     ):
         lines.append(f"  {chunk}")
-    if not facts.get("applying"):
+    if not any(r.get("applied") for r in (facts.get("rows") or ())):
         lines.append(
             "  Nothing has been renamed: it is only saying what it would have called them."
         )
@@ -1748,8 +1760,17 @@ def _naming_lines(naming: Mapping[str, Any] | None) -> list[str]:
 
     rows = list(facts.get("rows") or ())
     for row in rows[:_NAMING_ROWS]:
-        source = str(row.get("source_name") or row.get("item_id") or "a recording")
+        # Never the item id as a fallback. It is 34 characters of OneDrive bookkeeping,
+        # it identifies nothing he can look up, and printing it where a filename goes makes
+        # the email read like a machine talking to itself.
+        source = str(row.get("source_name") or "").strip() or "a recording with no name of its own"
         name = str(row.get("name") or "")
+        # From the decision, never from today's setting. He may have switched it on this
+        # morning; yesterday's recordings were still only being watched, and telling him
+        # they were named would send him looking in the record for a document that is not
+        # there. The reverse is worse: a rename reported as a suggestion is a change he
+        # does not know he made.
+        verb = "named" if row.get("applied") else "would call"
         head = f"{source}  ->  {verb} it {name}" if name else f"{source}  ->  left as it is"
         lines.append(f"    {head}")
         for chunk in _wrap(str(row.get("why") or ""), width=68):
@@ -1776,11 +1797,12 @@ def naming_report(config: Any, ledger: Ledger, *, day: str) -> Mapping[str, Any]
         book = sitebook.load(str(getattr(config, "naming_sites_file", "") or ""))
     except Exception as exc:  # noqa: BLE001 - the email must send from a sick everything
         log.warning("could not read the site list: %s", exc)
+    unreadable = ""
     try:
         decisions = ledger.naming_for_day(day)
     except Exception as exc:  # noqa: BLE001
         log.warning("could not read the naming decisions for %s: %s", day, exc)
-        decisions = []
+        decisions, unreadable = [], str(exc) or exc.__class__.__name__
     # E1 is "he named this one himself", which is most recordings and is not news.
     eligible = [d for d in decisions if str(d.get("code") or "") not in ("E1", "E2", "off")]
     return {
@@ -1789,6 +1811,10 @@ def naming_report(config: Any, ledger: Ledger, *, day: str) -> Mapping[str, Any]
         "eligible": len(eligible),
         "named": sum(1 for d in eligible if d.get("name")),
         "rows": eligible,
+        #: Set when the ledger could not be asked. Carried rather than swallowed, because
+        #: an empty list from a failed read and an empty list from a quiet day are the same
+        #: value and must never be the same sentence.
+        "unreadable": unreadable,
     }
 
 

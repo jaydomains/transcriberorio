@@ -25,9 +25,8 @@ Nine conditions, all mechanical, all assertable, every one of them failing towar
     N2  it is not a placeholder — "the site", "the office", "here"
     N3  those exact words appear in the PUBLISHED body of the transcript
     N4  the words look like a name — letters, digits and single spaces
-    N5  the record itself binds the transcript to one site
-    N6  the span names that site, and no other, in the record's own vocabulary
-    N7  the site is named twice or more, early, and spread across the recording
+    N6  the span names exactly one site the record knows about
+    N7  it is what the recording is ABOUT — he announced it, or it wins the conversation
     N8  the name survives being made into a name
     N9  **adding the name does not change what the record binds the file to**
 
@@ -59,7 +58,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from . import naming, sitebook
+from . import declaration, naming, sitebook
 
 __all__ = [
     "STOP_SITES",
@@ -127,12 +126,19 @@ class NameDecision:
     applied: bool = False       # written into the subject line and the heading
     site: str = ""              # the slug the record bound, "" when none
     span: str = ""              # the words in the transcript the name was taken from
-    mentions: int = 0
-    first_pct: int = 0          # where the first mention falls, as a percentage
-    spread_pct: int = 0         # first to last, as a percentage
+    mentions: int = 0           # how often the site is named across the recording
     code: str = ""              # "ok" | "off" | "E1".."E4" | "N1".."N9"
     why: str = ""               # plain English, printed in the morning email
     book: str = ""              # which site list decided it
+    #: Whether he announced the site at the top of the recording, rather than it being
+    #: worked out from the rest of the conversation. The stronger of the two.
+    declared: bool = False
+    #: What he said the recording was for — SITE WALK, INSPECTION — from the opening only.
+    activity: str = ""
+    #: Where the record will actually file the note, which is not always where the
+    #: recording says it belongs. Reported, never obeyed.
+    filed: str = ""
+    disagrees: bool = False
 
     def as_meta(self) -> dict[str, Any]:
         """The form stored on the ledger row. Small, flat and JSON-safe."""
@@ -143,11 +149,13 @@ class NameDecision:
             "site": self.site,
             "span": self.span,
             "mentions": int(self.mentions),
-            "first_pct": int(self.first_pct),
-            "spread_pct": int(self.spread_pct),
             "code": self.code,
             "why": self.why,
             "book": self.book,
+            "declared": bool(self.declared),
+            "activity": self.activity,
+            "filed": self.filed,
+            "disagrees": bool(self.disagrees),
         }
 
     @classmethod
@@ -168,11 +176,13 @@ class NameDecision:
                 site=str(raw.get("site") or ""),
                 span=str(raw.get("span") or ""),
                 mentions=int(raw.get("mentions") or 0),
-                first_pct=int(raw.get("first_pct") or 0),
-                spread_pct=int(raw.get("spread_pct") or 0),
                 code=str(raw.get("code") or ""),
                 why=str(raw.get("why") or ""),
                 book=str(raw.get("book") or ""),
+                declared=bool(raw.get("declared")),
+                activity=str(raw.get("activity") or ""),
+                filed=str(raw.get("filed") or ""),
+                disagrees=bool(raw.get("disagrees")),
             )
         except (TypeError, ValueError):
             return None
@@ -201,6 +211,12 @@ def eligible(
     the name, so suggest one" — is wrong on every one of them.
     """
     if not is_recorder_default(parsed.stem):
+        return False, "E1", "he named this one himself"
+
+    if not parsed.timestamp_recovered:
+        # The shape matched but the digits are not a real moment -- "Voice 260832_250000".
+        # The recorder writes its own clock and cannot produce that, so this is something
+        # else wearing the shape, and something else is a name a person chose.
         return False, "E1", "he named this one himself"
 
     if parsed.form != naming.FORM_FREE_TEXT or parsed.party is not None:
@@ -235,6 +251,7 @@ def decide(
     render: Callable[[str], str],
     apply: bool,
     min_seconds: int,
+    opening_seconds: float = declaration.DEFAULT_WINDOW_S,
 ) -> NameDecision:
     """Work out what to call this recording, or refuse. **Never raises.**
 
@@ -280,89 +297,115 @@ def decide(
         return NameDecision(decided=True, code="N4", span=span, book=book_name,
                             why="the words it is named by do not read as a name")
 
-    # N5 — the record itself binds the file to one site. Rendered without a name first,
-    # because that is the file as it stands today.
-    try:
-        plain = render("")
-    except Exception:
-        return NameDecision(decided=True, code="N5", span=span, book=book_name,
-                            why="the transcript could not be read back to check the name")
-    bound, _scores = book.bind(plain)
-    if bound is None:
-        return NameDecision(decided=True, code="N5", span=span, book=book_name,
-                            why="the record cannot tell which site this belongs to, so a "
-                                "name would say more than the recording does")
-
-    # N6 — the span names that site in the record's own vocabulary, and names no other.
-    # This is what stops an ordinary English word becoming a name: "House", "North",
-    # "Green" and "Beach" all appear in real site titles, and the record discards any term
-    # it uses of more than two sites, so none of them discriminates anything.
+    # N6 — the span names exactly one site the record knows about.
+    #
+    # This is the guard that stops an ordinary English word becoming a title. "House",
+    # "North", "Green", "Forest" and "Beach" all appear in real site titles, and the record
+    # discards any term it uses of more than two sites, so none of them discriminates
+    # anything and none of them can name a recording.
+    #
+    # It is NOT a check that the record binds this document anywhere. That check used to be
+    # here and it was wrong, in a way only an adversary found: the record scores a site by
+    # how many DISTINCT vocabulary terms appear in a document, once each, never by how
+    # often. A two-minute call about "Ashton Steelworks" carries three of its terms; an
+    # hour standing in Eagle House carries one. So the record answered Ashton Steelworks,
+    # this rule agreed with it, and titled an Eagle House walk after a phone call — while
+    # refusing a model that answered Eagle House, which was the truth. Deferring to the
+    # record made a misfile look deliberate. See :meth:`SiteBook.mentions_of_each`.
     named = book.sites_named_by(span)
-    if bound not in named:
-        return NameDecision(decided=True, code="N6", site=bound, span=span, book=book_name,
-                            why=f"{span!r} is not how the record recognises this site")
+    if not named:
+        return NameDecision(decided=True, code="N6", span=span, book=book_name,
+                            why=f"{span!r} is not a site the record knows about")
     if len(named) > 1:
-        return NameDecision(decided=True, code="N6", site=bound, span=span, book=book_name,
+        return NameDecision(decided=True, code="N6", span=span, book=book_name,
                             why=f"{span!r} could be more than one site")
+    site_slug = next(iter(named))
 
-    # N7 — named twice or more, early, and across the recording rather than in one patch.
-    hits = _all_spans(span, spoken)
-    mentions = len(hits)
-    length = max(len(spoken), 1)
-    first_pct = int(hits[0][0] * 100 / length) if hits else 100
-    spread_pct = int((hits[-1][0] - hits[0][0]) * 100 / length) if len(hits) > 1 else 0
+    # N7 — and it has to be what the recording is ABOUT, not merely something said in it.
+    # Two ways to earn that, and a recording needs only one.
+    counts = book.mentions_of_each(spoken)
+    mine = counts.get(site_slug, 0)
+    rivals = {slug: n for slug, n in counts.items() if slug != site_slug}
+    runner_up = max(rivals.values()) if rivals else 0
 
-    if mentions < _MIN_MENTIONS:
-        return NameDecision(decided=True, code="N7", site=bound, span=span,
-                            mentions=mentions, first_pct=first_pct, book=book_name,
-                            why=f"{span} is only mentioned once, so it looks like "
-                                f"something that came up rather than where he was")
-    if first_pct > int(_FIRST_WITHIN * 100):
-        return NameDecision(decided=True, code="N7", site=bound, span=span,
-                            mentions=mentions, first_pct=first_pct, spread_pct=spread_pct,
-                            book=book_name,
-                            why=f"{span} is not mentioned until {first_pct}% of the way in")
-    if spread_pct < int(_MIN_SPREAD * 100):
-        return NameDecision(decided=True, code="N7", site=bound, span=span,
-                            mentions=mentions, first_pct=first_pct, spread_pct=spread_pct,
-                            book=book_name,
-                            why=f"{span} is only said in one short stretch near the start, "
-                                f"so it looks like something that came up rather than "
-                                f"where he was")
+    window = declaration.opening(spoken, window_s=float(opening_seconds))
+    declared_here = book.sites_named_by(window.text) if window else frozenset()
+    declared = declared_here == {site_slug}
 
-    # N8 — the name survives being made into a name.
-    candidate = span.upper()
+    if len(declared_here) == 1 and not declared:
+        # He announced ONE site at the top and it was not this one. That is the recording
+        # itself contradicting the answer, and it outranks any amount of counting.
+        other = next(iter(declared_here))
+        return NameDecision(decided=True, code="N7", site=site_slug, span=span,
+                            mentions=mine, book=book_name,
+                            why=f"the recording opens by saying it is "
+                                f"{book.title_of(other)}, not {span}")
+
+    # An opening naming two sites is not a contradiction, it is a busy first minute — he
+    # finishes a call and then announces where he is. That falls through to the count
+    # rather than refusing, which is the whole point of having a second path.
+    if not declared:
+        # Nothing was announced, so fall back to what the conversation is mostly about.
+        # This is the second half of what he asked for: "if the name is not announced in the
+        # beginning then it should try and infer from the conversation."
+        if mine < _MIN_MENTIONS:
+            return NameDecision(decided=True, code="N7", site=site_slug, span=span,
+                                mentions=mine, book=book_name,
+                                why=f"{span} is only mentioned once and is not announced at "
+                                    f"the start, so it looks like something that came up "
+                                    f"rather than where he was")
+        if mine <= runner_up:
+            other = max(rivals, key=lambda k: rivals[k])
+            return NameDecision(decided=True, code="N7", site=site_slug, span=span,
+                                mentions=mine, book=book_name,
+                                why=f"the recording talks about {book.title_of(other)} as "
+                                    f"much as {span}, so it does not say plainly enough "
+                                    f"which one it is about")
+
+    # N8 — the name survives being made into a name, with the activity he announced.
+    activity = declaration.activity_in(window.text) if declared else ""
+    candidate = " ".join(part for part in (span.upper(), activity) if part).strip()
+    if (naming.safe_stem(candidate) != candidate or is_recorder_default(candidate)
+            or len(candidate) > _MAX_NAME):
+        candidate = span.upper()
+        activity = ""
     if naming.safe_stem(candidate) != candidate or is_recorder_default(candidate):
-        return NameDecision(decided=True, code="N8", site=bound, span=span,
-                            mentions=mentions, first_pct=first_pct, spread_pct=spread_pct,
-                            book=book_name,
+        return NameDecision(decided=True, code="N8", site=site_slug, span=span,
+                            mentions=mine, book=book_name,
                             why="the name would have to be changed to be usable, so it is "
                                 "not what was said")
 
-    # N9 — the last word, and by construction the quiet one. Adding the name must not
-    # change what the record files this under. N3 and N6 between them mean it cannot today
-    # (see the module docstring); it is here because it is the only rule that asks the
-    # record rather than reasoning about it, and it costs one render.
+    # N9 — what the record will do with it, reported rather than obeyed.
+    #
+    # This used to refuse a name that changed the record's answer. That is now backwards:
+    # the record's answer is the frequency-blind one, so a title that moves a filing toward
+    # the site he announced is the title CORRECTING the record, which is the best thing
+    # that can happen here. What is worth knowing is when the two disagree, because that
+    # means this note is about to be filed somewhere he will not look for it — and a title
+    # that visibly disagrees with the filing is far better than one that quietly
+    # corroborates a wrong one.
+    filed = ""
     try:
-        named_file = render(candidate)
+        filed, _scores = book.bind(render(candidate))
     except Exception:
-        return NameDecision(decided=True, code="N9", site=bound, span=span, book=book_name,
-                            why="the transcript could not be read back to check the name")
-    after, _after_scores = book.bind(named_file)
-    if after != bound:
-        return NameDecision(decided=True, code="N9", site=bound, span=span,
-                            mentions=mentions, first_pct=first_pct, spread_pct=spread_pct,
-                            book=book_name,
-                            why=f"calling it {candidate} would change which site the "
-                                f"record files it under, which is the one thing a name "
-                                f"must never do")
+        filed = ""
+    disagrees = bool(filed) and filed != site_slug
+
+    how = "you say so at the start" if declared else f"most of the recording is about it"
+    why = f"{span} is what this one is about — {how}"
+    if mine:
+        why += f", named {mine} time{'s' if mine != 1 else ''}"
+    if disagrees:
+        why += (f". Worth knowing: the record will file it under "
+                f"{book.title_of(filed)} rather than {book.title_of(site_slug)}")
+    elif filed == site_slug:
+        why += f", and the record files it there too"
 
     return NameDecision(
-        decided=True, name=candidate, applied=bool(apply), site=bound, span=span,
-        mentions=mentions, first_pct=first_pct, spread_pct=spread_pct,
-        code="ok", book=book_name,
-        why=(f"{span} is named {mentions} times, spread right across the recording, and "
-             f"the record files this one under {book.title_of(bound)} either way"),
+        decided=True, name=candidate, applied=bool(apply), site=site_slug, span=span,
+        mentions=mine, code="ok", book=book_name,
+        declared=declared, activity=activity, filed=filed or "", disagrees=disagrees,
+        why=why,
     )
 
 
@@ -389,13 +432,6 @@ def _find_span(phrase: str, text: str) -> tuple[int, int] | None:
         return None
     found = pattern.search(text or "")
     return (found.start(), found.end()) if found else None
-
-
-def _all_spans(phrase: str, text: str) -> list[tuple[int, int]]:
-    pattern = _pattern(phrase)
-    if pattern is None:
-        return []
-    return [(m.start(), m.end()) for m in pattern.finditer(text or "")]
 
 
 def _normalise(raw: str) -> str:

@@ -732,7 +732,12 @@ class Pipeline:
         # no symptom, and the stickiness that stops two attempts disagreeing would simply
         # not exist. Wrapped whole: the only thing this can do for a recording is give it a
         # better title, and nothing about a better title is worth a transcript.
-        decision = self._name(row, parsed, gate, info, route)
+        # The same notes the publish will carry, computed once. The probe MUST render the
+        # bytes the record is actually handed: notes are rendered into the transcript, so a
+        # probe without them scores a file that does not exist, and the one check that asks
+        # the record instead of reasoning about it would be asking about the wrong file.
+        publish_notes = _engine_notes(engine_meta) + gate.notes
+        decision = self._name(row, parsed, gate, info, route, notes=publish_notes)
 
         # --- 8. persist ANALYSED --------------------------------------------------
         # The redacted analysis, deliberately: `_review_row` keeps an unverifiable quote in
@@ -752,7 +757,7 @@ class Pipeline:
 
         # --- 9. write the three files, confirm them, then persist DONE ------------
         result = self._publish(row, parsed, gate.transcript, gate.extraction, info, route,
-                               notes=_engine_notes(engine_meta) + gate.notes,
+                               notes=publish_notes,
                                held=gate.held,
                                display_name=decision.name if decision.applied else "")
         self.ledger.advance(
@@ -1134,6 +1139,8 @@ class Pipeline:
         gate: Any,
         info: AudioInfo,
         route: Route,
+        *,
+        notes: tuple[str, ...] = (),
     ) -> autoname.NameDecision:
         """What to call this recording, or nothing. **Never raises, never delays.**
 
@@ -1157,7 +1164,7 @@ class Pipeline:
 
         try:
             probe = self._context(row, parsed, gate.transcript, gate.extraction, info,
-                                  held=tuple(gate.held))
+                                  notes=tuple(notes), held=tuple(gate.held))
             return autoname.decide(
                 parsed=parsed,
                 extraction=gate.extraction,
@@ -1169,6 +1176,9 @@ class Pipeline:
                 ),
                 apply=bool(getattr(self.config, "naming_apply", False)),
                 min_seconds=int(getattr(self.config, "naming_min_seconds", 120) or 120),
+                opening_seconds=float(
+                    getattr(self.config, "naming_opening_seconds", 60) or 60
+                ),
             )
         except Exception as exc:
             log.warning(

@@ -211,6 +211,37 @@ class SiteBook:
         entry = self.sites.get(slug) or {}
         return str(entry.get("title") or "").strip() or str(slug or "")
 
+    def mentions_of_each(self, text: str, *, spans: Any = None) -> dict[str, int]:
+        """How much of this recording is about each site, by how often it is named.
+
+        The record's own :func:`bind_site` cannot answer this and is not built to: it scores
+        a site by how many *distinct* vocabulary terms appear anywhere in the document, once
+        each, never by how often. So a passing call about "Ashton Steelworks" — three terms,
+        ``ashton``, ``ashton steelworks``, ``steelworks`` — outscores an hour spent at Eagle
+        House, which carries one. That is the right answer for an email, which is what the
+        record was built to file, and the wrong answer for a recording, where the question
+        is not *is this site mentioned* but *is this recording about it*.
+
+        Counting names spoken is the question a person would ask, and it is what he asked
+        for: *"any decent api call would easily be able to infer the site name from the
+        majority of conversation."* This is the mechanical half of that — the model's answer
+        still has to win the count, so a model naming a site that was said twice against one
+        said forty times is refused rather than believed.
+        """
+        counts: dict[str, int] = {}
+        lowered = (text or "").lower()
+        for slug, terms in self.vocab.items():
+            best = 0
+            for term in terms:
+                if not term or len(term) < 4:
+                    continue
+                found = lowered.count(term)
+                if found > best:
+                    best = found
+            if best:
+                counts[slug] = best
+        return counts
+
     def line(self) -> str:
         """The one line the morning email prints, every day, including the bad ones.
 

@@ -410,20 +410,36 @@ over 0.9 s. So "Beach Court" said either side of a breath is contiguous in the p
 **split across two lines in the file**. Deciding from the prose proposes a title the file
 does not contain — and in testing that filed a walk at one site under a different one.
 
-**Adding the name must not change which site the record files it under.** The title is part
-of the bytes the record scores. Measured against the real 56 sites: a body that binds
-cleanly to Milton Court binds to *nothing at all* once `CANTERBURY` is in its subject line.
-A wrong name does not merely mislabel a note — it unfiles it. So the file is rendered twice,
-with the name and without, through the record's own site-matching vendored into
-`sitebook.py`, and the name is refused unless the answer is identical. That check cannot
-disagree with the filing because it *is* the filing.
+**It has to be what the recording is *about*, not merely something said in it.** Two ways to
+establish that, and a recording needs only one.
+
+*Declared* — he says at the top what it is: *"this is a site walk of Beach Court, general
+inspection."* That is him stating the answer, and it beats any amount of repetition. It is
+also where the activity word comes from, and the only place it may: scanning the whole
+recording for one attributes events the recording contradicts — *"the site meeting for
+Canterbury moves to next Wednesday"* is a meeting that has not happened.
+
+*Counted* — nothing was announced, so the site has to win the conversation: named at least
+twice, and strictly more than any other site the record knows about.
+
+**The record's own site-matching was the judge here and has been demoted to a witness.** It
+scores a site by how many *distinct* vocabulary words appear anywhere in a document, once
+each, never by how often — which is right for an email and wrong for a recording. Measured
+on the real record: a walk at Eagle House with a two-minute call about Ashton Steelworks at
+either end binds to **Ashton Steelworks**, because that name carries three matchable words
+to Eagle House's one. The first version of this rule deferred to that, titled the walk after
+the phone call, and would have *refused* a model answering "Eagle House" — the truth.
+Deferring to the record made a misfile look deliberate, which is the worst outcome available:
+a wrong filing that a confident title corroborates is one nobody ever checks.
+
+So the record is still asked, and its answer is reported rather than obeyed. When the two
+disagree the morning email says so — *"the record will file it under Ashton Steelworks rather
+than Eagle House"* — which is the one thing that would make a person look.
 
 The rest: the site is not a placeholder ("the site", "here"); the words look like a name; the
-record binds the transcript to exactly one site; the span names that site and no other in the
-record's own vocabulary — which is what stops `House`, `North`, `Green` and `Beach` becoming
-names, since the record discards any term it uses of more than two sites; the site is named
-twice or more, in the first quarter, and spread across at least 40% of the recording; and the
-recording is longer than two minutes.
+span names exactly one site in the record's own vocabulary — which is what stops `House`,
+`North`, `Green` and `Beach` becoming names, since the record discards any term it uses of
+more than two sites; and the recording is longer than two minutes.
 
 That last one is not arbitrary. Forty seconds of wind noise comes back from a Whisper-family
 engine as *"Canterbury Square. Thank you for watching. Canterbury Square, thank you for
@@ -641,6 +657,7 @@ start without it — and it reports *every* missing variable at once, not one pe
 | `NAMING_APPLY` | Write that name into the transcript's subject line and heading. Default `false` — report only, and nothing in the record changes. |
 | `NAMING_SITES_FILE` | The site list written by `ops/build-site-book.py`. Without it nothing is ever named, which is safe. |
 | `NAMING_MIN_SECONDS` | Shortest recording that may be named. Default `120`. |
+| `NAMING_OPENING_SECONDS` | How much of the start counts as him announcing what the recording is. Default `60`. |
 
 ### The routes — one entry per kind of recording
 

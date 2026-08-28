@@ -176,6 +176,7 @@ _SPEC: tuple[_Var, ...] = (
     _Var("naming_apply", "NAMING_APPLY", "bool", False, "write that name into the transcript's subject line and heading; off means it is only reported and nothing in the record changes"),
     _Var("naming_sites_file", "NAMING_SITES_FILE", "str", "", "path to the site list written by ops/build-site-book.py from the record's nightly build; without it no recording is ever named"),
     _Var("naming_min_seconds", "NAMING_MIN_SECONDS", "int", 120, "shortest recording that may be named — below this an engine's own repetitions are indistinguishable from a site being named twice"),
+    _Var("naming_opening_seconds", "NAMING_OPENING_SECONDS", "int", 60, "how much of the start of a recording counts as him announcing what it is — 'this is a site walk of Beach Court'"),
     # --- digest email ----------------------------------------------------------------
     _Var("smtp_host", "SMTP_HOST", "str", _REQUIRED, "SMTP host for the morning digest"),
     _Var("smtp_port", "SMTP_PORT", "int", 587, "SMTP port"),
@@ -278,6 +279,9 @@ class Config:
     naming_apply: bool = False
     naming_sites_file: str = ""
     naming_min_seconds: int = 120
+    #: How long "the beginning of the recording" is. He announces the site and what the
+    #: visit is for in the first sentence; a call taken a few minutes in must fall outside.
+    naming_opening_seconds: int = 60
     #: route name -> the address that reviews that route's held passages; a route absent
     #: from here, or present with an empty value, is reviewed by the service owner. A staff
     #: member reviews their own held passages: he sees the count and the site, never the

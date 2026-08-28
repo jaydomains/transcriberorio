@@ -173,7 +173,8 @@ GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("what it expects to hear", ("LANGUAGES", "VOCABULARY", "VOCABULARY_FILE")),
     ("the sensitivity gate", ("GATE_MODE", "GATE_HELD_STORE", "GATE_REVIEW_BASE_URL")),
     ("naming a recording that arrived without one", (
-        "NAMING", "NAMING_APPLY", "NAMING_SITES_FILE", "NAMING_MIN_SECONDS")),
+        "NAMING", "NAMING_APPLY", "NAMING_SITES_FILE", "NAMING_MIN_SECONDS",
+        "NAMING_OPENING_SECONDS")),
     ("http and logging", ("HTTP_TIMEOUT_S", "MAX_RETRIES", "LOG_LEVEL", "LOG_FORMAT")),
 )
 
@@ -194,6 +195,12 @@ _RULES: dict[str, dict[str, Any]] = {
     "HEARTBEAT_URL": {"show": "private"},
     "TRANSCRIBE_ENGINE": {"choices": tuple(ENGINES)},
     "GATE_MODE": {"choices": tuple(GATE_MODES)},
+    # A floor of one minute. Zero or a negative number disables the guard that separates a
+    # site genuinely named twice from an engine's own repetitions on forty seconds of wind
+    # noise -- the one condition that catches a hallucinated site name, since "said twice"
+    # and "said early" are the hallucination's signature rather than evidence against it.
+    "NAMING_MIN_SECONDS": {"minimum": 60, "maximum": 3600},
+    "NAMING_OPENING_SECONDS": {"minimum": 10, "maximum": 600},
     "LOG_LEVEL": {"choices": LOG_LEVELS},
     "SMTP_PORT": {"minimum": 1, "maximum": 65535},
     "DIGEST_HOUR": {"minimum": 0, "maximum": 23},
@@ -427,9 +434,9 @@ def check_value(name: str, raw: str, env: Mapping[str, str]) -> str:
         )
 
     if name == "NAMING_APPLY" and value.lower() in ("1", "true", "yes", "on") and not str(
-        current.get("NAMING_SITES_FILE") or ""
+        env.get("NAMING_SITES_FILE") or ""
     ).strip():
-        raise ConfigError(
+        return (
             "NAMING_APPLY writes a worked-out name into the transcript's subject line, and "
             "the name can only come from the record's site list. Set NAMING_SITES_FILE "
             "first, to the file ops/build-site-book.py writes."

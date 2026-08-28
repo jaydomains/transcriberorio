@@ -299,9 +299,11 @@ The problem it solves: you record a site walk, it uploads before you get to name
 lands as `Voice 260806_162219.m4a`. That is what it stays called, forever, and nothing in the
 record ever says which site it was.
 
-What it does about it: it reads the site out of the recording and works out what the note
-should be called, following how you already name them — `BEACH COURT`, `CANTERBURY`,
-`22 CHEPSTOW`. **It only ever touches a file still called `Voice <numbers>_<numbers>`.**
+What it does about it: it listens for what you say at the top — *"this is a site walk of
+Beach Court, general inspection"* — and titles the note the way you already name them:
+`BEACH COURT SITE WALK`. On the ones where you forgot to announce it, it goes by which site
+the conversation is mostly about instead. **It only ever touches a file still called
+`Voice <numbers>_<numbers>`.**
 Anything you named yourself is left completely alone, and so is a call, which your phone
 already names.
 
