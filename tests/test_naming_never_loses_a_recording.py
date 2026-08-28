@@ -237,7 +237,11 @@ SPOKEN_LINES = (
 
 #: What the record calls the site those words are about, and what the service would title it.
 EXPECTED_SITE = "canterbury-square"
-EXPECTED_NAME = "CANTERBURY"
+#: The site, then the date and time the way he writes them on his own files —
+#: ``BEACH COURT SITE WALK 270826``. Day-first, from the moment pinned on the row, which is
+#: the recorder's own clock rather than when OneDrive finished receiving the file.
+EXPECTED_SITE_NAME = "CANTERBURY"
+EXPECTED_NAME = "CANTERBURY 060826 1622"
 
 #: Long enough to clear ``NAMING_MIN_SECONDS`` and to make the word count plausible.
 DURATION_S = 300.0
@@ -506,7 +510,7 @@ class TheRealRecordIsWhatTheseTestsRunAgainst(unittest.TestCase):
             parsed=parsed, extraction=_extraction(), spoken=outputs.spoken_body(transcript),
             duration_s=DURATION_S, book=book,
             render=lambda name: outputs.render_transcript(replace(ctx, display_name=name)),
-            apply=True, min_seconds=120,
+            apply=True, min_seconds=120, recorded_at=recorded_at,
         )
         self.assertEqual(decided.code, "ok", decided.why)
         self.assertEqual(decided.name, EXPECTED_NAME)
@@ -1417,7 +1421,26 @@ class EightyRecordingsInOneMorning(unittest.TestCase):
         # The point of the burst test: this is the load, not a load of refusals that cost
         # nothing. All eighty went the whole way through the rule.
         named = [self.deployment.decision(f"V{i:03d}").get("name") for i in range(self.COUNT)]
-        self.assertEqual(named, [EXPECTED_NAME] * self.COUNT)
+        for name in named:
+            self.assertTrue(str(name).startswith(EXPECTED_SITE_NAME), name)
+
+    def test_the_eighty_names_are_eighty_different_names(self) -> None:
+        """What the time in the name buys, on the day it matters most.
+
+        Eighty recordings arrive in one morning, all from the same site — a burst across
+        eight staff is a normal Monday. Without the time they would be eighty documents in
+        that site's correspondence log all titled ``CANTERBURY``, which is a log nobody can
+        read and no way to say which one somebody means. With it they are eighty distinct
+        titles in the order they were recorded.
+
+        The files were never at risk of colliding — the output names carry a hash of the
+        item id for exactly that reason — but the TITLES are what a person reads, and they
+        were.
+        """
+        named = [self.deployment.decision(f"V{i:03d}").get("name") for i in range(self.COUNT)]
+        self.assertEqual(len(set(named)), self.COUNT)
+        # And they sort into the order they happened, because the stamp ends the name.
+        self.assertEqual(named, sorted(named))
 
     def test_no_recording_is_waiting_on_a_person(self) -> None:
         # Nothing in this feature asks him anything, by design. A queue of eighty questions
@@ -1467,7 +1490,7 @@ class EightyRecordingsInOneMorning(unittest.TestCase):
         # Never the record's slug. ``canterbury-square`` in his morning email is exactly the
         # kind of thing that makes a person stop reading it.
         self.assertNotIn(EXPECTED_SITE, body)
-        self.assertIn(EXPECTED_NAME, body)
+        self.assertIn(EXPECTED_SITE_NAME, body)
 
     def test_the_email_says_nothing_was_renamed_when_nothing_was(self) -> None:
         # From the DECISIONS, not from today's setting. He may have switched it on this

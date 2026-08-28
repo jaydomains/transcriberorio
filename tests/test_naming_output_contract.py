@@ -672,11 +672,13 @@ class ALongNameStillFitsTheSubjectLine(unittest.TestCase):
 
     #: Names at or near ``autoname``'s ceiling, in the shape speech actually produces:
     #: several words, none of them long. Built from real site titles in the record.
+    #: The ceiling moved from 60 to 66 when the date and time joined the name, so these
+    #: carry a stamp of their own — which is also the shape a real long name now has.
     LONG_NAMES = (
-        "MILTON COURT NORTH ELEVATION REMEDIAL WATERPROOFING PACKAGE",   # 59
-        "CANTERBURY SQUARE PHASE TWO REMEDIAL AND SCAFFOLDING WORKS",    # 58
-        "GARDEN ROUTE MALL ROOF REMEDIALS AND STORM DAMAGE MAKE GOOD",   # 59
-        "THE OVAL COLLINGTON AND FERNWOOD OFFICE WINDOW REPLACEMENT",    # 58
+        "MILTON COURT NORTH ELEVATION REMEDIAL WATERPROOFING 060826 1622",   # 63
+        "CANTERBURY SQUARE PHASE TWO SCAFFOLD AND SNAG WALKS 060826 1622",   # 63
+        "GARDEN ROUTE MALL ROOF REMEDIALS AND STORM MAKE GOOD 060826 1622",   # 64
+        "THE OVAL COLLINGTON AND FERNWOOD WINDOW REPLACEMENT 060826 1622",   # 63
     )
 
     def test_the_fixtures_really_are_at_the_ceiling(self) -> None:

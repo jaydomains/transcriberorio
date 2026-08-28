@@ -1207,6 +1207,9 @@ class Pipeline:
                 ),
                 apply=bool(getattr(self.config, "naming_apply", False)),
                 min_seconds=int(getattr(self.config, "naming_min_seconds", 120) or 120),
+                # The moment pinned on the row, so the date in the title is the same one the
+                # output filenames open with and cannot drift from it between attempts.
+                recorded_at=probe.recorded_at,
                 opening_seconds=float(
                     getattr(self.config, "naming_opening_seconds", 60) or 60
                 ),

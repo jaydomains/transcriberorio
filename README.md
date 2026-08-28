@@ -413,6 +413,16 @@ does not contain — and in testing that filed a walk at one site under a differ
 **It has to be what the recording is *about*, not merely something said in it.** Two ways to
 establish that, and a recording needs only one.
 
+The name it writes is his own shape with the moment on the end — `BEACH COURT SITE WALK
+060826 1622`. **Day-first**, because that is what is on his files (`BEACH COURT SITE WALK
+270826`, `AMIDAL SITE WALK 260826`), and deliberately the opposite way round from the
+`YYMMDD` the phone writes into `Voice 260806_162219`. The two are indistinguishable before
+the thirteenth of a month, which is exactly why the parser refuses to *read* either from a
+hand-typed name — but writing one is safe, because the moment comes from the recorder's own
+clock pinned to the row rather than from any text. The time earns its place on a burst
+morning: eighty recordings from one site would otherwise be eighty documents in that site's
+log all called `CANTERBURY`.
+
 *Declared* — he says at the top what it is: *"this is a site walk of Beach Court, general
 inspection."* That is him stating the answer, and it beats any amount of repetition. It is
 also where the activity word comes from, and the only place it may: scanning the whole
