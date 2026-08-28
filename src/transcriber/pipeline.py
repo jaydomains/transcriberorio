@@ -87,6 +87,7 @@ from .models import (
 )
 from .naming import TimestampUnavailable
 from .outputs import OutputContractError, UploadIncompleteError
+from .ratelimit import RateLimitShutdown
 
 __all__ = [
     "Pipeline",
@@ -807,6 +808,8 @@ class Pipeline:
 
     def _fail(self, row: Row, exc: BaseException, started: float) -> Outcome:
         """The only failure path: retry with backoff, or quarantine loudly."""
+        if isinstance(exc, _NOT_THE_RECORDINGS_FAULT):
+            return self._interrupted(row, exc, started)
         retryable, reason = _classify(exc)
         attempts = self.ledger.record_attempt(row.item_id, reason, owner=self.owner)
         current = self.ledger.get(row.item_id) or row
@@ -830,6 +833,35 @@ class Pipeline:
         log.warning("retrying", f"{reason}; next attempt in {delay:.0f}s",
                     attempts=attempts, retry_in_s=round(delay), exc_info=exc)
         return self._outcome(current, RESULT_RETRY, reason, started, attempts=attempts)
+
+    def _interrupted(self, row: Row, exc: BaseException, started: float) -> Outcome:
+        """An ending that costs the recording nothing: no attempt, no backoff, no quarantine.
+
+        The service stopping while a recording waited its turn at the engine rate limit is a
+        fault in nothing at all — the recording was never started. Counted as a failed
+        attempt it was three redeploys from being quarantined, and a quarantine needs a
+        person, so restarting the service during a backlog quietly took recordings out of
+        the queue. With ``CONCURRENCY`` at 8 and ``ENGINE_MAX_CONCURRENT`` at 3, five
+        recordings are queued at the limiter at any moment under load, so one stop charged
+        five of them at once. So: the claim goes straight back, the attempt count does not
+        move, and the row is claimable again the moment the service is up.
+        """
+        reason = (
+            f"the service stopped before this recording was started, so it has not been "
+            f"tried and nothing has been counted against it — it is still queued and the "
+            f"next run picks it up ({_plain(exc)})"
+        )
+        log.info("interrupted", reason, attempts=row.attempts)
+        try:
+            self.ledger.release(row.item_id, reason, owner=self.owner)
+        except LedgerError as exc_release:
+            raise PipelineFatal(
+                f"the ledger refused to release {row.item_id}: {exc_release}"
+            ) from exc_release
+        return self._outcome(
+            self.ledger.get(row.item_id) or row, RESULT_RETRY, reason, started,
+            attempts=row.attempts,
+        )
 
     def _quarantine(self, row: Row, reason: str, started: float) -> Outcome:
         log.error("quarantined", reason, state=row.state)
@@ -980,6 +1012,14 @@ _NEVER_RETRY = (
     TranscriptTooLarge,
     EngineAudioTooLarge,
 )
+
+#: Endings that are not about this recording at all, and cost it nothing: no attempt, no
+#: backoff, no quarantine. The service stopping while a recording was still queued behind
+#: the engine rate limit is the whole of this list — it was never started, so there is
+#: nothing to have failed. Deliberately NOT ``PipelineFatal``: an ordinary redeploy is not a
+#: service fault, and routing it that way would exit the worker non-zero and ping the
+#: heartbeat's failure endpoint every time somebody restarted the service.
+_NOT_THE_RECORDINGS_FAULT = (RateLimitShutdown,)
 
 #: Faults in the service: a credential, a configuration, or the durable state. These stop the
 #: worker rather than consuming the backlog.

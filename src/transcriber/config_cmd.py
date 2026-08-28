@@ -43,6 +43,7 @@ from typing import Any, Mapping
 
 from . import config as config_mod
 from .config import ENGINES, Config, ConfigError
+from .diskbudget import MINIMUM_WORK_DIR_MAX_BYTES, format_bytes, parse_bytes
 from .setup_wizard import load_env_file, mask, routes_from_values, write_env_file
 
 __all__ = [
@@ -155,10 +156,16 @@ GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("the morning email", (
         "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM", "SMTP_TO",
         "SMTP_STARTTLS", "DIGEST_HOUR", "HEARTBEAT_URL",
+        # What the email calls a backlog. Both are about wording, and the wording is most
+        # of the value: a queue read as failure is the confusion this service removes.
+        "QUEUE_STALE_HOURS", "STUCK_AFTER_HOURS",
     )),
-    ("where it keeps its notes", ("LEDGER_PATH", "WORK_DIR")),
+    ("where it keeps its notes", (
+        "LEDGER_PATH", "WORK_DIR", "WORK_DIR_MAX_BYTES", "WORK_DIR_KEEP_FINISHED_HOURS",
+    )),
     ("timing", (
         "POLL_INTERVAL_S", "SETTLE_INTERVAL_S", "LEASE_SECONDS", "CONCURRENCY",
+        "ENGINE_MAX_CONCURRENT", "ENGINE_MAX_PER_MINUTE",
         "MAX_ATTEMPTS", "ARCHIVE_AGE_DAYS", "SWEEP_HOUR", "ARCHIVE_DAY_OF_MONTH", "TIMEZONE",
     )),
     ("what it expects to hear", ("LANGUAGES", "VOCABULARY", "VOCABULARY_FILE")),
@@ -190,6 +197,9 @@ _RULES: dict[str, dict[str, Any]] = {
     "SETTLE_INTERVAL_S": {"minimum": 1},
     "LEASE_SECONDS": {"minimum": 1},
     "CONCURRENCY": {"minimum": 1, "maximum": 32},
+    "WORK_DIR_KEEP_FINISHED_HOURS": {"minimum": 1, "maximum": 8760},
+    "ENGINE_MAX_CONCURRENT": {"minimum": 1, "maximum": 32},
+    "ENGINE_MAX_PER_MINUTE": {"minimum": 0, "maximum": 10000},
     "MAX_ATTEMPTS": {"minimum": 1, "maximum": 20},
     "ARCHIVE_AGE_DAYS": {"minimum": 1},
     "HTTP_TIMEOUT_S": {"minimum": 1},
@@ -238,7 +248,7 @@ def _build_settings() -> dict[str, Setting]:
             minimum=rules.get("minimum"),
             maximum=rules.get("maximum"),
             required=required,
-            default="" if required else _default_text(var.default),
+            default="" if required else _default_text(var.default, var.kind),
         )
     for extra in _EXTRA:
         rules = _RULES.get(extra.name, {})
@@ -257,7 +267,10 @@ def _build_settings() -> dict[str, Setting]:
     return out
 
 
-def _default_text(value: Any) -> str:
+def _default_text(value: Any, kind: str = "str") -> str:
+    if kind == "bytes":
+        # 4294967296 is a true answer to "what does it use?" and a useless one to read.
+        return format_bytes(value)
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (tuple, list)):
@@ -354,6 +367,24 @@ def check_value(name: str, raw: str, env: Mapping[str, str]) -> str:
             return (
                 f"{name}={number} is above the largest usable value, {setting.maximum} — "
                 f"{setting.description}"
+            )
+
+    if setting.kind == "bytes":
+        # Both of the rules ``Config.from_env`` applies, applied here as well. Without them
+        # this command writes a size the next start refuses — a service that will not come
+        # back up after a restart, discovered whenever the next restart happens to be. That
+        # is precisely the 06:00-on-a-Tuesday discovery `config set` exists to prevent.
+        try:
+            size = parse_bytes(value)
+        except ValueError as exc:
+            return f"{name}={value!r} is not a size — {exc}"
+        if 0 < size < MINIMUM_WORK_DIR_MAX_BYTES:
+            return (
+                f"{name}={format_bytes(size)} is smaller than one ordinary recording needs "
+                f"to be transcribed — an hour-long call is around 58 MB, and it is "
+                f"downloaded and then split into pieces beside itself. The smallest "
+                f"workable value is {format_bytes(MINIMUM_WORK_DIR_MAX_BYTES)}; 0 turns the "
+                f"limit off altogether."
             )
 
     if setting.kind == "bool" and value.lower() not in (

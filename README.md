@@ -227,6 +227,102 @@ is watched, what is written, or what is in the ledger changes.
 
 ---
 
+## Running it for a team
+
+One person recording a few calls a day needs none of this: the settings below already have
+the right values for that, and nothing changes until you turn them up. It matters the day
+eight people are each recording into their own folder, because eighty files can arrive
+between one check of OneDrive and the next.
+
+**The rule the whole service is built on: when it is busy, it slows down. It never drops
+anything.** A recording that cannot be started right now is still in OneDrive, still in the
+queue, and still gets transcribed — later, not never. There is no setting anywhere here
+that can make it throw work away.
+
+### The four things that hold it steady
+
+**How many recordings the machine works on at once — `CONCURRENCY`.** This is about the
+computer: disk, memory, and how much audio it can chew at the same time. Two is right for
+one person. For eight people on a proper server, try four to eight.
+
+**How hard the transcription service is pushed — `ENGINE_MAX_CONCURRENT` and
+`ENGINE_MAX_PER_MINUTE`.** This is a different number about a different thing: your
+transcription provider has its own limits, and eight recordings uploaded at once will hit
+them however powerful your machine is. Three at a time is the default and is safe with every
+provider. `ENGINE_MAX_PER_MINUTE` is off by default because the right number is on your
+provider's account page; if the log starts mentioning being throttled, set it to whatever
+they allow. When the limit is reached the service simply waits its turn.
+
+**How much disk the scratch space may use — `WORK_DIR_MAX_BYTES` and
+`WORK_DIR_KEEP_FINISHED_HOURS`.** Every recording is downloaded before it is transcribed,
+and an hour-long call is about 58 MB — plus, if it is too long for the provider to take in
+one piece, the pieces it is cut into. Eight of those at once is gigabytes. The default of
+4 GiB is comfortable for one person and fine for eight on a normal server; on a small VM
+with a 20 GB disk, 4 GiB is still the right answer, and what you must not do is set it to 0,
+which means "no limit" and eventually means "full disk". When the scratch space is full the
+service starts nothing new and says so in the morning email, and the queue starts moving
+again as recordings finish.
+
+The second setting is the clean-up. When a recording fails, its audio is kept so that a
+retry does not download it again and so you can listen to what went wrong; after two days it
+is cleared away. Leave it alone unless the disk is very small, in which case 12 or 24 hours
+is fine. The recordings themselves, in OneDrive, are never touched by any of this.
+
+**Where a folder is in the queue — nothing to set.** The service takes a turn from each
+person's folder in rotation, so somebody who uploads forty files in one morning does not
+bury the seven colleagues behind them. It happens by itself.
+
+### What to turn up when more people are added
+
+| Situation | Change |
+| --- | --- |
+| More people, and the queue is growing day after day | `CONCURRENCY` up first (4, then 8), then `ENGINE_MAX_CONCURRENT` to match |
+| The log mentions being throttled or refused by the transcription provider | Set `ENGINE_MAX_PER_MINUTE` to the number your provider allows, and leave `ENGINE_MAX_CONCURRENT` at 3 |
+| The morning email says the work directory is full | Either the disk is genuinely small — raise `WORK_DIR_MAX_BYTES` — or something failed and left its audio behind, which clears itself after two days |
+| One recording is refused **by name** for being too large | Only that one setting can fix it: raise `WORK_DIR_MAX_BYTES` past the size the message names |
+| Everything is fine and you added a person | Nothing. Add the route and carry on |
+
+### What the morning email tells you about a backlog
+
+The email counts what is **queued**, and a queue is not a loss. This is the whole point:
+
+```
+THE QUEUE
+  42 recording(s) queued and being worked through (3 being worked on right now).
+  Nothing here is lost or missing: each one has a row in the ledger and will be
+  transcribed.
+
+    Phone calls (calls): 39 queued, 3 being worked on now, oldest waiting 40 minutes
+    Site meetings (site-meetings): 3 queued, oldest waiting 12 minutes
+    nothing queued on: WhatsApp voice notes (whatsapp)
+
+  Longest in the queue: Call Nicholas Burgers_260827_141500.m4a, first seen 40 minutes ago.
+```
+
+"Queued" means the service knows about those recordings, has them written down, and has not
+transcribed them yet. Nothing in that state can be lost: they are still in OneDrive, and the
+ledger already has a row for each. What you are watching for is not the number but the
+**age** and the **direction**:
+
+- **A big number that shrinks by the next morning** is a busy morning. Ignore it.
+- **The oldest waiting far longer than anything should**, or **the number bigger every
+  morning for several days**, means the service genuinely cannot keep up: it is not busy, it
+  is behind. The email says so in those words — *"that is longer than anything should sit in
+  this queue, so the queue is not moving as fast as recordings are arriving"* — rather than
+  leaving you to compare numbers between mornings. That is when you turn `CONCURRENCY` up,
+  or ask the provider for a higher limit.
+- **A line about the work directory** — "no new recording is being started until some of that
+  clears" — means the disk is the thing holding it up, not the transcription provider.
+- **Anything marked "needs you"** is the one kind that will not resolve itself.
+
+You can ask at any time, without waiting for the morning:
+
+```
+transcriber status        # per folder: known, done, failed, queued, and how long the oldest has waited
+```
+
+---
+
 ## Running it
 
 Python 3.11 or newer. **There is nothing to install** — every import is from Python's own
@@ -364,10 +460,14 @@ no prior notice of any kind. One date turns a cliff into a countdown.
 | --- | --- |
 | `LEDGER_PATH` | **REQUIRED.** The SQLite file that remembers every recording. No default on purpose: two ledgers is the same as none. Back this up. |
 | `WORK_DIR` | Scratch space for downloads. **Put this on a real disk owned by the service account, not in `/tmp`** — it holds the raw audio of confidential conversations. The service creates it readable only by itself. |
+| `WORK_DIR_MAX_BYTES` | How much scratch `WORK_DIR` may hold before the service stops starting new recordings. Default `4GiB`. Written as `4GiB`, `500MB` or a plain number of bytes. Nothing is dropped when it is reached: the queue waits and starts moving again as recordings finish. `0` means no limit, which on a small disk eventually means a full one. |
+| `WORK_DIR_KEEP_FINISHED_HOURS` | How long the downloaded audio of a finished or failed recording is kept before it is cleared away. Default 48. A failure keeps its audio so a retry is cheap and so you can hear what went wrong; without an end to that, failures fill the disk. The recordings in OneDrive are never touched. |
 | `POLL_INTERVAL_S` | Seconds between checks of the OneDrive change feed. Default 120. |
 | `SETTLE_INTERVAL_S` | How long to wait between the two size readings that decide an upload has finished. Default 60. |
 | `LEASE_SECONDS` | How long one worker's hold on a recording lasts. Must be longer than `SETTLE_INTERVAL_S`. Default 900. |
-| `CONCURRENCY` | Recordings handled at once. Default 2. |
+| `CONCURRENCY` | Recordings handled at once. Default 2. About **the machine** — disk, memory, ffprobe. See **Running it for a team**. |
+| `ENGINE_MAX_CONCURRENT` | Transcriptions in flight at the provider at once, across every folder and every thread. Default 3. About **the provider's limits**, which are not the machine's. |
+| `ENGINE_MAX_PER_MINUTE` | Transcription requests started per minute, across every folder. Default 0, meaning no per-minute limit. Set it to the number your provider allows if the log mentions being throttled. Reaching it makes the service wait, never skip. |
 | `MAX_ATTEMPTS` | Failures before a recording is set aside for a person. Default 3. |
 | `ARCHIVE_AGE_DAYS` | Age at which a finished recording's original is moved to the archive folder. Default 60. Failures are never moved and nothing is ever deleted. |
 | `SWEEP_HOUR` | Local hour of the nightly re-check. Default 1. |

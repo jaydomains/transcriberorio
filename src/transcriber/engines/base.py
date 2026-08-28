@@ -6,7 +6,7 @@ badly. The same argument applies to the retry rules — an engine that invents i
 backoff is an engine that throttles differently from the rest of the pipeline for reasons
 nobody can find later.
 
-Two properties are deliberate and load-bearing.
+Three properties are deliberate and load-bearing.
 
 **Nothing degrades quietly.** A request that cannot be made raises. A response that cannot
 be understood raises. Where a call is retried after dropping an optional hint, the fact is
@@ -16,6 +16,13 @@ produced with less help than intended, rather than looking identical to one that
 **No secret and no address reaches an exception, a log line or a metadata dict.** Error
 bodies are scrubbed of every configured secret before they are allowed into an exception
 message, because an engine's 401 body routinely echoes the key that failed.
+
+**No engine can be outside the rate limit.** ``ENGINE_MAX_CONCURRENT`` and
+``ENGINE_MAX_PER_MINUTE`` are enforced here, in the client every engine's requests go
+through and around the ``transcribe`` of every engine this module builds, rather than in
+each engine — where the fourth one would eventually be written without it. The limiter is
+about not provoking a provider's limit; the ``RetryPolicy`` below is about obeying it when
+it is hit anyway. They are separate on purpose and neither replaces the other.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ from http.client import HTTPException
 from typing import Any, BinaryIO, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from ..models import Hints, Segment, Transcript, strip_emails
+from ..ratelimit import RateLimiter, configure_shared, shared_limiter
 
 __all__ = [
     "EngineError",
@@ -51,6 +59,8 @@ __all__ = [
     "Response",
     "RetryPolicy",
     "HttpClient",
+    "LimitedEngine",
+    "engine_limiter",
     "FilePart",
     "MultipartBody",
     "USER_AGENT",
@@ -178,8 +188,63 @@ def registered_engines() -> tuple[str, ...]:
     return tuple(sorted(_REGISTRY))
 
 
+class LimitedEngine:
+    """An engine that holds a concurrency slot for the whole of one transcription.
+
+    The HTTP client is limited too, but per request, and that is not the same statement:
+    Azure's batch API submits a job and then polls it for half an hour, so limiting only its
+    requests would let eight recordings be in the air at an engine configured for three.
+    Holding the slot around ``transcribe`` is what makes ``ENGINE_MAX_CONCURRENT`` mean
+    "recordings at this provider at once" for all three engines rather than for two of them.
+
+    It is a wrapper and not a base class because engines satisfy a Protocol rather than
+    inherit anything, and a base class is exactly the sort of thing a fourth engine could be
+    written without. Everything the engine exposes is forwarded, so the Azure content-URL
+    provider and ``max_bytes`` reach their engine unchanged.
+    """
+
+    def __init__(self, engine: Engine, limiter: RateLimiter) -> None:
+        self.engine = engine
+        self.limiter = limiter
+
+    @property
+    def name(self) -> str:
+        return self.engine.name
+
+    @property
+    def max_bytes(self) -> int | None:
+        return self.engine.max_bytes
+
+    def transcribe(self, path: str, hints: Hints) -> Transcript:
+        with self.limiter.slot():
+            return self.engine.transcribe(path, hints)
+
+    def __getattr__(self, item: str) -> Any:
+        # Reached only for attributes this wrapper does not define — with_content_url_provider,
+        # a model name, whatever a later engine grows. Guarded against the half-built case so
+        # a failure in __init__ raises AttributeError rather than recursing.
+        try:
+            engine = object.__getattribute__(self, "engine")
+        except AttributeError:
+            raise AttributeError(item) from None
+        return getattr(engine, item)
+
+    def __repr__(self) -> str:
+        return f"LimitedEngine({self.engine!r}, {self.limiter.describe()})"
+
+
+def engine_limiter(config: Any) -> RateLimiter:
+    """The shared limiter, pointed at this configuration. Never raises."""
+    return configure_shared(config)
+
+
 def engine_for_name(name: str, config: Any) -> Engine:
-    """Build one engine by name, or fail naming every engine that does exist."""
+    """Build one engine by name, or fail naming every engine that does exist.
+
+    Every engine leaves here inside a :class:`LimitedEngine`. This is the one construction
+    path the service uses, so the rate limit is not something a caller remembers to apply —
+    it is a property of having an engine at all.
+    """
     key = (name or "").strip().lower()
     factory = _REGISTRY.get(key)
     if factory is None:
@@ -187,7 +252,8 @@ def engine_for_name(name: str, config: Any) -> Engine:
             f"no transcription engine named {name!r} — registered engines are: "
             + (", ".join(registered_engines()) or "(none)")
         )
-    return factory(config)
+    limiter = engine_limiter(config)
+    return LimitedEngine(factory(config), limiter)
 
 
 def create_engine(config: Any, name: str | None = None) -> Engine:
@@ -461,6 +527,7 @@ class HttpClient:
         opener: urllib.request.OpenerDirector | None = None,
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
+        limiter: RateLimiter | None = None,
     ) -> None:
         self.timeout_s = int(timeout_s)
         self.policy = policy or RetryPolicy()
@@ -469,6 +536,12 @@ class HttpClient:
         self._opener = opener or urllib.request.build_opener()
         self._sleep = sleep
         self._rng = rng or random.Random()
+        #: The process-wide engine limiter unless a caller hands over its own. Defaulted
+        #: rather than injected because an engine that built its own client without one
+        #: would be an engine outside the rate limit, and there must not be one of those.
+        #: The analysis pass borrows this client too, so its calls are paced by the same
+        #: budget; a caller that wants its own passes its own ``RateLimiter`` here.
+        self.limiter = limiter if limiter is not None else shared_limiter()
 
     # -- redaction ---------------------------------------------------------------
 
@@ -510,81 +583,91 @@ class HttpClient:
         attempts = max_attempts or self.policy.max_attempts
         last_status = 0
         last_body = ""
-        for attempt in range(1, attempts + 1):
-            data: Any = body
-            stream: BinaryIO | None = None
-            if multipart is not None:
-                stream = multipart.open()
-                data = stream
-            request = urllib.request.Request(url, data=data, method=method.upper())
-            for key, value in base_headers.items():
-                request.add_header(key, value)
-            try:
-                with self._opener.open(request, timeout=self.timeout_s) as handle:
-                    payload = handle.read()
-                    response = Response(
-                        status=handle.status,
-                        headers={k.lower(): v for k, v in handle.headers.items()},
-                        body=payload,
-                        url=url,
-                    )
-                if response.status in expected:
-                    return response
-                last_status, last_body = response.status, self.scrub(response.text()[:600])
-                retry_after = parse_retry_after(response.headers.get("retry-after"))
-            except urllib.error.HTTPError as exc:
-                payload = b""
+        # Outside the retry loop on purpose: the limiter's job is to avoid provoking a
+        # rate limit, and the backoff below is what obeys the provider when it says no
+        # anyway. Neither replaces the other, and the slot is held across a backoff so a
+        # throttled request cannot be overtaken by three more of the same.
+        with self.limiter.slot():
+            for attempt in range(1, attempts + 1):
+                # One token per attempt, not per call: a retry is another request as far
+                # as the provider's per-minute allowance is concerned, and counting it as
+                # nothing is how a retry storm walks straight into the limit it is
+                # backing off from.
+                self.limiter.take_token()
+                data: Any = body
+                stream: BinaryIO | None = None
+                if multipart is not None:
+                    stream = multipart.open()
+                    data = stream
+                request = urllib.request.Request(url, data=data, method=method.upper())
+                for key, value in base_headers.items():
+                    request.add_header(key, value)
                 try:
-                    payload = exc.read()
-                except Exception:  # the body is a courtesy; its absence is not the failure
+                    with self._opener.open(request, timeout=self.timeout_s) as handle:
+                        payload = handle.read()
+                        response = Response(
+                            status=handle.status,
+                            headers={k.lower(): v for k, v in handle.headers.items()},
+                            body=payload,
+                            url=url,
+                        )
+                    if response.status in expected:
+                        return response
+                    last_status, last_body = response.status, self.scrub(response.text()[:600])
+                    retry_after = parse_retry_after(response.headers.get("retry-after"))
+                except urllib.error.HTTPError as exc:
                     payload = b""
-                last_status = exc.code
-                last_body = self.scrub(payload.decode("utf-8", "replace")[:600])
-                if exc.code in (401, 403):
-                    raise EngineAuthError(
-                        f"{redact_url(url)} rejected the credential with {exc.code}. "
-                        f"Provider said: {last_body or '(no body)'}"
-                    ) from None
-                if exc.code not in RETRYABLE_STATUSES:
-                    raise EngineHTTPError(
-                        f"{method.upper()} {redact_url(url)} failed with {exc.code}: "
-                        f"{last_body or '(no body)'}",
-                        status=exc.code,
-                        url=url,
-                        body=last_body,
-                        attempts=attempt,
-                    ) from None
-                retry_after = parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
-            except (urllib.error.URLError, HTTPException, socket.timeout, ConnectionError, OSError) as exc:
+                    try:
+                        payload = exc.read()
+                    except Exception:  # the body is a courtesy; its absence is not the failure
+                        payload = b""
+                    last_status = exc.code
+                    last_body = self.scrub(payload.decode("utf-8", "replace")[:600])
+                    if exc.code in (401, 403):
+                        raise EngineAuthError(
+                            f"{redact_url(url)} rejected the credential with {exc.code}. "
+                            f"Provider said: {last_body or '(no body)'}"
+                        ) from None
+                    if exc.code not in RETRYABLE_STATUSES:
+                        raise EngineHTTPError(
+                            f"{method.upper()} {redact_url(url)} failed with {exc.code}: "
+                            f"{last_body or '(no body)'}",
+                            status=exc.code,
+                            url=url,
+                            body=last_body,
+                            attempts=attempt,
+                        ) from None
+                    retry_after = parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+                except (urllib.error.URLError, HTTPException, socket.timeout, ConnectionError, OSError) as exc:
+                    if attempt >= attempts:
+                        raise EngineTransportError(
+                            f"{method.upper()} {redact_url(url)} never completed after {attempt} "
+                            f"attempt(s): {self.scrub(str(exc))}",
+                            url=url,
+                            attempts=attempt,
+                        ) from exc
+                    delay = self.policy.backoff(attempt, self._rng)
+                    log.warning(
+                        "%s %s failed at the transport (%s); retrying in %.1fs (attempt %d/%d)",
+                        method.upper(), redact_url(url), self.scrub(str(exc)), delay, attempt, attempts,
+                    )
+                    self._sleep(delay)
+                    continue
+                finally:
+                    if stream is not None:
+                        stream.close()
+
+                # A retryable status. Either wait as instructed, or back off.
                 if attempt >= attempts:
-                    raise EngineTransportError(
-                        f"{method.upper()} {redact_url(url)} never completed after {attempt} "
-                        f"attempt(s): {self.scrub(str(exc))}",
-                        url=url,
-                        attempts=attempt,
-                    ) from exc
-                delay = self.policy.backoff(attempt, self._rng)
+                    break
+                delay = self._delay_for(last_status, retry_after, attempt)
+                if delay is None:
+                    break
                 log.warning(
-                    "%s %s failed at the transport (%s); retrying in %.1fs (attempt %d/%d)",
-                    method.upper(), redact_url(url), self.scrub(str(exc)), delay, attempt, attempts,
+                    "%s %s returned %d; retrying in %.1fs (attempt %d/%d)",
+                    method.upper(), redact_url(url), last_status, delay, attempt, attempts,
                 )
                 self._sleep(delay)
-                continue
-            finally:
-                if stream is not None:
-                    stream.close()
-
-            # A retryable status. Either wait as instructed, or back off.
-            if attempt >= attempts:
-                break
-            delay = self._delay_for(last_status, retry_after, attempt)
-            if delay is None:
-                break
-            log.warning(
-                "%s %s returned %d; retrying in %.1fs (attempt %d/%d)",
-                method.upper(), redact_url(url), last_status, delay, attempt, attempts,
-            )
-            self._sleep(delay)
 
         raise EngineHTTPError(
             f"{method.upper()} {redact_url(url)} still failing with {last_status} after "

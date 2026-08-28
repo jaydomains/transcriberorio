@@ -43,11 +43,12 @@ quietly would be the worst outcome available.
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import smtplib
 import ssl
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from typing import Any, Callable, Mapping, Sequence
@@ -55,7 +56,9 @@ from typing import Any, Callable, Mapping, Sequence
 from .heartbeat import Heartbeat, PingResult
 from .ledger import Ledger
 from .models import (
+    DEFAULT_ROUTE,
     DigestCounts,
+    Row,
     State,
     contains_email,
     strip_dictated_emails,
@@ -70,6 +73,17 @@ log = logging.getLogger("transcriber.digest")
 __all__ = [
     "Digest",
     "RouteDigest",
+    "RouteQueue",
+    "QueueReport",
+    "queue_report",
+    "queue_history",
+    "record_queue_depth",
+    "human_duration",
+    "QUEUE_DEPTH_MARK",
+    "QUEUE_STALE_AFTER_S",
+    "STUCK_AFTER_S",
+    "WORK_DIR_MARK",
+    "WORK_DIR_REFUSED_MARK",
     "credential_warnings",
     "SendResult",
     "DigestResult",
@@ -79,6 +93,7 @@ __all__ = [
     "should_run",
     "mark_run",
     "subject_for",
+    "split_stopped_from_queued",
     "plain_reason",
     "DIGEST_DAY_MARK",
     "DIGEST_ATTEMPT_MARK",
@@ -93,6 +108,432 @@ DIGEST_ERROR_MARK = "digest:last_error"
 RETRY_AFTER_S = 900.0
 
 _RULE = "-" * 62
+
+#: Where the queue depth from each morning is kept, so "is it growing?" can be answered
+#: rather than guessed. A small JSON map of day -> how many were queued that morning.
+QUEUE_DEPTH_MARK = "queue:depth_by_day"
+#: Enough history to see a week-long trend and no more; this is a hint, not a metrics store.
+QUEUE_HISTORY_DAYS = 14
+#: A recording still queued a day after it arrived is not a busy morning any more. Under
+#: ``QUEUE_STALE_HOURS`` if a deployment sets one.
+QUEUE_STALE_AFTER_S = 24 * 3600.0
+
+#: How long an unfinished recording may sit before the subject line calls it FAILED rather
+#: than queued. The distinction is age, not state: eighty recordings landing at 17:00 are
+#: still legitimately in hand at 06:00, while one that arrived before lunch and has not
+#: moved has stopped in all but name. Six hours is comfortably longer than any real drain
+#: at this volume and comfortably shorter than a working day, so a genuinely stuck file is
+#: named the same morning rather than the next one.
+STUCK_AFTER_S = 6 * 3600.0
+
+#: What the worker wrote about the work directory on its last drain, and the recordings it
+#: cannot start at all until a size is raised. Written by ``worker.WORK_DIR_NOTE`` and
+#: ``worker.WORK_DIR_REFUSED``; read here by name rather than by import, because the worker
+#: pulls in the pipeline and every engine behind it and the digest is built from a ledger
+#: and nothing else. ``test_capacity_reporting`` asserts the two names have not drifted.
+WORK_DIR_MARK = "worker:work_dir"
+WORK_DIR_REFUSED_MARK = "worker:work_dir_refused"
+
+
+# --------------------------------------------------------------------------- the queue
+
+
+def human_duration(seconds: float) -> str:
+    """A wait a person can read. Never "0:00:00", never a float with six decimal places."""
+    total = max(0.0, float(seconds))
+    if total < 90:
+        return f"{int(total)} second{'' if int(total) == 1 else 's'}"
+    if total < 5400:
+        minutes = int(round(total / 60.0))
+        return f"{minutes} minute{'' if minutes == 1 else 's'}"
+    if total < 172800:
+        return f"{total / 3600.0:.1f} hours"
+    return f"{total / 86400.0:.1f} days"
+
+
+@dataclass(frozen=True)
+class RouteQueue:
+    """One route's share of the work in hand."""
+
+    name: str
+    label: str = ""
+    queued: int = 0
+    #: Of those, the ones a worker is holding right now. The rest are waiting their turn.
+    started: int = 0
+    oldest_at: str = ""
+    oldest_name: str = ""
+    oldest_age_s: float = 0.0
+
+    @property
+    def display(self) -> str:
+        label = (self.label or "").strip()
+        return f"{label} ({self.name})" if label and label != self.name else self.name
+
+    def line(self) -> str:
+        if not self.queued:
+            return f"{self.display}: nothing queued"
+        being = f", {self.started} being worked on now" if self.started else ""
+        return (
+            f"{self.display}: {self.queued} queued{being}, "
+            f"oldest waiting {human_duration(self.oldest_age_s)}"
+        )
+
+
+@dataclass(frozen=True)
+class QueueReport:
+    """How much work is in hand, per route, and whether it is piling up.
+
+    This exists because a backlog and a loss look identical from outside, and that
+    confusion is the whole disease this service was built to cure. "42 queued, working
+    through them" and "42 missing" are the same forty-two recordings to anyone reading a
+    total, and they are completely different mornings.
+
+    Nothing here is a failure. Every recording counted below is in the ledger, with a row
+    of its own, and will be transcribed. The two things that *are* worth saying out loud
+    are the age of the oldest one and whether the number is bigger than it was yesterday —
+    together they are the difference between "busy" and "not keeping up".
+    """
+
+    day: str = ""
+    queued: int = 0
+    started: int = 0
+    routes: tuple[RouteQueue, ...] = ()
+    oldest_at: str = ""
+    oldest_name: str = ""
+    oldest_route: str = ""
+    oldest_age_s: float = 0.0
+    previous_day: str = ""
+    previous_queued: int | None = None
+    #: The last few mornings' depths, oldest first, as (day, queued). Two rises in a row is
+    #: a trend; one morning bigger than the last is a Tuesday.
+    history: tuple[tuple[str, int], ...] = ()
+    stale_after_s: float = QUEUE_STALE_AFTER_S
+    #: Why the drain is pacing itself, when it is: the work directory is at its budget, or
+    #: this cycle's recordings did not all fit in what is left. Empty on an ordinary day.
+    #: Without this the queue section says how much is waiting and never says why nothing
+    #: is moving, which reads as a service that has died rather than one that is full.
+    work_dir: str = ""
+    #: Recordings that cannot be started at any time, because one of them alone needs more
+    #: scratch space than the whole budget. The one thing here that needs a person.
+    work_dir_refused: str = ""
+    #: Set when the ledger could not be counted. The digest still goes out; it says this
+    #: instead of quietly printing a zero, which would read as "nothing is waiting".
+    unavailable: str = ""
+
+    @property
+    def empty(self) -> bool:
+        return self.queued == 0 and not self.unavailable
+
+    @property
+    def stale(self) -> bool:
+        """The oldest has been waiting longer than a queue that is moving ever should."""
+        return self.queued > 0 and self.oldest_age_s > self.stale_after_s
+
+    @property
+    def growing(self) -> bool:
+        """Deeper than it was when the last digest went out."""
+        return (
+            self.queued > 0
+            and self.previous_queued is not None
+            and self.queued > self.previous_queued
+        )
+
+    @property
+    def growing_across_days(self) -> bool:
+        """Deeper every morning for three mornings running, this one included.
+
+        One morning bigger than the last is an ordinary Tuesday — eight people record more
+        on some days than others. Three in a row that each grew is arithmetic: less is
+        going out than is coming in, and that gap does not close by itself.
+        """
+        points = [count for _, count in self.history[-2:]] + [self.queued]
+        if len(points) < 3:
+            return False
+        return all(later > earlier for earlier, later in zip(points, points[1:]))
+
+    @property
+    def short_of_throughput(self) -> bool:
+        """Not "busy" — genuinely not keeping up, and worth a person's attention."""
+        return self.queued > 0 and (self.stale or self.growing_across_days)
+
+    def headline(self) -> str:
+        if self.unavailable:
+            return "The queue could not be counted this morning."
+        if not self.queued:
+            return "Nothing is queued: everything that has arrived has been dealt with."
+        being = f" ({self.started} being worked on right now)" if self.started else ""
+        return (
+            f"{self.queued} recording(s) queued and being worked through{being}. "
+            f"Nothing here is lost or missing: each one has a row in the ledger and will "
+            f"be transcribed."
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "queued": self.queued,
+            "started": self.started,
+            "oldest_at": self.oldest_at,
+            "oldest_name": self.oldest_name,
+            "oldest_route": self.oldest_route,
+            "oldest_age_s": round(self.oldest_age_s, 1),
+            "oldest_age": human_duration(self.oldest_age_s) if self.queued else "",
+            "previous_day": self.previous_day,
+            "previous_queued": self.previous_queued,
+            "stale": self.stale,
+            "work_dir": self.work_dir,
+            "work_dir_refused": self.work_dir_refused,
+            "growing": self.growing,
+            "growing_across_days": self.growing_across_days,
+            "history": [list(point) for point in self.history],
+            "unavailable": self.unavailable,
+            "routes": [
+                {
+                    "route": r.name,
+                    "label": r.label,
+                    "queued": r.queued,
+                    "started": r.started,
+                    "oldest_at": r.oldest_at,
+                    "oldest_age_s": round(r.oldest_age_s, 1),
+                }
+                for r in self.routes
+            ],
+        }
+
+    def lines(self) -> list[str]:
+        """The section as it is read: the count first, then the routes, then the warning."""
+        out: list[str] = []
+        if self.unavailable:
+            for chunk in _wrap(
+                f"The queue could not be counted this morning: {self.unavailable}. That is a "
+                f"fault in this report, not in the recordings — run `transcriber status`."
+            ):
+                out.append(f"  {chunk}")
+            return out
+
+        for chunk in _wrap(self.headline()):
+            out.append(f"  {chunk}")
+
+        # Before the per-route breakdown, because it is the answer to the question the
+        # breakdown provokes: "why is that number not going down?". Both of these are the
+        # worker's own words from its last drain, so the email says what the log says.
+        if self.work_dir:
+            out.append("")
+            for chunk in _wrap(f"Why the queue is moving slowly: {self.work_dir}"):
+                out.append(f"  {chunk}")
+        if self.work_dir_refused:
+            out.append("")
+            for chunk in _wrap(
+                "One or more recordings cannot be started at all until a size is raised, "
+                "however long they wait: " + self.work_dir_refused
+            ):
+                out.append(f"  {chunk}")
+
+        if not self.queued:
+            return out
+
+        out.append("")
+        for entry in self.routes:
+            if entry.queued:
+                out.append(f"    {entry.line()}")
+        quiet = [entry.display for entry in self.routes if not entry.queued]
+        if quiet:
+            out.append(f"    nothing queued on: {', '.join(quiet)}")
+        out.append("")
+
+        if self.oldest_name:
+            out.append(
+                f"  Longest in the queue: {self.oldest_name}, first seen "
+                f"{human_duration(self.oldest_age_s)} ago."
+            )
+        if self.stale:
+            for chunk in _wrap(
+                f"That is longer than anything should sit in this queue "
+                f"(over {human_duration(self.stale_after_s)}), so the queue is not moving "
+                f"as fast as recordings are arriving."
+            ):
+                out.append(f"  {chunk}")
+        if self.previous_queued is not None:
+            direction = (
+                "longer than" if self.queued > self.previous_queued
+                else "shorter than" if self.queued < self.previous_queued
+                else "the same length as"
+            )
+            out.append(
+                f"  The queue was {self.previous_queued} when the {self.previous_day} email "
+                f"went out, so it is {direction} it was."
+            )
+        if self.growing_across_days:
+            out.append(
+                "  It has grown every morning for three mornings running."
+            )
+        if self.short_of_throughput:
+            out.append("")
+            for chunk in _wrap(
+                "This is the one thing in this section worth acting on: the queue is not "
+                "just busy, it is not keeping up. Recordings are arriving faster than they "
+                "are being transcribed, so the wait gets longer every day until either the "
+                "number of recordings drops or the service is given more capacity — more "
+                "workers, or a higher engine limit. Nothing is being lost while that is "
+                "true: every recording here is in the ledger and will be transcribed. It "
+                "is only getting slower."
+            ):
+                out.append(f"  {chunk}")
+        return out
+
+
+def queue_history(ledger: Ledger) -> dict[str, int]:
+    """How deep the queue was on each of the last few mornings. Never raises."""
+    try:
+        raw = ledger.cursor_get(QUEUE_DEPTH_MARK) or ""
+    except Exception as exc:  # noqa: BLE001 - the digest must be sendable from a sick ledger
+        log.warning("could not read the queue history: %s", exc)
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except ValueError:
+        log.warning("the stored queue history is not readable JSON; starting a new one")
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    out: dict[str, int] = {}
+    for day, value in loaded.items():
+        try:
+            out[str(day)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def record_queue_depth(ledger: Ledger, day: str, queued: int) -> None:
+    """Write this morning's depth down, so tomorrow's email can say whether it grew.
+
+    Called by :func:`run` and not by :func:`build`: building a digest is a read, and a
+    ``status`` or a dry run that quietly rewrote the history would make "it is growing"
+    depend on who looked.
+    """
+    if not day:
+        return
+    history = queue_history(ledger)
+    history[str(day)] = int(queued)
+    for stale in sorted(history)[:-QUEUE_HISTORY_DAYS]:
+        history.pop(stale, None)
+    try:
+        ledger.cursor_set(QUEUE_DEPTH_MARK, json.dumps(history, sort_keys=True))
+    except Exception as exc:  # noqa: BLE001 - nothing about the digest depends on this write
+        log.warning("could not record the queue depth for %s: %s", day, exc)
+
+
+def queue_report(
+    config: Any,
+    ledger: Ledger,
+    *,
+    day: str = "",
+    now: float | None = None,
+    routes: Sequence[Any] | None = None,
+) -> QueueReport:
+    """Count the work in hand, per route, from the ledger as it stands right now.
+
+    Unfinished means exactly what the ledger means by it: a row that is not DONE, not
+    QUARANTINED and not verified silence. Those rows are the queue — the recordings this
+    service has written down and not yet finished — and counting them is the only honest
+    answer to "where are my recordings?".
+    """
+    clock = time.time() if now is None else now
+    stale_after = _stale_after(config)
+    try:
+        rows: Sequence[Row] = ledger.unfinished()
+    except Exception as exc:  # noqa: BLE001 - the digest must be sendable from a sick ledger
+        log.warning("could not count the queue: %s", exc)
+        return QueueReport(day=day, stale_after_s=stale_after, unavailable=f"{type(exc).__name__}: {exc}")
+
+    known: list[Any] = list(routes) if routes is not None else (
+        list(routes_of(config)) if config is not None else []
+    )
+    labels = {
+        str(getattr(r, "name", "")): str(getattr(r, "label", "") or "") for r in known
+    }
+    order = [str(getattr(r, "name", "")) for r in known if getattr(r, "name", "")]
+
+    queued: dict[str, int] = {name: 0 for name in order}
+    started: dict[str, int] = {name: 0 for name in order}
+    oldest: dict[str, Row] = {}
+    for row in rows:
+        name = str(getattr(row, "route", "") or DEFAULT_ROUTE)
+        queued[name] = queued.get(name, 0) + 1
+        started.setdefault(name, 0)
+        if not row.lease_expired(clock):
+            started[name] += 1
+        # unfinished() is ordered oldest first, so the first row seen for a route is its
+        # oldest and nothing here has to sort or compare timestamps to find it.
+        oldest.setdefault(name, row)
+        if name not in order:
+            order.append(name)
+
+    def age_of(row: Row | None) -> float:
+        stamp = parse_stamp(getattr(row, "discovered_at", "") if row else "")
+        return max(0.0, clock - stamp) if stamp is not None else 0.0
+
+    entries = tuple(
+        RouteQueue(
+            name=name,
+            label=labels.get(name, ""),
+            queued=queued.get(name, 0),
+            started=started.get(name, 0),
+            oldest_at=str(getattr(oldest.get(name), "discovered_at", "") or ""),
+            oldest_name=str(getattr(oldest.get(name), "name", "") or ""),
+            oldest_age_s=age_of(oldest.get(name)),
+        )
+        for name in order
+    )
+
+    first = rows[0] if rows else None
+    history = queue_history(ledger)
+    work_dir = _mark(ledger, WORK_DIR_MARK)
+    refused = _mark(ledger, WORK_DIR_REFUSED_MARK)
+    earlier = [d for d in sorted(history) if not day or d < day]
+    previous_day = earlier[-1] if earlier else ""
+    trend = tuple((d, history[d]) for d in earlier[-QUEUE_HISTORY_DAYS:])
+    return QueueReport(
+        day=day,
+        queued=len(rows),
+        started=sum(started.values()),
+        routes=entries,
+        oldest_at=str(getattr(first, "discovered_at", "") or ""),
+        oldest_name=str(getattr(first, "name", "") or ""),
+        oldest_route=str(getattr(first, "route", "") or DEFAULT_ROUTE) if first else "",
+        oldest_age_s=age_of(first),
+        previous_day=previous_day,
+        previous_queued=history.get(previous_day) if previous_day else None,
+        history=trend,
+        stale_after_s=stale_after,
+        work_dir=work_dir,
+        work_dir_refused=refused,
+    )
+
+
+def _mark(ledger: Ledger, name: str) -> str:
+    """One of the worker's notes, or '' — never an exception, and never a stale guess.
+
+    The worker rewrites both of these on every drain and clears them when there is nothing
+    to say, so what is read here is always about the last cycle rather than about the worst
+    afternoon this month.
+    """
+    try:
+        return str(ledger.cursor_get(name) or "").strip()
+    except Exception as exc:  # noqa: BLE001 - the digest must be sendable from a sick ledger
+        log.warning("could not read %s: %s", name, exc)
+        return ""
+
+
+def _stale_after(config: Any) -> float:
+    """How long a queued recording may wait before the wait itself is the news."""
+    try:
+        hours = float(getattr(config, "queue_stale_hours", 0) or 0)
+    except (TypeError, ValueError):
+        hours = 0.0
+    return hours * 3600.0 if hours > 0 else QUEUE_STALE_AFTER_S
 
 
 # --------------------------------------------------------------------------- wording
@@ -186,17 +627,82 @@ def plain_reason(failure: Mapping[str, Any]) -> str:
     return "it did not finish, and nothing was recorded about why. That is itself worth looking at."
 
 
-def subject_for(counts: DigestCounts, open_failures: int) -> str:
-    """The whole message, in the line he sees on his phone before opening anything."""
+def stuck_after_s(config: Any = None) -> float:
+    """Seconds before an unfinished recording is called stuck rather than queued."""
+    raw = getattr(config, "stuck_after_hours", None) if config is not None else None
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        return STUCK_AFTER_S
+    return hours * 3600.0 if hours > 0 else STUCK_AFTER_S
+
+
+def split_stopped_from_queued(
+    failures: Sequence[Mapping[str, Any]],
+    *,
+    now: float | None = None,
+    config: Any = None,
+) -> tuple[int, int]:
+    """How many have stopped, and how many are still going.
+
+    ``failures`` carries two different things: every quarantined recording, and the day's
+    unfinished ones. Reporting them as one number is what made a healthy backlog read as a
+    catastrophe on a phone screen.
+
+    Quarantined has stopped, always. An unfinished one is judged on **age**: past
+    :func:`stuck_after_s` it has stopped in all but name and is named; younger than that it
+    is work in hand. Age, not state, because "arrived yesterday and not finished" describes
+    both a file that died at 09:00 and one of eighty that landed at 17:00.
+    """
+    limit = stuck_after_s(config)
+    moment = time.time() if now is None else float(now)
+    stopped = queued = 0
+    for failure in failures:
+        if str(failure.get("state")) == State.QUARANTINED:
+            stopped += 1
+            continue
+        found = parse_stamp(str(failure.get("discovered_at") or ""))
+        if found is not None and (moment - found) < limit:
+            queued += 1
+        else:
+            # No usable timestamp means no evidence it is moving, so it is named rather
+            # than quietly counted as fine.
+            stopped += 1
+    return stopped, queued
+
+
+def subject_for(counts: DigestCounts, open_failures: int, queued: int = 0) -> str:
+    """The whole message, in the line he sees on his phone before opening anything.
+
+    **Queued is not failed, and the subject line must not say it is.** Eighty recordings
+    landing at 17:00 are still in hand at 06:00; calling them FAILED on a phone screen is
+    the exact confusion this service exists to remove, and it would teach him to distrust
+    the one line that is supposed to be trustworthy. A recording that has stopped
+    (quarantined) is a failure; one still moving through the queue is work in hand. The
+    body says how old the queue is and whether it grew, which is what distinguishes a busy
+    morning from a service that has fallen behind for good.
+
+    ``open_failures`` is the stopped ones. ``queued`` is the ones still going.
+    """
     if counts.discovered == 0:
+        parts = []
         if open_failures:
-            return f"⚠ Recordings: nothing arrived yesterday, {open_failures} still FAILED"
+            parts.append(f"{open_failures} still FAILED")
+        if queued:
+            parts.append(f"{queued} still queued")
+        if parts:
+            return "⚠ Recordings: nothing arrived yesterday, " + ", ".join(parts)
         return "⚠ Recordings: nothing arrived yesterday"
-    if open_failures == 0:
+    if open_failures == 0 and queued == 0:
         if counts.skipped_empty:
             return f"Recordings: all {counts.discovered} done ({counts.skipped_empty} silent)"
         return f"Recordings: all {counts.discovered} done"
-    return f"Recordings: {counts.done} done, {open_failures} FAILED"
+    tail = []
+    if open_failures:
+        tail.append(f"{open_failures} FAILED")
+    if queued:
+        tail.append(f"{queued} queued")
+    return f"Recordings: {counts.done} done, " + ", ".join(tail)
 
 
 # --------------------------------------------------------------------------- routes
@@ -329,6 +835,9 @@ class Digest:
     #: processed — but the transcript may be landing in the wrong folder, and that is only
     #: ever fixed by a person looking at the folders.
     route_disagreements: tuple[Mapping[str, Any], ...] = ()
+    #: The work in hand right now, per route. Not part of the day being reported: it is the
+    #: answer to "where are the rest of them?", which is asked about this minute.
+    queue: QueueReport = field(default_factory=QueueReport)
 
     @property
     def needs_a_person(self) -> bool:
@@ -410,13 +919,15 @@ def build(
     service_error = _service_error(ledger)
     attention = _attention(ledger, target)
     routes = route_digests(config, ledger, target)
+    queue = queue_report(config, ledger, day=target, now=clock)
     disagreements = route_disagreements(ledger, target)
     if sweep_report is None:
         sweep_report = _stored_report(ledger, "sweep")
     if archive_report is None:
         archive_report = _stored_report(ledger, "archive")
 
-    subject = subject_for(counts, len(failures))
+    _stopped, _queued = split_stopped_from_queued(failures, now=clock, config=config)
+    subject = subject_for(counts, _stopped, _queued)
     body = _render(
         config,
         counts,
@@ -426,6 +937,7 @@ def build(
         older_failures=older_failures,
         stats=ledger.stats(),
         routes=routes,
+        queue=queue,
         disagreements=disagreements,
         sweep_report=sweep_report,
         archive_report=archive_report,
@@ -471,6 +983,7 @@ def build(
         credential_warning=warnings[0][1] if warnings else "",
         routes=routes,
         route_disagreements=disagreements,
+        queue=queue,
     )
 
 
@@ -578,6 +1091,7 @@ def _render(
     stats: Mapping[str, Any],
     sweep_report: Any,
     routes: Sequence["RouteDigest"] = (),
+    queue: "QueueReport | None" = None,
     disagreements: Sequence[Mapping[str, Any]] = (),
     archive_report: Any,
     service_error: str = "",
@@ -642,6 +1156,21 @@ def _render(
     if today_failures or older_failures:
         total = len(today_failures) + len(older_failures)
         lines += [f"NEEDS YOU — {total} recording(s) did not finish", _RULE]
+        # Some of these are not stuck at all: they are yesterday's recordings still in the
+        # queue this morning. Saying so here, next to them, is the difference between a
+        # person believing a recording is lost and a person seeing that it is next.
+        waiting = [
+            f for f in list(today_failures) + list(older_failures)
+            if not State.is_terminal(str(f.get("state") or ""))
+        ]
+        if waiting:
+            for chunk in _wrap(
+                f"{len(waiting)} of these had not finished by the end of the day rather than "
+                f"failed — they are in the queue, counted again under THE QUEUE below, and "
+                f"nothing about them is lost."
+            ):
+                lines.append(f"  {chunk}")
+            lines.append("")
         # Which route a failure arrived on, but only when there is more than one: on a
         # single-route service it would be the same word under every failure.
         route_labels = {r.name: r.display for r in routes} if len(routes) > 1 else {}
@@ -665,6 +1194,14 @@ def _render(
         f"  finished yesterday (whenever they arrived): {counts.done_on_day}",
         "",
     ]
+
+    # Directly under the counts, because it is the sentence that stops "still in progress"
+    # above from being read as "lost". A queue is work in hand; the failures are above and
+    # are the only thing in this email that is a loss.
+    if queue is not None:
+        lines += ["THE QUEUE — what is waiting to be transcribed", _RULE]
+        lines += queue.lines()
+        lines.append("")
 
     if routes:
         # One line per route, every route, every morning. The totals above are the whole
@@ -919,6 +1456,10 @@ def run(
         config, ledger, day=day, now=clock, sweep_report=sweep_report, archive_report=archive_report
     )
     sent = send(config, digest, smtp_factory=smtp_factory)
+    # Written after the build, never during it: tomorrow's "is it growing?" is answered
+    # against what this morning's email actually reported, and a dry run or a `status` that
+    # rewrote the history would make the answer depend on who looked.
+    record_queue_depth(ledger, digest.queue.day or digest.day, digest.queue.queued)
 
     monitor = heartbeat if heartbeat is not None else Heartbeat.from_config(config)
     if sent.ok and not digest.alarm:
