@@ -1,0 +1,125 @@
+name: CI
+
+# Every push and every pull request. The point of a pull request is that something
+# independent checked it before it reached main — a review of a diff nobody ran is a
+# reading exercise.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No `pip install` step, deliberately. This service imports nothing outside the
+      # standard library so that it cannot rot underneath itself while running unattended
+      # for years. If a dependency ever appears, the next step fails and says so.
+      - name: No third-party runtime imports
+        run: |
+          python3 - <<'PY'
+          import ast, pathlib, sys
+
+          STDLIB = set(sys.stdlib_module_names)
+          bad = []
+          for path in sorted(pathlib.Path("src").rglob("*.py")):
+              tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      names = [a.name for a in node.names]
+                  elif isinstance(node, ast.ImportFrom):
+                      # level > 0 is a relative import inside the package
+                      names = [] if node.level else [node.module or ""]
+                  else:
+                      continue
+                  for name in names:
+                      root = name.split(".")[0]
+                      if root and root not in STDLIB and root != "transcriber":
+                          bad.append(f"{path}: {name}")
+          if bad:
+              print("Third-party imports found in the runtime tree:")
+              print("\n".join("  " + b for b in bad))
+              raise SystemExit(1)
+          print(f"clean — every import in src/ is stdlib or first-party")
+          PY
+
+      - name: Compile
+        run: python3 -m compileall -q src tests
+
+      - name: Tests
+        run: python3 -m unittest discover -s tests -t . -v
+        env:
+          PYTHONPATH: src
+
+      # The check a person runs on the server to know a deploy is sane. If it passes here
+      # it will pass there: it needs no credential and opens no socket.
+      - name: Selftest (offline, no credentials)
+        working-directory: src
+        run: python3 -m transcriber selftest
+
+      - name: No secrets committed
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          # Shapes of real credentials. The .env holding the live ones is gitignored; this
+          # catches the day somebody pastes one into a source file or a doc by accident.
+          PATTERNS = {
+              "OpenAI key": re.compile(r"\bsk-[A-Za-z0-9_-]{32,}"),
+              "Anthropic key": re.compile(r"\bsk-ant-[A-Za-z0-9_-]{32,}"),
+              "Slack token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+              "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+              "Azure/Graph secret": re.compile(r"\b[A-Za-z0-9~._-]{3}8Q~[A-Za-z0-9~._-]{30,}"),
+          }
+          SKIP = {".git", "__pycache__", ".mypy_cache"}
+
+          # Test fixtures deliberately LOOK like credentials — the selftest proves a key is
+          # scrubbed from logs, which needs something key-shaped to scrub. A real credential
+          # never announces itself as fake, so skipping self-identifying fixtures costs
+          # nothing and stops the check crying wolf on day one. Anything crying wolf gets
+          # switched off, and a check that is off protects nobody.
+          FIXTURE = re.compile(r"not-?a-?real|selftest|example|dummy|fake|placeholder|xxxx", re.I)
+
+          hits = []
+          for path in pathlib.Path(".").rglob("*"):
+              if not path.is_file() or any(p in SKIP for p in path.parts):
+                  continue
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
+              for label, pattern in PATTERNS.items():
+                  for match in pattern.finditer(text):
+                      if FIXTURE.search(match.group(0)):
+                          continue
+                      hits.append(f"{path}: looks like a {label}")
+          if hits:
+              print("Possible credential committed:")
+              print("\n".join("  " + h for h in hits))
+              raise SystemExit(1)
+          print("clean — nothing matching a credential shape")
+          PY
+
+      - name: No .env committed
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked. It holds live credentials and must stay gitignored."
+            exit 1
+          fi
+          echo "clean — .env is not tracked"
