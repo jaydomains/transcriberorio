@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from . import config as config_mod
-from .config import ENGINES, Config, ConfigError
+from .config import ENGINES, GATE_MODES, Config, ConfigError
 from .diskbudget import MINIMUM_WORK_DIR_MAX_BYTES, format_bytes, parse_bytes
 from .setup_wizard import load_env_file, mask, routes_from_values, write_env_file
 
@@ -88,7 +88,9 @@ ALIASES: dict[str, str] = {
 
 #: The ``.env`` variables that are a route's, not the service's. Listed and readable here,
 #: never written here.
-_ROUTE_VAR_RE = re.compile(r"^ROUTE_[A-Z0-9_]+_(LABEL|SOURCE|OUTPUT|ARCHIVE|ENGINE|ENABLED)$")
+_ROUTE_VAR_RE = re.compile(
+    r"^ROUTE_[A-Z0-9_]+_(LABEL|SOURCE|OUTPUT|ARCHIVE|ENGINE|ENABLED|REVIEWER)$"
+)
 
 
 @dataclass(frozen=True)
@@ -169,6 +171,7 @@ GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "MAX_ATTEMPTS", "ARCHIVE_AGE_DAYS", "SWEEP_HOUR", "ARCHIVE_DAY_OF_MONTH", "TIMEZONE",
     )),
     ("what it expects to hear", ("LANGUAGES", "VOCABULARY", "VOCABULARY_FILE")),
+    ("the sensitivity gate", ("GATE_MODE", "GATE_HELD_STORE", "GATE_REVIEW_BASE_URL")),
     ("http and logging", ("HTTP_TIMEOUT_S", "MAX_RETRIES", "LOG_LEVEL", "LOG_FORMAT")),
 )
 
@@ -188,6 +191,7 @@ _RULES: dict[str, dict[str, Any]] = {
     "SMTP_TO": {"show": "private"},
     "HEARTBEAT_URL": {"show": "private"},
     "TRANSCRIBE_ENGINE": {"choices": tuple(ENGINES)},
+    "GATE_MODE": {"choices": tuple(GATE_MODES)},
     "LOG_LEVEL": {"choices": LOG_LEVELS},
     "SMTP_PORT": {"minimum": 1, "maximum": 65535},
     "DIGEST_HOUR": {"minimum": 0, "maximum": 23},
@@ -413,6 +417,22 @@ def check_value(name: str, raw: str, env: Mapping[str, str]) -> str:
                 "it is refused here instead. If you have deliberately pointed the analysis "
                 "pass somewhere else, set ANALYSIS_PROVIDER first."
             )
+
+    if name == "GATE_REVIEW_BASE_URL" and not value.startswith("https://"):
+        return (
+            "GATE_REVIEW_BASE_URL must start with https:// — approvals, and the held "
+            "passages behind them, travel over it"
+        )
+
+    if name == "GATE_MODE" and value.lower() == "on" and not str(
+        env.get("GATE_REVIEW_BASE_URL") or ""
+    ).strip():
+        return (
+            "GATE_MODE=on holds sensitive passages back until somebody approves them, and "
+            "GATE_REVIEW_BASE_URL is not set — there would be nowhere to approve them and "
+            "nothing would ever be released. Set GATE_REVIEW_BASE_URL first, or leave the "
+            "gate on shadow, where it records what it would have held and withholds nothing."
+        )
 
     if name == "HEARTBEAT_URL" and not value.startswith("https://"):
         return (

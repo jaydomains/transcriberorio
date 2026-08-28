@@ -1,5 +1,5 @@
 """The command line: ``once``, ``run``, ``sweep``, ``digest``, ``archive``, ``backfill``,
-``selftest``, ``status``, ``routes``, ``config``.
+``selftest``, ``status``, ``routes``, ``config``, ``review``, ``held``, ``gate``.
 
     python3 -m transcriber run          the service
     python3 -m transcriber once         one poll and one drain, then exit
@@ -7,6 +7,23 @@
     python3 -m transcriber selftest     prove the deploy is sane, offline
     python3 -m transcriber routes       the watched folders, and how to change them
     python3 -m transcriber config       one setting, read or changed, without an editor
+    python3 -m transcriber review       serve the page held passages are approved on
+    python3 -m transcriber held         the same held passages, from a terminal
+    python3 -m transcriber gate         which mode the gate is in, and what it has measured
+
+``review``, ``held`` and ``gate`` are the sensitivity gate's three faces, and there are
+three of them on purpose. ``review`` is the page he taps yes or no on from a phone on site,
+which is the only way it will ever actually be used. ``held`` is the same list, the same
+words and the same two answers from a terminal on the service host — because a web page that
+is down must never be the only way to reach information that exists nowhere else but the
+audio and one SQLite file. ``gate`` reports which mode the gate is in and the fraction it
+has actually measured, which is the number that decides whether it may be armed at all.
+
+None of the three can decide anything. ``held release`` and ``held refuse`` both require the
+name of the person answering, both are refused if that name looks like a scheduler, and
+there is no command anywhere in this file that clears the queue, expires a passage or
+answers one on age. The only thing that turns a held passage into a released one is a person
+saying so.
 
 Every command that acts on recordings — ``once``, ``sweep``, ``archive``, ``backfill``,
 ``status`` — takes ``--route <name>`` to act on one route rather than all of them. Omitted
@@ -36,12 +53,14 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import archive as archive_module
 from . import audio as audio_module
 from . import config_cmd, diskbudget, digest as digest_module, naming, outputs, plausibility
-from . import ratelimit, routes_cmd
+from . import ratelimit, redact, routes_cmd
+from . import release as release_module
+from . import review_server
 from . import sweep as sweep_module
 from .config import Config, ConfigError
 from .ledger import DELTA_CURSOR, Ledger, delta_cursor_name, sweep_cursor_name
@@ -60,6 +79,17 @@ from .models import (
     utc_now_iso,
 )
 from .pipeline import Pipeline, PipelineFatal, build_graph
+from .withheld import (
+    CATEGORY_DESCRIPTION,
+    MODE_OFF,
+    MODE_ON,
+    MODE_SHADOW,
+    Decision,
+    HeldRecord,
+    WithheldError,
+    WithheldStore,
+    normalise_mode,
+)
 from .worker import (
     DigestUnavailable,
     LAST_CYCLE_ERROR,
@@ -75,6 +105,16 @@ from .worker import (
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_CONFIG = 2
+
+
+class CommandProblem(RuntimeError):
+    """Something a person asked for that cannot be done, said in one sentence.
+
+    Not a :class:`~transcriber.config.ConfigError` — that one exists to report every missing
+    setting at once and prints its argument as a list of problems, so a sentence handed to
+    it comes back out one character per line. This is the ordinary "that reference does not
+    exist" case: printed as written, and a non-zero exit.
+    """
 
 #: The backfill lane never touches anything more recent than this. Two days is comfortably
 #: past the point where the live loop has either finished a recording or quarantined it.
@@ -93,6 +133,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     handler: Callable[[argparse.Namespace], int] = args.handler
     try:
         return handler(args)
+    except CommandProblem as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_FAILED
+    except (release_module.ReleaseError, WithheldError) as exc:
+        # Every one of these carries a whole sentence about a held passage, written to be
+        # read by the person who just typed the command. A traceback in its place would be
+        # the service refusing to explain itself about the one thing it holds.
+        print(str(exc), file=sys.stderr)
+        return EXIT_FAILED
     except ConfigError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_CONFIG
@@ -195,6 +244,99 @@ def _parser() -> argparse.ArgumentParser:
     )
     config_cmd.add_arguments(settings)
     settings.set_defaults(handler=cmd_config)
+
+    review = sub.add_parser(
+        "review",
+        help="serve the page held passages are approved on",
+        description=(
+            "The page the morning email links to. It shows one person their own held "
+            "passages and nothing else, and an answer on it is written in that person's "
+            "name. Serve it behind a proxy that terminates HTTPS, or give it a certificate."
+        ),
+    )
+    review.add_argument("--bind", default=os.environ.get("REVIEW_BIND", "127.0.0.1"),
+                        help="address to listen on (default 127.0.0.1, for a proxy in front)")
+    review.add_argument("--port", type=int, default=int(os.environ.get("REVIEW_PORT", "8443") or 8443))
+    review.add_argument("--cert", default=os.environ.get("REVIEW_CERTFILE", ""),
+                        help="TLS certificate, if this process terminates HTTPS itself")
+    review.add_argument("--key", default=os.environ.get("REVIEW_KEYFILE", ""))
+    review.add_argument("--trust-forwarded", action="store_true",
+                        help="take the client address from X-Forwarded-For (only behind your own proxy)")
+    review.add_argument("--allow-plaintext", action="store_true",
+                        help="serve without TLS on a non-loopback address; almost never right")
+    review.add_argument("--link", metavar="PERSON", default="",
+                        help="mint one review link for one person and exit, without serving")
+    review.add_argument("--revoke", metavar="PERSON", default="",
+                        help="revoke every live link one person holds and exit (a lost phone)")
+    review.add_argument("--hours", type=int, default=review_server.DEFAULT_TOKEN_HOURS,
+                        help="how long a minted link is good for")
+    review.set_defaults(handler=cmd_review)
+
+    held = sub.add_parser(
+        "held",
+        help="held passages from a terminal: list, show, release, refuse, deliver",
+        description=(
+            "The same held passages the review page shows, reachable when the page is not. "
+            "Every answer carries the name of the person giving it, and nothing here "
+            "answers anything on age, on a count or on a timer."
+        ),
+    )
+    held_sub = held.add_subparsers(dest="held_command", required=True)
+
+    held_list = held_sub.add_parser(
+        "list", help="what is waiting: counts, sites and ages — no words"
+    )
+    held_list.add_argument("--as", dest="who", default="",
+                           help="your own name, to list your own passages rather than the totals")
+    _add_route_option(held_list)
+    held_list.add_argument("--json", dest="as_json", action="store_true")
+
+    held_show = held_sub.add_parser("show", help="one held passage in full, with its words")
+    held_show.add_argument("ref", help="the six-character reference, from the page or the email")
+    held_show.add_argument("--as", dest="who", required=True,
+                           help="your own name; only the person the passage belongs to may read it")
+
+    held_release = held_sub.add_parser(
+        "release", help="say these words may be written down, and write them into the record"
+    )
+    held_release.add_argument("ref")
+    held_release.add_argument("--as", dest="who", required=True, help="your own name")
+    held_release.add_argument("--note", default="", help="why, kept with the answer forever")
+
+    held_refuse = held_sub.add_parser(
+        "refuse", help="say these words stay out; nothing is written and the marker stays"
+    )
+    held_refuse.add_argument("ref")
+    held_refuse.add_argument("--as", dest="who", required=True, help="your own name")
+    held_refuse.add_argument("--note", default="", help="why, kept with the answer forever")
+
+    held_deliver = held_sub.add_parser(
+        "deliver",
+        help="finish any release whose words have not reached the record yet",
+    )
+    held_deliver.add_argument("--ref", default="", help="just this one")
+    held_deliver.add_argument("--limit", type=int, default=None)
+    held_deliver.add_argument("--force", action="store_true",
+                              help="write the file again even if it is already recorded as written")
+    held.set_defaults(handler=cmd_held)
+
+    gate = sub.add_parser(
+        "gate",
+        help="which mode the sensitivity gate is in, and the fraction it has measured",
+        description=(
+            "It ships dark. This is the number that has to be real before it is armed: how "
+            "many recordings have been read, how many carried anything, and what share of "
+            "the words that came to."
+        ),
+    )
+    gate.add_argument("--status", action="store_true",
+                      help="print the mode and the measurement (the default, and the only thing it does)")
+    gate.add_argument("--since", default="", help="only count from this timestamp onwards")
+    gate.add_argument("--until", default="", help="only count up to this timestamp")
+    gate.add_argument("--days", type=int, default=None,
+                      help="only count the last N days (a shorthand for --since)")
+    gate.add_argument("--json", dest="as_json", action="store_true")
+    gate.set_defaults(handler=cmd_gate)
 
     setup = sub.add_parser(
         "setup", help="interactive wizard — asks for everything, checks it, writes .env"
@@ -521,6 +663,515 @@ def _live_work_waiting(ledger: Ledger, cutoff_iso: str) -> bool:
         (row.created_at or row.discovered_at or "") >= cutoff_iso
         for row in claimable_now(ledger, 200, time.time())
     )
+
+
+# --------------------------------------------------------------- the sensitivity gate
+
+
+def _held_store(config: Config) -> WithheldStore:
+    """The one held-passage database, opened where the configuration actually says.
+
+    ``Config.held_store_path`` honours ``GATE_HELD_STORE`` and is the path startup
+    validation checked; ``WithheldStore.from_config`` does not read that attribute at all.
+    Opening the wrong file here would show an empty queue while passages were being held in
+    another one, which is the most convincing possible way to lose something.
+    """
+    return WithheldStore(review_server.store_path_for(config), scrub=config.scrub)
+
+
+def _same_person(one: str, other: str) -> bool:
+    """Whether two ways of writing a person's name are the same person.
+
+    Reviewers are configured as addresses and typed at a terminal as whatever the person
+    calls themselves, so ``james`` and ``james@kbc.invalid`` have to match. Nothing looser:
+    two different people are never the same person here, and the only relaxation is the
+    domain, which is the part a person does not type.
+    """
+    left, right = (one or "").strip(), (other or "").strip()
+    if not left or not right:
+        return False
+    if left.casefold() == right.casefold():
+        return True
+    from .review_page import display_name
+
+    return display_name(left).casefold() == display_name(right).casefold()
+
+
+def _resolve_reviewer(store: WithheldStore, who: str, decision: str = Decision.PENDING) -> str:
+    """The name the store files this person's passages under, given what they typed.
+
+    ``queue_for`` answers for one named reviewer and matches exactly, which is right — it is
+    the method that returns held text. But a person at a terminal types their own name, not
+    the address the route was configured with, and a queue that came back empty because of
+    a domain would look exactly like a queue that is empty. So the typed name is resolved
+    against the reviewers the store actually knows, and anything ambiguous is refused by
+    name rather than guessed at.
+    """
+    typed = (who or "").strip()
+    if not typed:
+        return typed
+    try:
+        known = [
+            name
+            for name, count in (store.overview(decision=decision).get("by_reviewer") or {}).items()
+            if count and name and name != "unassigned"
+        ]
+    except Exception:  # noqa: BLE001 - fall back to what was typed rather than to nothing
+        return typed
+    if typed in known:
+        return typed
+    matches = [name for name in known if _same_person(typed, name)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise CommandProblem(
+            f"{typed!r} could be any of {', '.join(sorted(matches))}. Say which one — the "
+            f"held text of one person is never shown under another person's name."
+        )
+    return typed
+
+
+def _one_hold(store: WithheldStore, ref: str) -> HeldRecord:
+    """The single passage this reference names, or a sentence saying why it is not single."""
+    found = store.by_ref(ref)
+    if not found:
+        raise CommandProblem(
+            f"there is no held passage with the reference {str(ref).strip().upper()!r}. "
+            f"References are six characters and are printed beside the marker in the "
+            f"transcript, on the review page and in the morning email."
+        )
+    if len(found) > 1:
+        detail = ", ".join(f"{r.hold_id} ({r.item_id})" for r in found)
+        raise CommandProblem(
+            f"two held passages carry the reference {ref.upper()!r}: {detail}. That is a "
+            f"collision rather than a mistake, and both are real — answer them on the review "
+            f"page, where each is listed against its own recording."
+        )
+    return found[0]
+
+
+def _releaser(config: Config, ledger: Ledger, store: WithheldStore, graph: Any) -> Any:
+    return release_module.Releaser(config, ledger, store, graph)
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    """Serve the page, or mint and revoke one person's link.
+
+    The page is wired to the releaser here and nowhere else: when somebody taps yes, the
+    decision is written to the held-passage store by the page and the words are written into
+    the record by :class:`transcriber.release.Releaser`. If that second step fails the first
+    still stands, and ``transcriber held deliver`` finishes it — which is why the wiring is
+    a callback rather than something the page has to succeed at.
+    """
+    config, ledger, graph = _service(args)
+    with ledger:
+        store = _held_store(config)
+        service = review_server.service_from_config(
+            config, store=store, on_decision=_releaser(config, ledger, store, graph).on_decision
+        )
+
+        if args.link and args.revoke:
+            print("--link and --revoke do different things; ask for one of them.", file=sys.stderr)
+            return EXIT_CONFIG
+        if args.link:
+            issued = service.tokens.issue(args.link, hours=args.hours)
+            base = str(getattr(config, "gate_review_base_url", "") or "")
+            from . import logging_setup
+
+            logging_setup.add_secrets([issued.token])
+            print(issued.url(base))
+            print(f"good until {issued.expires_at}. Every earlier link for that person is now dead.")
+            return EXIT_OK
+        if args.revoke:
+            killed = service.tokens.revoke_for(args.revoke, why="revoked from the command line")
+            print(f"{killed} live link(s) revoked.")
+            print("Nothing else changed. Nothing was released and nothing was discarded.")
+            return EXIT_OK
+
+        mode = normalise_mode(getattr(config, "gate_mode", MODE_SHADOW))
+        if mode != MODE_ON:
+            print(
+                f"The gate is {_gate_mode_words(mode)}, so nothing is being withheld and the "
+                f"page will say so. It is still worth serving: it shows what the gate would "
+                f"have held."
+            )
+        pending = store.overview().get("count", 0)
+        print(f"{pending} passage(s) waiting. Listening on {args.bind}:{args.port}.")
+        print("Stop it with Ctrl-C; any answer still inside its undo window is written first.")
+        review_server.serve(
+            service,
+            host=args.bind,
+            port=args.port,
+            certfile=args.cert,
+            keyfile=args.key,
+            allow_plaintext=args.allow_plaintext,
+            trust_forwarded=args.trust_forwarded,
+        )
+    return EXIT_OK
+
+
+def cmd_held(args: argparse.Namespace) -> int:
+    """Held passages from a terminal, because the page can be down and these words cannot."""
+    config, ledger, graph = _service(args)
+    with ledger:
+        store = _held_store(config)
+        releaser = _releaser(config, ledger, store, graph)
+        command = args.held_command
+        if command == "list":
+            return _held_list(config, ledger, store, args)
+        if command == "show":
+            return _held_show(store, args)
+        if command in ("release", "refuse"):
+            return _held_answer(store, releaser, args, command)
+        if command == "deliver":
+            return _held_deliver(releaser, args)
+    print(f"{command!r} is not something `transcriber held` does.", file=sys.stderr)
+    return EXIT_CONFIG
+
+
+def _held_list(config: Config, ledger: Ledger, store: WithheldStore, args: argparse.Namespace) -> int:
+    """What is waiting. Without ``--as`` this is counts, sites and ages and nothing else."""
+    who = _resolve_reviewer(store, str(getattr(args, "who", "") or ""))
+    route = getattr(args, "route", None)
+    if who:
+        records = store.queue_for(who, route=route or None)
+        if getattr(args, "as_json", False):
+            print(json.dumps([r.to_dict() for r in records], indent=2, sort_keys=True))
+            return EXIT_OK
+        print(f"{len(records)} passage(s) waiting for you.")
+        if not records:
+            print("Nothing of yours is being held.")
+            return EXIT_OK
+        print("")
+        for record in records:
+            print(f"  {record.ref}  {record.phrase}")
+            print(
+                f"          {record.site or 'no site named'} · "
+                f"{record.source_name or record.item_id} · held {record.held_at[:10]} · "
+                f"{record.age_days()} day(s) ago"
+            )
+        print("")
+        print("Read one in full:  transcriber held show <reference> --as <your name>")
+        print("Then:              transcriber held release <reference> --as <your name>")
+        print("or:                transcriber held refuse  <reference> --as <your name>")
+        return EXIT_OK
+
+    overview = store.overview()
+    owed = release_module.outstanding(store, ledger)
+    if getattr(args, "as_json", False):
+        payload = dict(overview)
+        payload["outstanding"] = {
+            "count": owed.count, "refs": list(owed.refs), "problems": list(owed.problems)
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    mode = normalise_mode(getattr(config, "gate_mode", MODE_SHADOW))
+    print(f"The gate is {_gate_mode_words(mode)}.")
+    count = int(overview.get("count") or 0)
+    if not count:
+        print("Nothing is being held.")
+    else:
+        print(f"{count} passage(s) from {overview.get('recordings', 0)} recording(s) waiting,")
+        print(f"the oldest for {overview.get('oldest_age_days', 0)} day(s).")
+        print("")
+        print("  by site")
+        for site, n in sorted((overview.get("by_site") or {}).items(), key=lambda p: -p[1]):
+            print(f"    {site}: {n}")
+        print("")
+        print("  whose list")
+        from .review_page import display_name
+
+        for person, n in sorted((overview.get("by_reviewer") or {}).items(), key=lambda p: -p[1]):
+            print(f"    {display_name(person) or person}: {n}")
+        print("")
+        print("  what kind")
+        for category, n in sorted((overview.get("by_category") or {}).items(), key=lambda p: -p[1]):
+            print(f"    {CATEGORY_DESCRIPTION.get(category, category)}: {n}")
+        print("")
+        # Deliberately not the words, and deliberately not even the classifier's own summary
+        # of them: this is the view somebody who does not own the passage is looking at, and
+        # a staff member reviews their own. Add `--as <your name>` to see your own list.
+        print("These are counts, sites and ages. To read the words of your own passages:")
+        print("  transcriber held list --as <your name>")
+    if owed.any:
+        print("")
+        for line in owed.lines():
+            print(f"  {line}")
+    return EXIT_OK
+
+
+def _held_show(store: WithheldStore, args: argparse.Namespace) -> int:
+    """One passage in full — the only command in this file that prints held words.
+
+    It answers for the person the passage belongs to and refuses for anybody else, including
+    the principal. That is decision 6: staff record voluntarily and can stop keeping a folder
+    at all, and one who works out that their held words are read by somebody else has an
+    obvious response, after which the recordings are gone entirely. A staff disciplinary
+    matter is already routed to him by the classifier, so the passages that are genuinely
+    his to hold are on his own list.
+    """
+    record = _one_hold(store, args.ref)
+    who = str(args.who or "").strip()
+    if not record.reviewer:
+        # No reviewer was recorded against it — a classifier run before the routes named
+        # one, or a route with nobody set. It is nobody's list, and a passage nobody can
+        # reach is a passage whose words exist only in the audio, which is the loss this
+        # service was built to prevent. So it is readable, and the gap is said out loud.
+        print(
+            f"NOTE: no reviewer is recorded against {record.ref}, so it is on nobody's "
+            f"list and appears in no queue. Set ROUTE_{record.route.upper().replace('-', '_')}"
+            f"_REVIEWER so the next one reaches somebody."
+        )
+    elif not _same_person(who, record.reviewer):
+        from .review_page import display_name
+
+        owner = display_name(record.reviewer) or "somebody else"
+        print(
+            f"{record.ref} is on {owner}'s list, not yours, so its words are not printed "
+            f"here. What can be said about it: {CATEGORY_DESCRIPTION.get(record.category, record.category)}, "
+            f"from {record.site or 'a site that was not named'}, held {record.age_days()} "
+            f"day(s) ago, still waiting. Ask {owner} to answer it.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
+
+    print(f"held passage {record.ref}")
+    print(f"  recording   {record.source_name or record.item_id}")
+    print(f"  site        {record.site or 'not named'}")
+    print(f"  route       {record.route}")
+    print(f"  held        {record.held_at} ({record.age_days()} day(s) ago)")
+    print(f"  kind        {CATEGORY_DESCRIPTION.get(record.category, record.category)}")
+    if record.subject:
+        print(f"  in short    {record.subject}")
+    if record.reason:
+        print(f"  why         {record.reason}")
+    if record.confidence is not None:
+        print(f"  confidence  {record.confidence:.2f}")
+    print(f"  state       {record.decision}"
+          + (f" by {record.answered_by} on {record.decided_at[:10]}" if record.decided_at else ""))
+    if record.mode != MODE_ON:
+        print("  NOTE        this was recorded in shadow: nothing was withheld, and there is")
+        print("              nothing to release. It is here to be counted, not answered.")
+    print("")
+    print("  what was said, with a little either side:")
+    print("")
+    if record.context_before:
+        print(f"    …{record.context_before.strip()}")
+    print("")
+    print(f"    >>> {record.text.strip()}")
+    print("")
+    if record.context_after:
+        print(f"    {record.context_after.strip()}…")
+    print("")
+    if record.decision == Decision.PENDING:
+        print(f"  transcriber held release {record.ref} --as {who}")
+        print(f"  transcriber held refuse  {record.ref} --as {who}")
+        print("")
+        print("  Nothing happens to it until you run one of those. It is not released on a")
+        print("  deadline, it is not discarded, and it does not expire.")
+    return EXIT_OK
+
+
+def _held_answer(store: WithheldStore, releaser: Any, args: argparse.Namespace, answer: str) -> int:
+    """Release or refuse one passage, in the name of the person who said so.
+
+    A release then writes the words into the record as their own document; a refusal writes
+    nothing at all and leaves the marker in the transcript, because the record's rule is that
+    absence is itself a record and a refused passage that had vanished would read exactly
+    like one nobody ever noticed.
+    """
+    record = _one_hold(store, args.ref)
+    who = str(args.who or "").strip()
+    if record.reviewer and not _same_person(who, record.reviewer):
+        from .review_page import display_name
+
+        print(
+            f"{record.ref} is on {display_name(record.reviewer) or 'somebody else'}'s list. "
+            f"A held passage is answered by the person it belongs to and by nobody else.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
+    try:
+        answered = (
+            store.release(record.hold_id, answered_by=who, note=args.note)
+            if answer == "release"
+            else store.refuse(record.hold_id, answered_by=who, note=args.note)
+        )
+    except WithheldError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_FAILED
+
+    delivery = releaser.deliver_quietly(answered)
+    print(delivery.line())
+    if answer == "release" and not delivery.ok:
+        print("")
+        print("Your answer is recorded and will not be lost. The words have not reached the")
+        print("record yet; run `transcriber held deliver` on the service host to finish it.")
+        return EXIT_FAILED
+    return EXIT_OK
+
+
+def _held_deliver(releaser: Any, args: argparse.Namespace) -> int:
+    """Finish every release whose words are not in the record yet. Safe to run twice."""
+    if args.ref:
+        deliveries = releaser.deliver_ref(args.ref, force=args.force)
+    else:
+        deliveries = releaser.deliver_outstanding(limit=args.limit)
+    if not deliveries:
+        print("Nothing is owed: every released passage is already written into the record.")
+        return EXIT_OK
+    failed = 0
+    for delivery in deliveries:
+        print(delivery.line())
+        if not delivery.ok:
+            failed += 1
+    if failed:
+        print("")
+        print(f"{failed} of {len(deliveries)} could not be written. Every one of those")
+        print("decisions still stands and is still recorded; nothing was lost.")
+        return EXIT_FAILED
+    return EXIT_OK
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    """Which mode the gate is in, and the fraction it has actually measured.
+
+    ``--status`` is accepted because that is how it reads in the deployment notes, and the
+    command does the same thing without it: there is nothing else for it to do, and a flag
+    that could be forgotten must not be the difference between a number and silence.
+    """
+    config, ledger, _graph = _service(args)
+    with ledger:
+        store = _held_store(config)
+        since = args.since
+        if args.days:
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.days)
+            since = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+        measured = store.measurement(since=since, until=args.until)
+        overview = store.overview()
+        stats = store.stats()
+        owed = release_module.outstanding(store, ledger)
+        mode = normalise_mode(getattr(config, "gate_mode", MODE_SHADOW))
+
+        if args.as_json:
+            print(json.dumps(
+                {
+                    "mode": mode,
+                    "store": store.path,
+                    "review_url": str(getattr(config, "gate_review_base_url", "") or ""),
+                    "measurement": measured,
+                    "pending": overview.get("count", 0),
+                    "by_reviewer": overview.get("by_reviewer", {}),
+                    "by_site": overview.get("by_site", {}),
+                    "oldest_age_days": overview.get("oldest_age_days", 0),
+                    "store_stats": stats,
+                    "outstanding": {"count": owed.count, "refs": list(owed.refs)},
+                },
+                indent=2, sort_keys=True, default=str,
+            ))
+            return EXIT_OK
+
+        print(f"GATE_MODE={mode} — {_gate_mode_sentence(mode)}")
+        print(f"held passages are kept at {store.path}")
+        url = str(getattr(config, "gate_review_base_url", "") or "")
+        print(f"the review page is at {url}" if url else
+              "GATE_REVIEW_BASE_URL is not set, so there is no page to send anybody to")
+        print("")
+        print("WHAT IT HAS MEASURED")
+        window = "everything on record" if not (since or args.until) else f"{since or 'the start'} to {args.until or 'now'}"
+        print(f"  window                        {window}")
+        print(f"  recordings read               {measured['recordings_classified']}")
+        print(f"  of those, carrying something  {measured['recordings_with_a_hold']}"
+              f"  ({measured['fraction_of_recordings'] * 100:.1f}%)")
+        print(f"  passages found                {measured['spans']}")
+        print(f"  per day                       {measured['spans_per_day']:.2f}")
+        print(f"  share of the words            {measured['fraction_of_text'] * 100:.4f}%")
+        print(f"  days measured                 {measured['days_measured']}")
+        if measured.get("by_category"):
+            # Counted from the passages themselves rather than from the classifier's own
+            # per-recording note, so the two disagreeing means passes were not recorded —
+            # which is worth seeing rather than smoothing over.
+            print("")
+            print("  the passages, by kind")
+            for name, count in sorted(measured["by_category"].items(), key=lambda p: -p[1]):
+                print(f"    {CATEGORY_DESCRIPTION.get(name, name)}: {count}")
+        print("")
+        print("THE QUEUE")
+        print(f"  waiting for a person          {overview.get('count', 0)}")
+        print(f"  oldest, in days               {overview.get('oldest_age_days', 0)}")
+        by_decision = dict(stats.get("by_decision") or {})
+        print(f"  released, all time            {by_decision.get(Decision.RELEASED, 0)}")
+        print(f"  refused, all time             {by_decision.get(Decision.REFUSED, 0)}")
+        print(f"  recorded in shadow            {by_decision.get(Decision.NOT_WITHHELD, 0)}")
+        if owed.any:
+            print("")
+            for line in owed.lines():
+                print(f"  {line}")
+        print("")
+        for line in _gate_readiness(mode, measured):
+            print(line)
+    return EXIT_OK
+
+
+def _gate_mode_words(mode: str) -> str:
+    """The mode as it is said out loud: "on", "off", "in shadow"."""
+    return "in shadow" if mode == MODE_SHADOW else mode
+
+
+def _gate_mode_sentence(mode: str) -> str:
+    if mode == MODE_OFF:
+        return "nothing is read for sensitive passages and nothing is held"
+    if mode == MODE_SHADOW:
+        return (
+            "every recording is read and what it would have held is written down, and "
+            "NOTHING is withheld"
+        )
+    return "passages are actually withheld until a person answers them"
+
+
+def _gate_readiness(mode: str, measured: Mapping[str, Any]) -> list[str]:
+    """Whether the number is real enough to arm the gate on. A reading, never a decision.
+
+    The whole reason it ships dark is that the design passes disagreed about how much this
+    touches by a factor of twenty-five. So the only thing worth saying here is what the
+    measurement is, how much of it there is, and what switching it on would cost per day —
+    and then a person decides. Nothing in this service switches its own mode.
+    """
+    if mode == MODE_ON:
+        return [
+            "The gate is armed. Every passage above was actually taken out of a transcript,",
+            "is marked in place where it was said, and is waiting for a person.",
+        ]
+    days = int(measured.get("days_measured") or 0)
+    recordings = int(measured.get("recordings_classified") or 0)
+    per_day = float(measured.get("spans_per_day") or 0.0)
+    if mode == MODE_OFF:
+        return [
+            "The gate is off, so this measurement is not growing. Set GATE_MODE=shadow to",
+            "start measuring without withholding anything.",
+        ]
+    if recordings == 0:
+        return [
+            "Nothing has been read yet, so there is no measurement. Leave it in shadow until",
+            "there is one: arming it against an estimate is how the queue becomes a wall.",
+        ]
+    out = [
+        f"Switching this on today would cost about {per_day:.1f} approval(s) a day, measured",
+        f"over {days} day(s) and {recordings} recording(s).",
+    ]
+    if days < 5 or recordings < 50:
+        out += [
+            "That is not yet enough of a run to trust. Leave it in shadow: the estimates this",
+            "replaces differed by a factor of twenty-five, which is exactly why it ships dark.",
+        ]
+    else:
+        out += [
+            "Read that as the number of approvals a day. If it is small and the categories",
+            "above look right, GATE_MODE=on is a decision a person can now take on a real",
+            "number rather than an estimate.",
+        ]
+    return out
 
 
 # --------------------------------------------------------------------------- status
@@ -1028,6 +1679,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         _selftest_quotes(checks)
         _selftest_outputs(checks)
         _selftest_redaction(checks, config, level)
+        _selftest_gate(checks)
         _selftest_pipeline(checks, config)
 
     print("")
@@ -1936,6 +2588,224 @@ def _selftest_redaction(checks: _Checks, config: Config, restore_level: str = "C
 
     # Put the handler back where the rest of the selftest expects it.
     logging_setup.configure(config, level=restore_level, stream=sys.stderr)
+
+
+# -- 7b. the gate: the redaction round trip and the shape of the marker --------------
+
+
+#: One ordinary site call with exactly one thing in it that must not be written down, and
+#: the traffic that has to keep flowing around it: a price, a supplier and a delivery.
+#: Prices flow — that was his call, taken against his own first instinct, on the measurement
+#: that 6.3% of the record's content lines carry a rand figure.
+_GATE_TEXT = (
+    "Right, I am at Beach Court now. Spoke to Carel about the roof leak at unit four. "
+    "The new chap starts Monday, his ID number is 8001015009087 so put him on the site "
+    "register. The remedial is coming in at R4,500 from Marius and the bricks land Thursday."
+)
+_GATE_HELD = "his ID number is 8001015009087"
+_GATE_QUOTE = "The new chap starts Monday, his ID number is 8001015009087 so put him on the site register"
+_GATE_PRICE = "The remedial is coming in at R4,500 from Marius"
+
+
+def _selftest_gate(checks: _Checks) -> None:
+    """The sensitivity gate, offline: the cut, the marker, the quote, and the fourth file.
+
+    Everything here is the part of the gate that has no network in it, which is nearly all
+    of it. The four properties proved are the four that were got wrong somewhere in the
+    investigation before they were got right: the cut lands on the transcript text, the
+    marker is a stated unknown the record's own harvester will carry, a redaction does not
+    shred the action items that quote it, and a released passage reaches the record as a
+    file the record will actually ingest.
+    """
+    from . import extract as extract_module
+    from .withheld import HeldSpan, WithheldStore
+
+    checks.section("the sensitivity gate, with nothing withheld and nothing on the wire")
+
+    start = _GATE_TEXT.index(_GATE_HELD)
+    span = HeldSpan(
+        item_id="selftest-item",
+        start=start,
+        end=start + len(_GATE_HELD),
+        text=_GATE_HELD,
+        category="bare_identifier",
+        route="calls",
+        subject="an identity number",
+        site="Beach Court",
+        source_name="Call Carel_260827_141500.m4a",
+        recorded_at="2026-08-27T12:15:00Z",
+        recorded_by="selftest-person",
+        reviewer="selftest-person",
+    )
+
+    # -- the marker ----------------------------------------------------------------
+    marker = redact.marker_for(span)
+    question = redact.harvestable(marker)
+    checks.check(
+        "the marker is phrased so the record's question harvester will lift it",
+        bool(question),
+        "a marker that only sits in the transcript is invisible: the record's read path is "
+        "built from six sources and our inbox is not one of them",
+    )
+    checks.check("the harvested question is inside the record's own 15-240 character window",
+                 15 <= len(question) <= 240, f"{len(question)} characters")
+    checks.check("the marker carries exactly one question mark",
+                 marker.count("?") == 1, f"{marker.count('?')} of them")
+    checks.check("the marker names the passage's reference",
+                 redact.refs_in(marker) == (span.ref,), str(redact.refs_in(marker)))
+    checks.check("the marker says what kind of thing was held, not the words",
+                 span.phrase.casefold() in marker.casefold() and _GATE_HELD not in marker,
+                 marker)
+
+    # -- the cut -------------------------------------------------------------------
+    shadow = redact.redact_text(_GATE_TEXT, [span], mode="shadow")
+    checks.check("shadow cuts nothing at all", shadow.text == _GATE_TEXT and shadow.cut == 0)
+    checks.check("shadow still reports what it would have held", len(shadow.spans) == 1)
+
+    cut = redact.redact_text(_GATE_TEXT, [span], mode="on")
+    checks.check("the cut is applied to the transcript text", cut.ok and cut.cut == 1)
+    checks.check("the held words are gone from the transcript", _GATE_HELD not in cut.text)
+    checks.check("the mechanical backstop agrees they are gone",
+                 not redact.contains_any_held(cut.text, [span]))
+    checks.check("prices flow: the rand figure is untouched", _GATE_PRICE in cut.text)
+    checks.check("the marker is where the words were", span.ref in cut.text)
+    checks.check(
+        "cutting the same transcript twice changes nothing",
+        redact.redact_text(cut.text, [span], mode="on").text == cut.text,
+    )
+
+    # -- the masker and the backstop, which must not be able to drift apart ---------
+    # The backstop refuses a file over a run of held words anywhere in a passage; the
+    # masker must therefore cut anything it would refuse. When it did not, a model's
+    # summary reusing the middle of a held sentence was masked by neither and refused by
+    # the backstop — and that refusal is never retried, so the whole recording quarantined
+    # permanently with none of its three files written. A gate is not allowed to delete
+    # recordings; that is the loss this service exists to cure.
+    interior = " ".join(_GATE_HELD.split()[1:])
+    derived = (
+        f"A note that {interior}, and the bricks land Thursday.",
+        _GATE_HELD,
+        f"He mentioned {_GATE_HELD} in passing.",
+        _GATE_PRICE,
+        "",
+    )
+    covered = all(
+        not redact.contains_any_held(cut.mask(text)[0], cut.cut_spans) for text in derived
+    )
+    checks.check(
+        "whatever the backstop would refuse, the masker cuts first",
+        covered,
+        "a passage the masker leaves and the backstop refuses quarantines the recording "
+        "forever, which costs the record more than the leak it prevents",
+    )
+    checks.check(
+        "and masking still leaves ordinary site talk alone",
+        cut.mask(_GATE_PRICE)[0] == _GATE_PRICE,
+        "prices flow; a masker that shreds the record is the same failure wearing a "
+        "different coat",
+    )
+    checks.check(
+        "nothing the redactor reports about a leak quotes the words it is holding",
+        all(
+            _GATE_HELD not in problem
+            for problem in cut.check_publishable(_GATE_TEXT) + cut.problems()
+        ),
+        "these strings reach the ledger, the log and the morning email, and they are "
+        "written exactly when the masker has a bug",
+    )
+
+    # -- the quote, which is where a redaction turns into a shredder ----------------
+    before = extract_module.verify_quote(_GATE_QUOTE, _GATE_TEXT)
+    checks.check("an honest quote verifies against the transcript as transcribed", before.ok,
+                 before.reason)
+    naive = extract_module.verify_quote(_GATE_QUOTE, cut.text)
+    checks.check(
+        "and would FAIL against the redacted one, which is the trap",
+        not naive.ok,
+        "if the item kept its original quote it would be discarded at render — a redaction "
+        "that silently destroys action items",
+    )
+    rewritten = cut.apply_to_quote(_GATE_QUOTE)
+    checks.check("the item's quote is rewritten with the same marker", span.ref in rewritten)
+    checks.check("the rewritten quote carries none of the held words",
+                 _GATE_HELD not in rewritten)
+    checks.check("the rewritten quote keeps the words either side",
+                 "The new chap starts Monday" in rewritten and "site register" in rewritten)
+    after = extract_module.verify_quote(rewritten, cut.text)
+    checks.check(
+        "and it verifies against the published transcript, so the item survives",
+        after.ok,
+        after.reason,
+    )
+
+    # -- putting it back -------------------------------------------------------------
+    restored, put_back = redact.restore_released(cut.text, {span.ref: span.text})
+    checks.check("a released passage goes back exactly where it was said",
+                 restored == _GATE_TEXT and put_back == (span.ref,))
+    left = redact.restore_released(cut.text, {})[0]
+    checks.check("a refused one does not: the marker stays and keeps saying so",
+                 left == cut.text and span.ref in left)
+
+    # -- the fourth file ---------------------------------------------------------------
+    store = WithheldStore(":memory:")
+    other_words = "Carel is off sick with something he does not want written down"
+    other = HeldSpan(
+        item_id="selftest-item", start=0, end=len(other_words), text=other_words,
+        category="personal_circumstances", route="calls", site="Beach Court",
+        source_name=span.source_name, recorded_at=span.recorded_at,
+        recorded_by="selftest-person", reviewer="selftest-person",
+    )
+    held = store.hold(span, mode="on")
+    still = store.hold(other, mode="on")
+    checks.raises(
+        "a machine cannot answer a held passage",
+        Exception,
+        lambda: store.decide(held.hold_id, "released", answered_by="scheduler"),
+    )
+    released = store.release(held.hold_id, answered_by="selftest-person", note="fine to write")
+    rendered = release_module.render_release(
+        released,
+        transcript_name="20260827-141500-Call-Carel-a1b2c3d4.md",
+        still_held=(still.as_span(),),
+    )
+    checks.check("the release file is named after the recording and the passage",
+                 rendered.name.endswith(f"-released-{span.ref}.md"), rendered.name)
+    checks.check("the release file is not named so the record will skip it",
+                 not os.path.basename(rendered.name).startswith("_"))
+    checks.check("the release file's name is one this service may write",
+                 not outputs.check_name(rendered.name),
+                 "; ".join(outputs.check_name(rendered.name)))
+    problems = outputs.check_contract(rendered.text)
+    checks.check("the record will read the release file as a transcript, not an email",
+                 not problems, "; ".join(problems))
+    checks.check("the release file carries the released words", _GATE_HELD in rendered.text)
+    checks.check(
+        "the release file does not repeat the marker's question",
+        not redact.harvestable(rendered.text),
+        "repeating it would put the same open question on the site's page twice, one of "
+        "them already answered",
+    )
+    checks.check("the release file carries no other passage that is still held",
+                 not redact.contains_any_held(rendered.text, [still.as_span()]))
+    checks.raises(
+        "a passage nobody has released has no release file",
+        release_module.NotReleased,
+        lambda: release_module.render_release(still, transcript_name="20260827-x.md"),
+    )
+    refused = store.refuse(
+        store.hold(
+            HeldSpan(
+                item_id="selftest-other", start=0, end=len(other_words), text=other_words,
+                category="personal_circumstances", route="calls",
+                recorded_by="selftest-person", reviewer="selftest-person",
+            ),
+            mode="on",
+        ).hold_id,
+        answered_by="selftest-person",
+    )
+    checks.check("a refusal is kept as a refusal rather than deleted",
+                 refused.decision == "refused" and refused.answered_by == "selftest-person")
+    store.close()
 
 
 # -- 8. the state machine end to end -----------------------------------------------

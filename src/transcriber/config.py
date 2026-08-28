@@ -28,6 +28,7 @@ Environment variables, all read by :meth:`Config.from_env`::
     TRANSCRIBE_ENGINE  + one of OPENAI_API_KEY | ELEVENLABS_API_KEY | AZURE_SPEECH_KEY
                        (+ AZURE_SPEECH_REGION when the engine is azure)
     ANALYSIS_API_KEY ANALYSIS_BASE_URL ANALYSIS_MODEL_CHEAP ANALYSIS_MODEL_STRONG
+    GATE_MODE GATE_HELD_STORE GATE_REVIEW_BASE_URL + per route ROUTE_<NAME>_REVIEWER
     SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASSWORD SMTP_FROM SMTP_TO SMTP_STARTTLS
     HEARTBEAT_URL LEDGER_PATH WORK_DIR WORK_DIR_MAX_BYTES WORK_DIR_KEEP_FINISHED_HOURS
     ORPHAN_FOLDER_ID
@@ -62,6 +63,7 @@ log = logging.getLogger("transcriber.config")
 __all__ = [
     "Config",
     "ConfigError",
+    "GATE_MODES",
     "nested_folder_problems",
     "ENGINES",
     "ENGINE_KEY_VARS",
@@ -89,13 +91,22 @@ SECRET_FIELDS = frozenset(
         "smtp_from",
         "smtp_to",
         "heartbeat_url",
+        # Addresses, on the same footing as the SMTP ones: the house rule is that this
+        # service never prints an email address anywhere, for any reason.
+        "route_reviewers",
     }
 )
+
+#: How much of the sensitivity gate is switched on. It ships **dark** — ``shadow`` classifies
+#: every recording and records what it would have held while withholding nothing — because
+#: the estimates of how much this touches differ by a factor of twenty-five, and arming it
+#: before that number is real is how the review queue becomes a wall.
+GATE_MODES: tuple[str, str, str] = ("off", "shadow", "on")
 
 #: The per-route settings, in the order the wizard asks for them and the ``.env`` writes
 #: them. One list, so config, the wizard and the ``routes`` command cannot disagree about
 #: what a route is made of.
-ROUTE_SUFFIXES = ("LABEL", "SOURCE", "OUTPUT", "ARCHIVE", "ENGINE", "ENABLED")
+ROUTE_SUFFIXES = ("LABEL", "SOURCE", "OUTPUT", "ARCHIVE", "ENGINE", "ENABLED", "REVIEWER")
 
 #: The single-folder variables a pre-routes ``.env`` uses, and the route field each becomes.
 LEGACY_FOLDER_VARS = {
@@ -155,6 +166,10 @@ _SPEC: tuple[_Var, ...] = (
     _Var("analysis_model_cheap", "ANALYSIS_MODEL_CHEAP", "str", "", "the router model — classifies every recording, so nothing is skipped on a guess"),
     _Var("analysis_model_strong", "ANALYSIS_MODEL_STRONG", "str", "", "the model that runs on substantive recordings"),
     _Var("engine_key_expires_on", "ENGINE_KEY_EXPIRES_ON", "str", "", "ISO date the transcription engine key expires, if it has one (optional)"),
+    # --- the sensitivity gate --------------------------------------------------------
+    _Var("gate_mode", "GATE_MODE", "str", "shadow", "off | shadow | on — 'shadow' reads every recording and records what it would have held while withholding nothing; 'on' actually holds a passage back until a person approves it; 'off' does not read for it at all"),
+    _Var("gate_held_store", "GATE_HELD_STORE", "str", "", "path to the store of held passages — the only copy of that text outside the audio, so it is never put in the work directory; empty means held.sqlite3 beside the ledger"),
+    _Var("gate_review_base_url", "GATE_REVIEW_BASE_URL", "str", "", "https address of the page where held passages are approved, linked from the morning email; required before the gate can be switched on"),
     _Var("analysis_key_expires_on", "ANALYSIS_KEY_EXPIRES_ON", "str", "", "ISO date the analysis API key expires, if it has one (optional)"),
     # --- digest email ----------------------------------------------------------------
     _Var("smtp_host", "SMTP_HOST", "str", _REQUIRED, "SMTP host for the morning digest"),
@@ -238,6 +253,19 @@ class Config:
     analysis_model_strong: str = ""
     engine_key_expires_on: str = ""
     analysis_key_expires_on: str = ""
+    # the sensitivity gate
+    #: off | shadow | on. Defaults to ``shadow``: it classifies and measures, and withholds
+    #: nothing. Switching it to ``on`` is the deliberate act of arming it.
+    gate_mode: str = "shadow"
+    #: Where held passages live. Empty means the default beside the ledger — see
+    #: :attr:`held_store_path`, which is what everything should read.
+    gate_held_store: str = ""
+    gate_review_base_url: str = ""
+    #: route name -> the address that reviews that route's held passages; a route absent
+    #: from here, or present with an empty value, is reviewed by the service owner. A staff
+    #: member reviews their own held passages: he sees the count and the site, never the
+    #: words, because staff record voluntarily and can simply stop.
+    route_reviewers: dict[str, str] = field(default_factory=dict)
     # digest
     smtp_host: str = ""
     smtp_port: int = 587
@@ -364,6 +392,26 @@ class Config:
         """Which engine transcribes this route's recordings — its override, or the default."""
         found = self.route(route) if isinstance(route, str) else route
         return (getattr(found, "engine", "") or "").strip() or self.engine
+
+    def reviewer_for(self, route: Route | str | None = None) -> str:
+        """Who reviews this route's held passages. Empty means the service owner.
+
+        Never logged and never printed: ``route_reviewers`` is a secret field for the same
+        reason ``SMTP_TO`` is.
+        """
+        name = route if isinstance(route, str) else getattr(route, "name", "") or ""
+        return str(self.route_reviewers.get(name.strip(), "") or "").strip()
+
+    @property
+    def held_store_path(self) -> str:
+        """Where held passages are kept — the configured path, or the default beside the ledger.
+
+        A held passage is the only copy of that information outside the audio, so it
+        inherits the ledger's discipline rather than the work directory's: the work
+        directory is swept on a disk budget, and a queue that empties itself when a disk
+        fills is the silent-emptying failure this gate exists to refuse.
+        """
+        return _held_store_path(self.gate_held_store, self.ledger_path, self.work_dir)
 
     def engine_key_for(self, route: Route | str | None = None) -> str:
         """The API key for whichever engine this route uses. Empty is a configuration fault."""
@@ -527,6 +575,132 @@ class Config:
                     "settings are ignored completely. Delete them so the file says what the "
                     "service actually does."
                 )
+        # The sensitivity gate. Everything here is refused at startup rather than at 06:00
+        # on the morning somebody first tries to approve something.
+        gate_mode = str(values.get("gate_mode", "shadow") or "shadow").strip().lower()
+        values["gate_mode"] = gate_mode
+        if gate_mode not in GATE_MODES:
+            problems.append(
+                f"GATE_MODE={gate_mode!r} is not one of: " + ", ".join(GATE_MODES)
+                + ". 'shadow' is the default: it reads every recording and records what it "
+                "would have held, and withholds nothing."
+            )
+        review_url = str(values.get("gate_review_base_url") or "").strip()
+        if review_url and not review_url.startswith("https://"):
+            problems.append(
+                f"GATE_REVIEW_BASE_URL={review_url!r} must start with https:// — approvals, "
+                "and the passages behind them, travel over it"
+            )
+        if gate_mode == "on" and not review_url:
+            problems.append(
+                "GATE_REVIEW_BASE_URL is not set, and GATE_MODE=on means passages are held "
+                "back until somebody approves them. Without the review page there is "
+                "nowhere to approve anything and nothing would ever be released. Set the "
+                "address, or run with GATE_MODE=shadow until the page exists."
+            )
+        held_store = _held_store_path(
+            str(values.get("gate_held_store") or ""),
+            str(values.get("ledger_path") or ""),
+            str(values.get("work_dir") or ""),
+        )
+        work_dir_value = str(values.get("work_dir") or "").strip()
+        if gate_mode != "off" and work_dir_value and _is_inside(held_store, work_dir_value):
+            why = (
+                "The work directory is cleared on a disk budget, and a held passage is the "
+                "only copy of that text outside the audio — it would be deleted without "
+                "anybody deciding to."
+            )
+            if str(values.get("gate_held_store") or "").strip() or gate_mode == "on":
+                # Refused when it was pointed there deliberately, and whenever the gate
+                # is armed: a store that is swept on a disk budget is a queue that empties
+                # itself, which is the one thing this gate may never do. Nothing about it
+                # looks wrong at 06:00, which is why it is refused at the keyboard.
+                problems.append(
+                    f"held passages would be kept at {held_store!r}, inside "
+                    f"WORK_DIR={work_dir_value!r}. {why} Set GATE_HELD_STORE to a path "
+                    "outside the work directory."
+                )
+            else:
+                # Only inherited, from a ledger that already lives in the work directory.
+                # That is a configuration people have in the field and it starts today, so
+                # it keeps starting — said out loud rather than refused.
+                notices.append(
+                    f"Held passages would be kept at {held_store}, which is inside the work "
+                    f"directory {work_dir_value}, because that is where LEDGER_PATH points. "
+                    f"{why} Set GATE_HELD_STORE to a path outside the work directory before "
+                    "switching the gate on."
+                )
+
+        # Who reviews each route's held passages. An address, so it is validated like one
+        # and never printed anywhere afterwards.
+        reviewers: dict[str, str] = {}
+        for route in routes:
+            reviewer_var = route_env_var(route.name, "REVIEWER")
+            address = str(source.get(reviewer_var) or "").strip()
+            if not address:
+                continue
+            if not _looks_like_address(address):
+                problems.append(
+                    f"{reviewer_var} is not an email address. It names whoever reviews the "
+                    f"held passages from {_route_phrase(route)}; leave it empty for the "
+                    "service owner to review them."
+                )
+                continue
+            reviewers[route.name] = address
+        values["route_reviewers"] = reviewers
+
+        # The case that actually matters, and the one nothing checked. An empty
+        # ROUTE_<NAME>_REVIEWER is treated as "the service owner reviews them", and
+        # ``withheld.reviewer_for`` then returns the principal for EVERY category — not
+        # just the staff matters that are genuinely his. So the first deployment that arms
+        # the gate on a staff route puts that person's own health, their family
+        # circumstances and everything they asked not be written down onto James's review
+        # page, words, stored context and all. Nobody has to set anything for that to
+        # happen; it is what the default does.
+        #
+        # Decision 6 says why that is not a privacy nicety: staff record voluntarily and
+        # choose whether to keep a folder at all. One of them works out that he reads the
+        # held text from their calls, the rational answer is to stop recording, and then the
+        # recordings are gone. That is the original loss arriving as a social effect, and it
+        # is not fixable in code afterwards — so it is refused at the keyboard, like the
+        # held store inside WORK_DIR, and not discovered at 06:00.
+        unassigned = [route for route in routes if route.enabled and route.name not in reviewers]
+        if unassigned:
+            named = ", ".join(route_env_var(route.name, "REVIEWER") for route in unassigned)
+            plain = (
+                "Without it, every passage held from "
+                + _join_phrases([_route_phrase(route) for route in unassigned])
+                + " goes to the service owner to review — including a staff member's own "
+                "health, their family circumstances, and anything they asked not be written "
+                "down. Only staff disciplinary matters are meant to reach him; the rest a "
+                "person reviews for themselves, and he sees the count and the site."
+            )
+            if gate_mode == "on":
+                problems.append(
+                    f"GATE_MODE=on, and no reviewer is named for: {named}. {plain} Set each "
+                    "one to the address of whoever records on that route, or to the service "
+                    "owner's own address if that route is his."
+                )
+            elif gate_mode == "shadow":
+                notices.append(
+                    f"No reviewer is named for: {named}. Nothing is being withheld in "
+                    f"shadow, so nothing is going anywhere yet. {plain} Set them before "
+                    "switching the gate on."
+                )
+
+        configured_reviewer_vars = {route_env_var(r.name, "REVIEWER") for r in routes}
+        stray_reviewers = sorted(
+            key for key in source
+            if key.startswith("ROUTE_") and key.endswith("_REVIEWER")
+            and key not in configured_reviewer_vars and str(source.get(key) or "").strip()
+        )
+        if stray_reviewers:
+            notices.append(
+                "These name a reviewer for a route that is not configured, so they assign "
+                "nobody: " + ", ".join(stray_reviewers) + ". Held passages from a route with "
+                "no reviewer go to the service owner."
+            )
+
         values["notices"] = tuple(notices)
 
         for name in ("graph_secret_expires_on", "engine_key_expires_on", "analysis_key_expires_on"):
@@ -720,6 +894,16 @@ def _suggest_route_name(name: str) -> str:
     while "--" in cleaned:
         cleaned = cleaned.replace("--", "-")
     return cleaned or "calls"
+
+
+def _join_phrases(phrases: list[str]) -> str:
+    """``a, b and c`` — for a sentence a person reads, not a list a machine parses."""
+    items = [p for p in phrases if p]
+    if not items:
+        return "any route"
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
 
 
 def _route_phrase(route: Route) -> str:
@@ -961,6 +1145,43 @@ def nested_folder_problems(
     return problems
 
 
+def _held_store_path(configured: str, ledger_path: str, work_dir: str) -> str:
+    """Where held passages go: what was configured, or the default beside the ledger.
+
+    One function, used by both the startup validation and :attr:`Config.held_store_path`, so
+    the path that is checked is the path that is used.
+    """
+    explicit = (configured or "").strip()
+    if explicit:
+        return explicit
+    ledger = (ledger_path or "").strip()
+    if ledger and ledger != ":memory:":
+        return os.path.join(os.path.dirname(os.path.abspath(ledger)), "held.sqlite3")
+    # An in-memory ledger is a test or a selftest, never a running service.
+    return os.path.join((work_dir or tempfile.gettempdir()).strip(), "held.sqlite3")
+
+
+def _is_inside(path: str, directory: str) -> bool:
+    """True when ``path`` is ``directory`` or sits under it. Best effort, never raises."""
+    try:
+        target = os.path.abspath(os.path.expanduser(str(path or "")))
+        parent = os.path.abspath(os.path.expanduser(str(directory or "")))
+    except (OSError, ValueError):  # pragma: no cover - abspath on a hostile string
+        return False
+    if not target or not parent:
+        return False
+    return target == parent or target.startswith(parent.rstrip(os.sep) + os.sep)
+
+
+def _looks_like_address(value: str) -> bool:
+    """Enough of an email address to be worth writing down. Checked, then never printed."""
+    text = (value or "").strip()
+    if not text or any(c.isspace() for c in text) or text.count("@") != 1:
+        return False
+    local, _, domain = text.partition("@")
+    return bool(local and "." in domain and not domain.startswith(".") and not domain.endswith("."))
+
+
 def _env_of(name: str) -> str:
     for var in _SPEC:
         if var.name == name:
@@ -1010,7 +1231,9 @@ def _coerce(var: _Var, raw: Any) -> Any:
 #: Fields with no environment variable of their own: the engine keys, which are read from
 #: whichever variable belongs to the engine in use; ``routes``, assembled from ROUTES and the
 #: per-route variables; and ``notices``, which the parse produces rather than reads.
-_DERIVED_FIELDS = frozenset({"engine_key", "engine_keys", "routes", "notices"})
+_DERIVED_FIELDS = frozenset(
+    {"engine_key", "engine_keys", "routes", "notices", "route_reviewers"}
+)
 _SPEC_NAMES = {v.name for v in _SPEC}
 _FIELD_NAMES = {f.name for f in dataclass_fields(Config)} - _DERIVED_FIELDS
 if _SPEC_NAMES != _FIELD_NAMES:

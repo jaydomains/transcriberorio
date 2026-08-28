@@ -336,6 +336,15 @@ def routes_to_values(values: dict[str, str], routes: Sequence[Route]) -> dict[st
     completely, and a file that still lists them is a file that invites somebody to edit
     the setting that does nothing.
     """
+    # Who reviews each route's held passages is a route setting, but it is not one the
+    # folder pickers ask for — it is set with `transcriber config` or by hand. Clearing
+    # every ROUTE_ variable would delete it on the next wizard run, and a reviewer that
+    # quietly reverts to the service owner is exactly the kind of silent change this
+    # service exists to stop, so it is carried across for the routes that survive.
+    reviewers = {
+        key: value for key, value in values.items()
+        if key.startswith("ROUTE_") and key.endswith("_REVIEWER") and str(value or "").strip()
+    }
     for key in [k for k in values if k.startswith("ROUTE_")]:
         del values[key]
     for key in ("SOURCE_FOLDER_ID", "OUTPUT_FOLDER_ID", "ARCHIVE_FOLDER_ID"):
@@ -349,6 +358,9 @@ def routes_to_values(values: dict[str, str], routes: Sequence[Route]) -> dict[st
         values[route_env_var(route.name, "ARCHIVE")] = route.archive_folder_id
         values[route_env_var(route.name, "ENGINE")] = route.engine
         values[route_env_var(route.name, "ENABLED")] = "true" if route.enabled else "false"
+        kept = reviewers.get(route_env_var(route.name, "REVIEWER"))
+        if kept:
+            values[route_env_var(route.name, "REVIEWER")] = kept
     return values
 
 

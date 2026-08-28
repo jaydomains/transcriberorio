@@ -243,6 +243,15 @@ class AnalysisSettings:
     max_transcript_chars: int = 600_000
     classify_excerpt_chars: int = 120_000
     fuzzy_threshold: float = DEFAULT_FUZZY_THRESHOLD
+    #: Whether the strong call is also asked the sensitivity question. True whenever
+    #: ``GATE_MODE`` is not ``off``, including ``shadow`` — shadow's whole job is to measure
+    #: the real classifier, and a shadow run that never asks the question measures nothing
+    #: while reporting a number that reads like "this barely touches anything".
+    #:
+    #: False leaves the analysis pass byte-identical to the day before the gate existed: no
+    #: extra field in the schema, no extra words in the system prompt. A gate that can break
+    #: a transcription while switched off is not off.
+    sensitivity: bool = False
     anthropic_version: str = "2023-06-01"
     extra_headers: Mapping[str, str] = field(default_factory=dict)
     vocabulary: tuple[str, ...] = ()
@@ -331,6 +340,9 @@ class AnalysisSettings:
             timeout_s=max(int(getattr(config, "http_timeout_s", 60) or 60), 300),
             max_attempts=max(int(getattr(config, "max_retries", 4) or 4), 2),
             vocabulary=tuple(getattr(config, "vocabulary", ()) or ()),
+            # The gate's own mode decides it, in one place. ``shadow`` — what ships — asks
+            # the question and withholds nothing; ``off`` does not ask it at all.
+            sensitivity=str(getattr(config, "gate_mode", "off") or "off").strip().lower() != "off",
         )
 
 
@@ -1040,6 +1052,19 @@ class Extraction:
     analysed_at: str = ""
     trivial: bool = False
     redacted: bool = False
+    #: The sensitivity gate's half of the same answer, exactly as the model returned it, or
+    #: ``None`` when the question was not asked or was not answered.
+    #:
+    #: The distinction between ``None`` and ``()`` is load-bearing and is not a nicety:
+    #: ``()`` means "asked, and there is nothing sensitive in this recording", while ``None``
+    #: means "nobody asked" — the gate is off, the recording was trivial and never reached
+    #: the strong model, or the model dropped the field. :meth:`transcriber.pipeline.Pipeline._assess`
+    #: reads them differently, and collapsing the two would let a recording nothing ever
+    #: classified count in the measurement as one the classifier cleared.
+    #:
+    #: ``repr=False`` because each entry carries a verbatim quote of the passage, which is
+    #: the text the whole gate exists to keep out of a log line.
+    sensitive_passages: tuple[Mapping[str, Any], ...] | None = field(default=None, repr=False)
 
     @property
     def items(self) -> tuple[ExtractedItem, ...]:
@@ -1097,6 +1122,13 @@ class Extraction:
             "elapsed_s": round(self.elapsed_s, 3),
             "trivial": self.trivial,
             "redacted": self.redacted,
+            # A count, never the entries. This dict is written into the ledger row and
+            # printed by ``transcriber status``, and every entry carries a verbatim quote of
+            # a passage that may be about to be withheld. ``None`` says the question was
+            # never asked, which is a different fact from "nothing was found".
+            "sensitive_passages_returned": (
+                None if self.sensitive_passages is None else len(self.sensitive_passages)
+            ),
             "observed_by": "agent",
         }
 
@@ -1147,6 +1179,10 @@ if not set(_CATEGORY_KIND.values()) <= set(ITEM_KINDS):
 
 #: Signature of the injectable transport. Takes (url, headers, body) and returns the
 #: decoded JSON response. ``selftest`` and the test suite pass one of these so the whole
+#: The gate's field in the extraction answer. Named once, because it is the single
+#: required field whose absence degrades the pass instead of failing it.
+_SENSITIVITY_FIELD = "sensitive_passages"
+
 #: pass runs offline with no credential and no network.
 Caller = Callable[[str, Mapping[str, str], Mapping[str, Any]], Mapping[str, Any]]
 
@@ -1307,9 +1343,14 @@ class Extractor:
         routing_note = _join(f"{t.category}" for t in routing.triggers)
         payload = self._call(
             model=self.settings.model_strong,
-            system=prompts.EXTRACTION_SYSTEM,
+            # One call, two questions. The sensitivity half is asked here or it is asked
+            # nowhere: the gate's mechanical rules find an explicit "don't write that down"
+            # and a bare identifier, and nothing else. A staff matter, a person's health,
+            # KBC's attorney strategy and its own cost-against-charge are visible only to
+            # whatever reads the transcript, which is this call.
+            system=prompts.extraction_system(sensitivity=self.settings.sensitivity),
             user=prompts.build_extraction_user(text, self._context(hints), routing_note),
-            schema=prompts.EXTRACTION_SCHEMA,
+            schema=prompts.extraction_schema(sensitivity=self.settings.sensitivity),
             schema_name=prompts.EXTRACTION_SCHEMA_NAME,
             max_tokens=self.settings.max_tokens_extract,
             effort=self.settings.effort_strong,
@@ -1444,7 +1485,28 @@ class Extractor:
             unclear=tuple(unclear),
             notes=tuple(notes),
             redacted=redacted,
+            sensitive_passages=self._sensitive_passages(data),
         )
+
+    def _sensitive_passages(self, data: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...] | None:
+        """The gate's half of the answer, or ``None`` when it was not asked or not answered.
+
+        Deliberately not verified, filtered or scored here. Every judgement about a passage —
+        whether its category is one of the six held ones, whether its quote can be located in
+        the transcript, whether its confidence clears the bar — belongs to
+        :mod:`transcriber.sensitivity`, which owns the held band and is the only module that
+        may widen or narrow it. This function's whole job is to carry the answer across
+        without losing the difference between "no" and "not asked".
+        """
+        if not self.settings.sensitivity:
+            return None
+        raw = data.get("sensitive_passages")
+        if not isinstance(raw, (list, tuple)):
+            # The schema puts it in ``required``, so a missing field means the provider
+            # stopped honouring the constraint. The gate then runs on its mechanical rules
+            # and says so in its own notes rather than reading silence as "nothing here".
+            return None
+        return tuple(entry for entry in raw if isinstance(entry, Mapping))
 
     def _one_item(
         self,
@@ -1714,6 +1776,19 @@ class Extractor:
             raise AnalysisResponseError(f"{model} answered with a {type(data).__name__}, not an object")
 
         missing = [key for key in schema.get("required", ()) if key not in data]
+        if _SENSITIVITY_FIELD in missing:
+            # The one required field whose absence may not stop a recording. It is in
+            # ``required`` because strict structured output demands that every property be,
+            # but the gate is a passenger on this call: in ``shadow`` nothing is withheld at
+            # all, and a provider dropping the field would otherwise quarantine a recording
+            # for the sake of a measurement. The pass degrades to its mechanical rules and
+            # ``sensitivity.assess`` says so in the report's own notes.
+            missing = [key for key in missing if key != _SENSITIVITY_FIELD]
+            log.warning(
+                "%s did not return %s, so this recording was read for sensitive passages by "
+                "the mechanical rules alone. Nothing about the transcript changed.",
+                model, _SENSITIVITY_FIELD,
+            )
         if missing:
             raise AnalysisResponseError(
                 f"{model}'s answer is missing required field(s): {', '.join(missing)}. "

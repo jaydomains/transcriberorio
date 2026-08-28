@@ -28,6 +28,33 @@ one recording with a summary and no transcript, which is the worst possible rema
 derived reading survives and the evidence for it does not. Rendering happens for all three
 before any upload begins, the transcript goes up first, each one is read back from Graph
 before success is returned, and nothing short of all three lets the ledger advance.
+
+Held passages, and why all three files are gated equally
+--------------------------------------------------------
+
+When the sensitivity gate is armed, the pipeline hands this module a transcript whose held
+passages have already been cut out and replaced by their markers, and — in
+:attr:`OutputContext.held` — the passages themselves, so that the last thing standing
+between held words and OneDrive is a check that does not trust any of the work above it.
+
+**All three files are still written, on time, every time.** Only the *words* wait. That is
+what makes "hold indefinitely" a safe default rather than a way to lose recordings: nothing
+about a passage awaiting approval delays the transcript, the summary or the proposals, and
+the marker left in place says a passage is held, what kind it is, when it was said and how
+to ask for it. A hole that says nothing would be indistinguishable from a conversation in
+which nothing was said, and that is the failure this whole service exists to cure.
+
+**The summary and the actions file are gated exactly as tightly as the transcript**, and
+they have to be, because they are the more likely leak. Both are written by a model reading
+the *unredacted* transcript — it must be unredacted, or quote verification cannot tell an
+invented quote from a masked one — so the model can and does restate in its own prose what
+the transcript masks in its own words. :func:`transcriber.redact.redact_extraction` masks
+them from the same redaction that cut the transcript; :func:`refuse_held_text` then re-reads
+every rendered file, whole, with :func:`transcriber.redact.contains_any_held`, and refuses
+**the entire publish** if any of the three still carries a held passage — not just the file
+that carries it. A partially redacted set is worse than an unredacted one, because it looks
+redacted. That check shares no reasoning with the masking it is checking: the masker is the
+thing that might have a bug, and a guard that reasons the same way guards nothing.
 """
 
 from __future__ import annotations
@@ -37,7 +64,7 @@ import logging
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
@@ -55,6 +82,8 @@ from .models import (
     strip_owner_paths,
 )
 from .naming import OutputNames, ParsedName, output_names
+from . import redact
+from .redact import contains_any_held, held_words_in
 
 # extract.Extraction and its proposals are read by attribute rather than imported. The
 # renderers stay pure functions over plain data, testable with a stand-in and with no
@@ -62,7 +91,9 @@ from .naming import OutputNames, ParsedName, output_names
 
 __all__ = [
     "OutputContractError",
+    "HeldTextWouldLeak",
     "UploadIncompleteError",
+    "refuse_held_text",
     "OutputContext",
     "RenderedFile",
     "UploadedFile",
@@ -131,6 +162,27 @@ class OutputContractError(ValueError):
     """
 
 
+class HeldTextWouldLeak(OutputContractError):
+    """A rendered file still carries words a person has not agreed to write down.
+
+    Raised before any upload, and it stops **all three** files, not the one that carries the
+    passage. Two files redacted and one not is worse than three unredacted ones: it looks
+    like the gate worked.
+
+    An :class:`OutputContractError` deliberately, so it takes the path this service already
+    has for a file it must not write — never retried, because the same transcript renders
+    the same way, and quarantined loudly with the reason in words a person can act on. What
+    a person needs to know is *which* passage survived and into *which* file, so both are
+    named; the words themselves are not, because naming them here would put them in the
+    ledger, the log and the morning email, which is the leak this stopped.
+    """
+
+    def __init__(self, message: str, *, refs: Sequence[str] = (), files: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.refs = tuple(refs)
+        self.files = tuple(files)
+
+
 class UploadIncompleteError(RuntimeError):
     """Fewer than three files are confirmed present. The ledger must not advance.
 
@@ -175,6 +227,18 @@ class OutputContext:
     web_url: str = ""
     engine: str = ""
     notes: tuple[str, ...] = ()
+    #: The passages cut out of ``transcript`` before it got here — the pipeline's
+    #: :class:`transcriber.withheld.HeldSpan` objects, carrying the words themselves so that
+    #: :func:`refuse_held_text` can search every rendered file for them.
+    #:
+    #: Empty in ``GATE_MODE=off`` and in ``shadow``, because those modes cut nothing and so
+    #: nothing can have survived a cut. Empty is therefore not "unknown" and not "not
+    #: checked": it is "there was nothing to leak", which is why the backstop can treat an
+    #: empty tuple as a pass rather than as a reason to refuse.
+    #:
+    #: ``repr=False`` and out of every rendered line: these are the words the whole gate
+    #: exists to keep out of a file.
+    held: tuple[Any, ...] = field(default=(), repr=False)
 
     @property
     def names(self) -> OutputNames:
@@ -289,6 +353,16 @@ def render_transcript(ctx: OutputContext) -> str:
         "`observed_by: agent`.",
         "",
     ]
+    # Before the provenance and before a word of the call. The record files the FIRST
+    # twenty questions it finds in a transcript, in the order they appear, and a hold
+    # marker sits down in the body among forty questions from a site walk — so on exactly
+    # the recordings most likely to carry a hold, every hold question fell off the end of
+    # that cap and the site's live page said nothing. Up here it cannot be pushed off, and
+    # because it is the marker's own sentence the record de-duplicates the two into one.
+    body += redact.held_preamble(
+        ctx.held,
+        site=str(getattr(ctx.extraction, "site", "") or ""),
+    )
     body += _provenance(ctx)
     body += ["", "## What was said", ""]
 
@@ -445,10 +519,74 @@ def render_all(ctx: OutputContext) -> tuple[RenderedFile, ...]:
             f"{ctx.source_name!r} produced fewer than three distinct output names "
             f"({', '.join(names.as_tuple())}); two files would overwrite each other"
         )
-    return (
+    files = (
         RenderedFile("transcript", names.transcript, render_transcript(ctx)),
         RenderedFile("summary", names.summary, render_summary(ctx)),
         RenderedFile("actions", names.actions, render_actions(ctx)),
+    )
+    refuse_held_text(files, ctx.held, source_name=ctx.source_name)
+    return files
+
+
+def refuse_held_text(
+    files: Sequence[RenderedFile],
+    held: Sequence[Any],
+    *,
+    source_name: str = "",
+) -> None:
+    """Refuse the whole publish if any rendered file still carries a held passage.
+
+    The mechanical backstop, and deliberately a dumb one. It does not know how the masking
+    was done, does not consult the redaction that did it, and does not trust that it worked:
+    it takes the words that were cut out of the transcript and looks for them, whole or in
+    runs, in the finished bytes of all three files. The thing most likely to have a bug is
+    the masker, and a guard that shares the masker's reasoning guards nothing.
+
+    **All three files are refused together, whichever one carries the passage.** A set with
+    the transcript masked and the summary not is worse than a set with neither masked,
+    because it presents itself as redacted and nobody looks twice at it.
+
+    The three files are checked on equal terms, and the two derived ones are the ones this
+    is really for. The transcript was cut at exact offsets and is the easy case; the summary
+    and the proposals are a model's prose about the *unredacted* transcript — it has to be
+    unredacted, or quote verification cannot tell an invented quote from a masked one — so
+    they are free to restate in other words what the transcript no longer says. They are
+    masked upstream by searching for the held words; this is what catches the occasion when
+    that search missed.
+
+    Empty ``held`` is a pass, not a skip: nothing was cut, so there is nothing that could
+    have survived a cut. That is the state of every recording in ``shadow`` and ``off``.
+    """
+    spans = tuple(held or ())
+    if not spans:
+        return
+    problems: list[str] = []
+    refs: list[str] = []
+    leaking: list[str] = []
+    for rendered in files:
+        if not contains_any_held(rendered.text, spans):
+            continue
+        # Asked again, for the detail: which passage, and how much of it is showing. The
+        # answer above is the one that decides; this only writes the sentence a person reads.
+        for span, words, why in held_words_in(rendered.text, spans):
+            ref = str(getattr(span, "ref", "") or "?")
+            phrase = str(getattr(span, "phrase", "") or "a held passage")
+            refs.append(ref)
+            leaking.append(rendered.name)
+            problems.append(
+                f"the {rendered.kind} file ({rendered.name}) still contains held passage "
+                f"{ref} ({phrase}) — {why}"
+            )
+    if not problems:
+        return
+    raise HeldTextWouldLeak(
+        f"{source_name or 'this recording'} has passages a person has not agreed to write "
+        f"down yet, and they survived into the files that were about to be uploaded, so "
+        f"none of the three has been written: " + "; ".join(problems) + ". Nothing was "
+        "uploaded, nothing was moved and nothing was deleted; the passages are in the held "
+        "queue and the recording is where it was.",
+        refs=tuple(dict.fromkeys(refs)),
+        files=tuple(dict.fromkeys(leaking)),
     )
 
 
@@ -501,6 +639,22 @@ def _provenance(ctx: OutputContext) -> list[str]:
     safe_url = _safe_web_url(ctx.web_url)
     if safe_url:
         rows.append(("Recording in OneDrive", safe_url))
+    if ctx.held:
+        # Stated, not implied. The markers say it where the words were, but a reader who
+        # opens the summary or the proposals sees no marker at all unless one happened to be
+        # quoted — and "this file is complete" and "this file is complete except for two
+        # passages" are different claims. Counts and references only: the references are
+        # already printed in the transcript beside each marker, and are how a person asks
+        # for the words back. Nothing here is a word of what was held.
+        count = len(ctx.held)
+        rows.append(
+            (
+                "Passages held for review",
+                f"{count} ({', '.join(str(getattr(s, 'ref', '?')) for s in ctx.held)}) — "
+                f"marked in place in the transcript, nothing was deleted, and nothing is "
+                f"released until a person says so",
+            )
+        )
     rows.append(("observed_by", "agent"))
 
     lines = [f"- {key}: {_inline(value)}" for key, value in rows if str(value).strip()]
@@ -932,6 +1086,7 @@ def upload_outputs(
     parent_id: str,
     files: Sequence[RenderedFile],
     *,
+    held: Sequence[Any] = (),
     verify_bytes: bool = False,
     orphan_folder_id: str = "",
     work_dir: str = "",
@@ -954,6 +1109,13 @@ def upload_outputs(
             f"expected three files and was given {len(files)}: "
             + ", ".join(f.kind for f in files)
         )
+
+    # The last thing before the wire, and the second time it is asked. ``render_all`` already
+    # refused these bytes once; this is the check on the way *out* rather than on the way in,
+    # in the same place and for the same reason ``_refuse_unverified`` is asked twice. It
+    # costs one pass over three small strings and it is the only thing standing between a
+    # masking bug and a held passage in the record, from which nothing can take it back.
+    refuse_held_text(files, held)
 
     uploaded: list[UploadedFile] = []
     remaining = [f.name for f in files]
@@ -1019,12 +1181,14 @@ def publish(
 
     Rendering happens first and completely: a contract failure in the actions file stops the
     transcript from ever being uploaded, which is the cheapest possible place for all-or-none
-    to be decided.
+    to be decided. A held passage surviving into any one of the three is the same kind of
+    failure and takes the same path — it stops all three, before the first byte.
     """
     return upload_outputs(
         client,
         parent_id,
         render_all(ctx),
+        held=ctx.held,
         verify_bytes=verify_bytes,
         orphan_folder_id=orphan_folder_id,
         work_dir=work_dir,
@@ -1245,6 +1409,27 @@ def _refuse_unverified(proposals: Sequence[Any], ctx: OutputContext) -> None:
     Two checks rather than one because this is the guard that stops a misheard word from
     hardening into a task, and a guard on the way in is not the same as a guard on the way
     out. The ``exact`` claim is re-tested against the transcript for the same reason.
+
+    **The sensitivity gate could have turned this guard into a shredder, and does not.**
+    ``extract.py`` verifies each quote against the transcript as transcribed and discards
+    any item whose quote it cannot find; ``ctx.transcript`` here is the transcript *after*
+    held passages were cut out of it. Redact the transcript and leave the items alone and
+    every item quoting a held passage fails this check — which raises rather than dropping
+    it, so the whole recording quarantines and no action item is lost, but that is a
+    quarantine a day for a gate working correctly, which is a gate somebody switches off.
+
+    So it is solved upstream instead, and the solution is an ordering rather than a
+    weakening of anything here: verification runs first, on the unredacted text, because
+    only that text can answer "did the model invent this?" — and the gate then rewrites each
+    surviving quote through :meth:`transcriber.redact.Redaction.apply_to_quote`, replacing
+    exactly the held part with exactly the marker that replaced it in the transcript. The
+    rewritten quote is still a literal substring of the published transcript, so the check
+    below passes because it is true, not because it was loosened. An item quoting *only*
+    held words is withheld as an item — kept, counted, listed as held in every file's notes,
+    never silently dropped and never written out.
+
+    Nothing in this function may be relaxed to accommodate the gate. If a quote ever fails
+    here on a redacted recording, the masking is wrong and the recording must not publish.
     """
     # Both sides redacted the same way. ``ExtractedItem`` rewrites a quote containing an
     # address into "[address removed]", and comparing that against the raw transcript failed
@@ -1254,14 +1439,14 @@ def _refuse_unverified(proposals: Sequence[Any], ctx: OutputContext) -> None:
     raw = ctx.transcript.text or ""
     haystack = _loose(raw)
     redacted_haystack = _loose(strip_dictated_emails(strip_emails(raw)))
-    for proposal in proposals:
+    for index, proposal in enumerate(proposals, start=1):
         item = getattr(proposal, "item", proposal)
         quote = str(getattr(item, "quote", "") or "").strip()
-        text = str(getattr(item, "text", "") or "").strip()
+        where = _identify(proposal, item, index)
         if not quote:
             raise OutputContractError(
-                f"{ctx.source_name!r}: an item ({text[:60]!r}) has no verbatim quote, which "
-                f"makes it an assertion rather than an observation"
+                f"{ctx.source_name!r}: {where} has no verbatim quote, which makes it an "
+                f"assertion rather than an observation"
             )
         if getattr(item, "observed_by", "agent") != "agent":
             raise OutputContractError(
@@ -1270,23 +1455,50 @@ def _refuse_unverified(proposals: Sequence[Any], ctx: OutputContext) -> None:
             )
         if not getattr(item, "quote_verified", False):
             raise OutputContractError(
-                f"{ctx.source_name!r}: an item quoting {quote[:60]!r} did not pass quote "
-                f"verification and must go to the review list, never to an output"
+                f"{ctx.source_name!r}: {where} did not pass quote verification and must go "
+                f"to the review list, never to an output"
             )
         check = getattr(proposal, "quote_check", None)
         if check is not None and not bool(getattr(check, "ok", True)):
             raise OutputContractError(
-                f"{ctx.source_name!r}: an item quoting {quote[:60]!r} carries a failed quote "
-                f"check and must not be written out"
+                f"{ctx.source_name!r}: {where} carries a failed quote check and must not be "
+                f"written out"
             )
         method = str(getattr(check, "method", "") or "") if check is not None else ""
         needle = _loose(quote)
         found = (needle in haystack) or (needle in redacted_haystack)
         if method == "exact" and haystack and not found:
             raise OutputContractError(
-                f"{ctx.source_name!r}: an item claims an exact quote match for "
-                f"{quote[:60]!r}, but those words are not in the transcript"
+                f"{ctx.source_name!r}: {where} claims an exact quote match, but those words "
+                f"are not in the transcript"
+                + (
+                    ". This recording had passages held for review, so the likeliest cause "
+                    "is that the item's quote was not rewritten with the same markers the "
+                    "transcript was cut with — the words were said, and nothing about them "
+                    "is invented. Nothing was written"
+                    if ctx.held
+                    else ""
+                )
             )
+
+
+def _identify(proposal: Any, item: Any, index: int) -> str:
+    """Which item this is, without repeating a word of it.
+
+    These messages are raised as :class:`OutputContractError`, which the pipeline never
+    retries, so they go to the ledger's ``quarantine_reason``, out through the morning
+    email's "Technical detail:" line, and into the log. On a redacted recording an item's
+    quote still carries the held words *by definition* — the raise only fires when the
+    quote failed to be rewritten — so interpolating sixty characters of it here would put a
+    staff matter or an identity number in James's inbox, on the one path that exists to
+    prevent exactly that. The operator's next step is to open the ledger row for the
+    recording either way, and the category and position are what find it.
+
+    No error message in this service should be able to carry transcript text, so this
+    carries none, held recording or not. A rule with an exception is a rule somebody edits.
+    """
+    category = str(getattr(proposal, "category", "") or getattr(item, "kind", "") or "?")
+    return f"item {index} in {category}"
 
 
 def _loose(text: str) -> str:
