@@ -39,6 +39,7 @@ import os
 import re
 import socket
 import sqlite3
+import stat
 import threading
 import time
 from contextlib import contextmanager
@@ -282,6 +283,8 @@ class Ledger:
         # being permanent.
         self._scrub = scrub if callable(scrub) else None
         self._memory = path == ":memory:" or path.startswith("file::memory:")
+        #: Said once per ledger, not per connection — see _restrict_permissions.
+        self._permission_warning_given = False
         self._local = threading.local()
         self._shared: sqlite3.Connection | None = None
         self._lock = threading.RLock()
@@ -309,7 +312,47 @@ class Ledger:
         # failure this service removes, so durability wins over write speed at this volume.
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA foreign_keys=ON")
+        self._restrict_permissions()
         return conn
+
+    def _restrict_permissions(self) -> None:
+        """Make the ledger readable only by the account that runs the service.
+
+        It is not just state. Quarantine reasons, last errors and the disagreement log all
+        carry fragments of what was said, and the sensitivity gate will hold whole withheld
+        passages here — so on a shared host this file is one of the most revealing things on
+        the machine. The work directory was already locked down and this was not, which is
+        the kind of gap that survives precisely because the file looks like bookkeeping.
+
+        SQLite writes ``-wal`` and ``-shm`` beside it, and they carry the same content, so
+        all three are set. Best effort by design: a volume that will not take a chmod (a
+        Windows bind mount, some container filesystems) must not stop the service starting —
+        losing recordings is the worse failure. It is done on every connection because WAL
+        files come and go.
+        """
+        if self._memory:
+            return
+        for suffix in ("", "-wal", "-shm"):
+            target = self.path + suffix
+            try:
+                if os.path.exists(target):
+                    os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError as exc:
+                # Said once, not per connection: a warning on every database open is noise
+                # nobody reads, and noise nobody reads is how a real warning gets missed.
+                # But it MUST be said — an earlier version claimed config reported this,
+                # and config only warns about the work directory, so the one gap this
+                # method exists to close was itself closing silently.
+                if not self._permission_warning_given:
+                    self._permission_warning_given = True
+                    log.warning(
+                        "ledger-permissions",
+                        "could not restrict the ledger to this account only; it holds "
+                        "fragments of what was said and may be readable by other users "
+                        "on this machine",
+                        file=os.path.basename(target),
+                        error=str(exc),
+                    )
 
     def _conn(self) -> sqlite3.Connection:
         # An in-memory database is per-connection, so threads must share one; a file

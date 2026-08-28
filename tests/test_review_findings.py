@@ -940,3 +940,72 @@ def _accepting_smtp(host: str, port: int, timeout: float | None = None) -> _Acce
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TheLedgerFileIsNotWorldReadable(unittest.TestCase):
+    """The work directory was locked down and the ledger was not.
+
+    It looks like bookkeeping, which is why the gap survived — but quarantine reasons, last
+    errors and the disagreement log all carry fragments of what was said, and the
+    sensitivity gate will hold whole withheld passages here. On a shared host it is one of
+    the most revealing files on the machine.
+    """
+
+    def test_the_database_and_its_wal_are_owner_only(self) -> None:
+        import stat as _stat
+        import tempfile as _tempfile
+
+        with _tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.sqlite3")
+            with Ledger(path) as ledger:
+                ledger.cursor_set("worker:last_cycle_error_detail", "x")  # a write, so a WAL exists
+                for suffix in ("", "-wal"):
+                    target = path + suffix
+                    if not os.path.exists(target):
+                        continue
+                    mode = _stat.S_IMODE(os.stat(target).st_mode)
+                    self.assertEqual(
+                        mode, 0o600,
+                        f"{os.path.basename(target)} is mode {mode:o}; it carries "
+                        "fragments of what was said",
+                    )
+
+    def test_a_filesystem_that_refuses_chmod_does_not_stop_the_service(self) -> None:
+        """Losing recordings is the worse failure, so this is best effort by design."""
+        import tempfile as _tempfile
+        from unittest import mock
+
+        with _tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.sqlite3")
+            with mock.patch("transcriber.ledger.os.chmod", side_effect=OSError("read-only")):
+                with Ledger(path) as ledger:
+                    ledger.cursor_set("worker:last_cycle_error_detail", "x")
+                    self.assertEqual(
+                        ledger.cursor_get("worker:last_cycle_error_detail"), "x"
+                    )
+
+    def test_a_refused_chmod_is_said_out_loud_exactly_once(self) -> None:
+        """The gap this method closes was itself closing silently.
+
+        An earlier version swallowed the failure with a comment claiming config reported
+        it. Config only warns about the work directory, so nothing anywhere said the ledger
+        had been left readable — in a change whose entire point is that the file is
+        sensitive. Found by a review bot on the pull request, which was right.
+        """
+        import logging as _logging
+        import tempfile as _tempfile
+        from unittest import mock
+
+        with _tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ledger.sqlite3")
+            with mock.patch("transcriber.ledger.os.chmod", side_effect=OSError("read-only")):
+                with self.assertLogs("transcriber.ledger", level=_logging.WARNING) as caught:
+                    with Ledger(path) as ledger:
+                        # Several connections and several writes: the warning is once per
+                        # ledger, not once per connection, or it becomes noise nobody reads.
+                        ledger.cursor_set("worker:last_cycle_error_detail", "x")
+                        ledger.cursor_set("worker:last_cycle_error_detail", "y")
+
+        said = [line for line in caught.output if "readable by other users" in line]
+        self.assertEqual(len(said), 1, f"expected exactly one warning, got: {caught.output}")
+        self.assertIn("readable by other users", said[0])
