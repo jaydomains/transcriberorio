@@ -672,11 +672,13 @@ class ALongNameStillFitsTheSubjectLine(unittest.TestCase):
 
     #: Names at or near ``autoname``'s ceiling, in the shape speech actually produces:
     #: several words, none of them long. Built from real site titles in the record.
+    #: The ceiling moved from 60 to 66 when the date and time joined the name, so these
+    #: carry a stamp of their own — which is also the shape a real long name now has.
     LONG_NAMES = (
-        "MILTON COURT NORTH ELEVATION REMEDIAL WATERPROOFING PACKAGE",   # 59
-        "CANTERBURY SQUARE PHASE TWO REMEDIAL AND SCAFFOLDING WORKS",    # 58
-        "GARDEN ROUTE MALL ROOF REMEDIALS AND STORM DAMAGE MAKE GOOD",   # 59
-        "THE OVAL COLLINGTON AND FERNWOOD OFFICE WINDOW REPLACEMENT",    # 58
+        "MILTON COURT NORTH ELEVATION REMEDIAL WATERPROOFING 060826 1622",   # 63
+        "CANTERBURY SQUARE PHASE TWO SCAFFOLD AND SNAG WALKS 060826 1622",   # 63
+        "GARDEN ROUTE MALL ROOF REMEDIALS AND STORM MAKE GOOD 060826 1622",   # 64
+        "THE OVAL COLLINGTON AND FERNWOOD WINDOW REPLACEMENT 060826 1622",   # 63
     )
 
     def test_the_fixtures_really_are_at_the_ceiling(self) -> None:
@@ -996,6 +998,125 @@ class TheRealRecordStillFilesItUnderTheSameSite(unittest.TestCase):
             "then score that site on every named recording, whatever the recording is "
             "about.",
         )
+
+
+class TheDateAlwaysFitsAndIsNeverTheThingDropped(unittest.TestCase):
+    """No emitted name may exceed the ceiling, and the date is never what makes room.
+
+    Found by a review bot on the change that added the date. Dropping the activity to fit
+    was implemented; re-measuring what was left was not, so a long site name plus the twelve
+    characters of the stamp produced a name over the ceiling that was decided and applied in
+    silence. The ceiling is not decoration — the record cuts a subject at ninety, and a cut
+    subject is two rows in a site's correspondence log that read the same.
+
+    The room is now reserved before anything is measured, because both ways of making an
+    over-long name fit afterwards are wrong: dropping the date drops the thing he asked for,
+    and cutting a site name short names somewhere else or nowhere at all.
+    """
+
+    MOMENT = datetime(2026, 8, 6, 16, 22, 19, tzinfo=SAST)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="naming-ceiling-")
+        cls.book = real_site_book(cls._tmp.name)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def _decide(self, site: str) -> Any:
+        lines = [f"Right, we are at {site} this morning with the managing agent.",
+                 "The scaffold is up and the crew started yesterday on the north side.",
+                 f"That is {site} done for today, I will send the photographs tonight."]
+        transcript = transcript_of(lines)
+        ctx = context(transcript=transcript, extraction=extraction_of(site=site))
+        return autoname.decide(
+            parsed=ctx.parsed, extraction=ctx.extraction,
+            spoken=outputs.spoken_body(transcript), duration_s=754.0,
+            book=self.book,
+            render=lambda name: outputs.render_transcript(
+                OutputContext(**{**ctx.__dict__, "display_name": name})),
+            apply=True, min_seconds=120, recorded_at=self.MOMENT,
+        )
+
+    def test_a_site_name_too_long_to_carry_a_date_is_refused_not_truncated(self) -> None:
+        # One character past the room left once the date has taken its own. Refused with a
+        # reason a person can read, rather than silently shortened.
+        too_long = "BEACHWOOD " * 6                       # 60 characters, well over 54
+        decision = self._decide(too_long.strip())
+
+        self.assertEqual(decision.code, "N4")
+        self.assertEqual(decision.name, "")
+        self.assertIn("too long", decision.why)
+
+    def test_no_name_it_emits_can_ever_pass_the_ceiling(self) -> None:
+        """Swept over every site the record has, not argued from the code."""
+        emitted = 0
+        for entry in self.book.sites.values():
+            title = str(entry.get("title") or "")
+            with self.subTest(site=title):
+                decision = self._decide(title)
+                if not decision.name:
+                    continue
+                emitted += 1
+                self.assertLessEqual(
+                    len(decision.name), autoname._MAX_NAME,
+                    f"{decision.name!r} is over the ceiling and would be cut by the record, "
+                    f"which puts two rows reading the same in one site's log",
+                )
+                # And the date is on every one of them, which is the other half: the
+                # trimming must never have reached it.
+                self.assertTrue(decision.name.endswith(autoname._his_stamp(self.MOMENT)),
+                                decision.name)
+        self.assertGreater(emitted, 10, "no names were emitted, so this proved nothing")
+
+    def test_the_ceiling_holds_for_a_site_longer_than_any_he_has_today(self) -> None:
+        """The reachable half of the bug, on a book built to reach it.
+
+        His longest real site title is forty characters, so nothing in the record can
+        currently produce an over-long name — which is why the bug the review found was
+        invisible to every other test here. It becomes reachable the day a site with a
+        longer name is added, and sites get added.
+
+        Built with a book of one long site rather than left to that day.
+        """
+        # Fifty-nine: past the room left once the date has taken its own (54), and inside
+        # the whole-name ceiling (66) so that N4 is the rule under test rather than N1.
+        title = "Rondebosch Heights Phase Two Remedial Waterproofing Package"
+        self.assertGreater(len(title), autoname._MAX_NAME - autoname._STAMP_ROOM)
+        self.assertLessEqual(len(title), autoname._MAX_NAME)
+
+        with tempfile.TemporaryDirectory(prefix="naming-long-site-") as tmp:
+            target = os.path.join(tmp, "sites.json")
+            with open(target, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "vocab_contract": sitebook.CONTRACT,
+                    "generated_at": "2026-08-28",
+                    "sites": {"rondebosch-heights-phase-two": {
+                        "slug": "rondebosch-heights-phase-two",
+                        "title": title,
+                        "monday_item_id": "1234567890",
+                        "status_raw": "", "contractors_raw": "", "client_org_raw": "",
+                        "supervisor_raw": "", "timeline_raw": "", "kbc_owners_raw": "",
+                    }},
+                }, handle)
+            long_book = sitebook.load(target)
+
+        self.assertTrue(long_book, "the one-site book did not load")
+        original, self.book = self.book, long_book
+        try:
+            decision = self._decide(title)
+        finally:
+            self.book = original
+
+        # Refused, and named as too long. Before the fix the site sailed past N4 — which
+        # measured it against the whole ceiling rather than the ceiling less the date — and
+        # the second guard did not measure at all, so a 79-character name was applied in
+        # silence and the record cut it at ninety.
+        self.assertEqual(decision.code, "N4", decision.why)
+        self.assertEqual(decision.name, "")
+        self.assertIn("too long", decision.why)
 
 
 if __name__ == "__main__":       # pragma: no cover

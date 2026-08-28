@@ -172,7 +172,7 @@ ITEM_ID = "01BYE5RZ6QN3ZWBTUFOFD3GSPGOHDJD36K"
 #: says it. Only the last two may ever reach his screen.
 SLUG = "canterbury-square"
 TITLE = "Canterbury Square"
-NAME = "CANTERBURY"
+NAME = "CANTERBURY 060826 1622"
 
 
 def _decision(**overrides: Any) -> dict[str, Any]:

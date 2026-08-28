@@ -95,10 +95,20 @@ STOP_SITES = frozenset({
     "the scheme", "the complex", "the property", "the premises", "the depot",
 })
 
-#: Shortest and longest a proposed name may be. Sixty leaves room inside the subject line's
-#: ninety for the longest suffix the renderers append; his longest real name is 49.
+#: Shortest and longest a proposed name may be, INCLUDING the date and time appended to it.
+#: The subject line is cut at ninety and the longest suffix the renderers append is
+#: ``" — proposals to confirm"`` at twenty-four, leaving sixty-six. His longest real name is
+#: 49; with a date and time on the end that is 61, so the room is there and it is measured
+#: rather than assumed.
 _MIN_NAME = 3
-_MAX_NAME = 60
+_MAX_NAME = 66
+
+#: What the date and time cost. Reserved out of the ceiling at N4, so the room for the date
+#: is taken before anything else is measured and the date can never be the thing that gets
+#: dropped to make a name fit — he asked for the date, and a title without one is the thing
+#: he asked to have fixed. Fifty-four characters are left for the site, against a longest
+#: real name of forty-nine.
+_STAMP_ROOM = len(" 060826 1622")
 
 #: How early the first mention must fall, and how far apart the first and last must be, as
 #: fractions of the transcript. Together they say "this recording is ABOUT this site"
@@ -258,6 +268,7 @@ def decide(
     render: Callable[[str], str],
     apply: bool,
     min_seconds: int,
+    recorded_at: Any = None,
     opening_seconds: float = declaration.DEFAULT_WINDOW_S,
 ) -> NameDecision:
     """Work out what to call this recording, or refuse. **Never raises.**
@@ -299,10 +310,19 @@ def decide(
                                 f"nothing in the recording to take the name from")
     span = _normalise(spoken[match[0]:match[1]])
 
-    # N4 — the span looks like a name.
-    if not _NAME_SHAPE.fullmatch(span) or not (_MIN_NAME <= len(span) <= _MAX_NAME):
+    # N4 — the span looks like a name, and leaves room for the date on the end.
+    #
+    # The room is reserved HERE rather than trimmed later, because the only two ways to
+    # make an over-long name fit are both wrong: dropping the date is dropping the thing he
+    # asked for, and cutting a site name short names somewhere else or nowhere. A site whose
+    # name will not fit in fifty-four characters is refused, plainly, and his longest real
+    # one is forty-nine.
+    if not _NAME_SHAPE.fullmatch(span) or len(span) < _MIN_NAME:
         return NameDecision(decided=True, code="N4", span=span, book=book_name,
                             why="the words it is named by do not read as a name")
+    if len(span) > _MAX_NAME - _STAMP_ROOM:
+        return NameDecision(decided=True, code="N4", span=span, book=book_name,
+                            why=f"{span!r} is too long to be a title with the date on it")
 
     # N6 — the span names exactly one site the record knows about.
     #
@@ -369,14 +389,31 @@ def decide(
                                     f"much as {span}, so it does not say plainly enough "
                                     f"which one it is about")
 
-    # N8 — the name survives being made into a name, with the activity he announced.
+    # N8 — the name survives being made into a name, with the activity he announced and
+    # the date and time it was made.
+    #
+    # The date is WRITTEN here, never read, and that distinction is the whole reason it is
+    # safe. `naming.parse_source_name` refuses to read the trailing digits of a hand-typed
+    # name because "270826" is 27 August written the way a person writes it and would be
+    # 2027 read as the machine's YYMMDD — a recording filed a year into the future. Nothing
+    # of the sort can happen in this direction: the moment comes from the recorder's own
+    # clock, pinned to the row, and is formatted the way he writes it.
     activity = declaration.activity_in(window.text) if declared else ""
-    candidate = " ".join(part for part in (span.upper(), activity) if part).strip()
+    stamp = _his_stamp(recorded_at)
+    head = " ".join(part for part in (span.upper(), activity) if part).strip()
+    candidate = " ".join(part for part in (head, stamp) if part)
     if (naming.safe_stem(candidate) != candidate or is_recorder_default(candidate)
             or len(candidate) > _MAX_NAME):
-        candidate = span.upper()
+        # Drop the activity before the date. A site and a date is a name he writes —
+        # "CANTERBURY 6 AUGUST" — and a site with an activity and no date is the shape he
+        # asked to have fixed.
+        candidate = " ".join(part for part in (span.upper(), stamp) if part)
         activity = ""
-    if naming.safe_stem(candidate) != candidate or is_recorder_default(candidate):
+    if (naming.safe_stem(candidate) != candidate or is_recorder_default(candidate)
+            or len(candidate) > _MAX_NAME):
+        # The length is re-checked here as well as reserved at N4. Belt and braces on the
+        # one number that protects the record's ninety-character subject cut: a name over it
+        # is cut, and a cut name is two rows in a site's log that read the same.
         return NameDecision(decided=True, code="N8", site=site_slug, span=span,
                             mentions=mine, book=book_name,
                             why="the name would have to be changed to be usable, so it is "
@@ -414,6 +451,29 @@ def decide(
         declared=declared, activity=activity, filed=filed or "", disagrees=disagrees,
         why=why,
     )
+
+
+def _his_stamp(moment: Any) -> str:
+    """The date and time the way he writes them, or ``""`` when the moment is unknown.
+
+    ``060826 1622`` — day, month, year, then the hour and minute. Day-first because that is
+    what is on his own files: ``BEACH COURT SITE WALK 270826``, ``AMIDAL SITE WALK 260826``,
+    ``22 CHEPSTOW SITE INSPECTION 2408``. Not the machine's ``YYMMDD``, which is what the
+    phone writes into ``Voice 260806_162219`` and is the opposite way round — the two are
+    indistinguishable on a day before the thirteenth, which is exactly why the parser refuses
+    to READ either from a hand-typed name.
+
+    The time is four digits with no separator, so the whole stamp is two plain groups that
+    sort and read the way a date on a file should. It comes from the moment pinned on the
+    row, which is the recorder's own clock, so it is when he recorded it and not when
+    OneDrive finished receiving it.
+    """
+    if moment is None:
+        return ""
+    try:
+        return f"{moment:%d%m%y %H%M}"
+    except (TypeError, ValueError):
+        return ""
 
 
 # --------------------------------------------------------------------------- span search
