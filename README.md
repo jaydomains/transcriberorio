@@ -484,9 +484,13 @@ being present, and no change to the record's repository, which is read-only to t
 
 Every failure ends in fewer names and never in different ones: a missing file, an unreadable
 one, one written against a contract this code does not know, a site the record has no folder
-for. The morning email prints the list's date every day, including on a day with nothing to
-report, so a list that quietly stopped being written says so rather than reading as a quiet
-fortnight.
+for.
+
+A missing or unreadable list is reported in the morning email **every morning until it is
+fixed**, and says plainly that nothing is being named. A healthy list with nothing to report
+says nothing at all — the section sits under *"WORTH A LOOK (nothing failed)"*, and a heading
+that appears every day on every install to report a non-event is a heading that stops being
+read, taking the real failures underneath it along with it.
 
 ---
 

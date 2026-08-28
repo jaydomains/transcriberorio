@@ -39,6 +39,7 @@ in its subject line — only exists against the real thing.
 from __future__ import annotations
 
 import builtins
+import contextlib
 import datetime
 import json
 import os
@@ -1678,18 +1679,18 @@ class OnlyTheRecordersOwnNameIsEverTouched(unittest.TestCase):
         self.assertIn("BEACH COURT SITE WALK 270826",
                       deployment.drive.by_kind()["transcript"].splitlines()[0])
 
-    def test_a_day_with_none_of_them_still_says_so_out_loud(self) -> None:
+    def test_a_day_with_none_of_them_says_nothing_at_all(self) -> None:
         # Most recordings are his own names, and reporting them would be a daily list of
-        # non-events. But a section that vanished on a quiet day would make silence mean
-        # "nothing came in" and "the site list stopped being written a fortnight ago" at the
-        # same time, so the quiet day gets a line of its own.
+        # non-events. The state a daily line used to guard — the site list having quietly
+        # stopped being written — is guarded instead by the fault line, which prints every
+        # morning until somebody fixes it. See test_naming_is_visible.
         lines = digest._naming_lines(
             {"book": sitebook.load(SITE_BOOK).line(), "applying": False,
              "eligible": 0, "named": 0, "rows": []}
         )
         body = "\n".join(lines)
-        self.assertIn("Nothing came in under the voice recorder's own name.", body)
-        self.assertIn("56 sites", body, "the email says where the site list stands, daily")
+        self.assertEqual(body.strip(), "")
+        self.assertEqual(body, "", "a healthy site list with nothing to report says nothing")
 
     def test_a_recording_too_short_to_judge_is_published_with_no_name(self) -> None:
         # A short recording of wind noise comes back as the engine repeating itself, which
@@ -1707,3 +1708,121 @@ class OnlyTheRecordersOwnNameIsEverTouched(unittest.TestCase):
 
 if __name__ == "__main__":       # pragma: no cover
     unittest.main()
+
+
+# ================================ 21. the moment is the row's, not the running build's
+
+
+class TheRecordedMomentIsPinnedToTheRow(unittest.TestCase):
+    """The output filenames open with when the recording was made, so it may never move.
+
+    Found by an adversarial pass against the commit that introduced it, which is the worst
+    place to find it: **this very change moved that moment**, for exactly the recordings it
+    targets. An unnamed recording used to be dated by when OneDrive finished receiving it;
+    it is now dated by the recorder's own clock in the filename. Hours apart, and often
+    across midnight.
+
+    So a recording that was in flight when the service restarted onto the new build would
+    resume, work the moment out again from the new code, and write three files under three
+    new names — while the three it had already written stayed in OneDrive. Nothing can
+    clean those up. The ledger row has been overwritten with the new names; the collision
+    guard only looks at other rows; there is no delete in the Graph client; and the sweep
+    never enumerates an output folder. Downstream the record keys a document on its date
+    and its bytes, so it logs a **second document, in a different month folder**, with a
+    second row in that site's correspondence log.
+
+    The commit message for the change that introduced it says, of the output filenames:
+    *"a name that could change between attempts leaves three files nobody can delete and a
+    second document in the record."* It was right, and it had done it.
+
+    The moment is now pinned on the row the first time it is worked out, on the same write
+    that stores the naming decision and for the same reason.
+    """
+
+    def _row_meta(self, deployment: Deployment) -> dict[str, Any]:
+        return dict(deployment.row().meta or {})
+
+    def test_the_moment_is_written_to_the_row(self) -> None:
+        deployment = Deployment()
+        self.addCleanup(deployment.close)
+        deployment.arrive()
+        deployment.walk()
+
+        meta = self._row_meta(deployment)
+        self.assertIn("recorded_at", meta)
+        # The recorder's clock from the filename, not when OneDrive received it.
+        self.assertTrue(str(meta["recorded_at"]).startswith("2026-08-06T16:22:19"))
+
+    def test_a_republish_under_a_changed_rule_writes_the_same_three_names(self) -> None:
+        """The regression itself: the parser changes its mind, the filenames do not."""
+        deployment = Deployment()
+        self.addCleanup(deployment.close)
+        deployment.arrive()
+        deployment.walk()
+
+        first = sorted(deployment.drive.names)
+        self.assertTrue(first, "nothing was published, so this proves nothing")
+
+        # A future build that reads the moment differently — which is precisely what the
+        # change introducing this test was. Anything that alters resolve_timestamp for this
+        # population stands in the same place.
+        moved = datetime.datetime(2011, 1, 1, 1, 1, 1, tzinfo=naming.SAST)
+        # `transcriber requeue` — the remedy the morning email itself tells him to run, and
+        # the on-demand half of the same hazard.
+        deployment.drive.written.clear()
+        deployment.ledger.requeue(deployment.row().item_id, "a person re-ran it")
+        with mock.patch.object(naming, "resolve_timestamp",
+                               return_value=(moved, "a different rule entirely")):
+            deployment.reboot().walk()
+
+        self.assertEqual(
+            sorted(deployment.drive.names), first,
+            "the recording republished under different filenames, orphaning the three "
+            "already in OneDrive and putting a second document in the record",
+        )
+        self.assertNotIn("2011", " ".join(deployment.drive.names))
+
+
+class TurningNamingOffDoesNotRewriteWhatWasAlreadyPublished(unittest.TestCase):
+    """The switch he is most likely to reach for must not republish under a new title.
+
+    He sees a title he does not like at 06:00 and sets ``NAMING=0``. Any recording still in
+    flight — a publish that got the transcript up and failed on the summary — resumes, and
+    before this fix the flag was read *above* the stored decision: the transcript already in
+    OneDrive under ``Subject: CANTERBURY`` was replaced in place with different bytes, and
+    the stored ``{"applied": true, "name": "CANTERBURY"}`` was overwritten with
+    ``{"code": "off"}`` — destroying the only evidence that the first one was ever
+    published. The record keys a document on its bytes, so that is a second logged document
+    and a second correspondence row, one filed under the site and one not.
+
+    Note the asymmetry that made it easy to miss: flipping ``NAMING_APPLY`` in either
+    direction was correctly sticky. Only ``NAMING`` overrode an answer that had already
+    reached OneDrive.
+    """
+
+    def test_a_decision_that_reached_onedrive_survives_the_switch(self) -> None:
+        deployment = Deployment(apply=True)
+        self.addCleanup(deployment.close)
+        deployment.drive.refuse_after = 1     # the transcript lands; nothing else does
+        deployment.arrive()
+        with contextlib.suppress(Exception):
+            deployment.walk()
+
+        published = deployment.drive.subject()
+        stored = deployment.decision()
+        self.assertEqual(stored.get("name"), EXPECTED_NAME)
+        self.assertIn(EXPECTED_NAME, published)
+
+        # He switches it off overnight, with this recording still unfinished.
+        deployment.config = replace(deployment.config, naming=False)
+        deployment.drive.refuse_after = None
+        deployment.drive.written.clear()
+        deployment.reboot().walk()
+
+        self.assertIn(
+            EXPECTED_NAME, deployment.drive.subject(),
+            "the transcript was republished under a different subject line, which the "
+            "record reads as a second document for one recording",
+        )
+        self.assertEqual(deployment.decision().get("name"), EXPECTED_NAME,
+                         "the record of what was published was overwritten")

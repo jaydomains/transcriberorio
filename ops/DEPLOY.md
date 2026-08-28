@@ -176,11 +176,16 @@ The ledger volume is not optional. It is the only proof a recording ever existed
               /srv/transcriber/ops/build-site-book.py . /var/lib/transcriber/sites.json
   ```
 
+  The `make build` half is the record's own existing nightly job, not something added here;
+  the line after it reads what that build produced and writes one file into the
+  transcriber's own directory. Nothing in this service ever writes to the record's
+  repository.
+
   Then `NAMING_SITES_FILE=/var/lib/transcriber/sites.json`. **Nothing breaks if this stops
-  running**: a stale list names slightly fewer recordings and a missing one names none,
-  which is the behaviour without the feature at all. The morning email prints the list's
-  date every day, so a list that quietly stopped being written says so. Note the service
-  only ever *reads* it — nothing here writes to the record's repository.
+  running**: an old list describes the sites as they were, so a job it has never heard of
+  gets no name, and a missing one names nothing at all — which is the behaviour without the
+  feature. A missing or unreadable list is said out loud in the morning email, every
+  morning, until it is fixed.
 - **An existing pile of recordings.** `transcriber backfill` walks history newest-first in
   its own lane, yielding whenever the live path has work waiting. Start it after the live
   path has been running cleanly for a day.

@@ -72,6 +72,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 from . import audio as audio_probe
@@ -170,6 +171,22 @@ _META_GATE_FIRST_SEEN = "gate_first_seen"
 #: a retry counting the same recording twice in the measurement the arming decision rests on.
 _META_SENSITIVITY = "sensitivity"
 _META_NAMING = "naming"
+#: When the recording was made, pinned on the row the first time it is worked out.
+#:
+#: The three output filenames open with this moment, so anything that changes how it is
+#: DERIVED changes the names — and a recording republished across such a change writes three
+#: new files while the three it already wrote stay in OneDrive forever. Nothing can clean
+#: them up: the ledger row has been overwritten with the new names, the collision guard only
+#: looks at other rows, Graph has no delete here, and the sweep never enumerates an output
+#: folder. Downstream the record keys a document on its date and its bytes, so it logs a
+#: second document, in a different month, with a second row in the site's log.
+#:
+#: This is not hypothetical: the change that added it moved this moment for exactly the
+#: recordings it targets — an unnamed one used to be dated by when OneDrive finished
+#: receiving it. Pinned here, the names are a function of the row rather than of whichever
+#: build happens to be running.
+_META_RECORDED_AT = "recorded_at"
+_META_RECORDED_NOTE = "recorded_at_note"
 
 _UNSAFE_PATH = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -421,6 +438,10 @@ class Pipeline:
                 book = sitebook.load(path)
             except Exception as exc:                                # pragma: no cover
                 book = sitebook.SiteBook(path=path, fault=f"could not be read ({exc})")
+            # Stamp the mtime we looked at, even on a fault. Without it a corrupt-but-present
+            # file never matches the cache key, so every recording re-reads and re-parses it
+            # — blocking file I/O on the publish path, behind a lock every worker shares.
+            book = replace(book, mtime=mtime, path=path)
             self._site_book = book
             if book.fault:
                 log.warning("site-list", book.line(), path=path)
@@ -743,9 +764,12 @@ class Pipeline:
         # The redacted analysis, deliberately: `_review_row` keeps an unverifiable quote in
         # the row so `transcriber status` can show a person what the model produced, and the
         # ledger is printed. A held passage must not reach it any more than it reaches a file.
+        pinned_at, pinned_note = self._recorded_at(row, parsed)
         changes: dict[str, Any] = {
             "analysis": _analysis_note(gate.extraction),
             _META_NAMING: decision.as_meta(),
+            _META_RECORDED_AT: pinned_at.isoformat(),
+            _META_RECORDED_NOTE: pinned_note,
         }
         if gate.note:
             # Only when the gate actually read the recording. An empty entry on every row in
@@ -1155,12 +1179,19 @@ class Pipeline:
         the record ends up holding two documents for one recording with no way to tell they
         are the same.
         """
-        if not bool(getattr(self.config, "naming", False)):
-            return autoname.NO_NAME
-
+        # The stored answer FIRST, above the switch. A recording whose transcript already
+        # reached OneDrive under a worked-out subject line, and whose publish then half
+        # failed, must republish under that same subject line — even if he saw a title he
+        # did not like at 06:00 and switched naming off while it was still in flight. The
+        # record keys a document on its bytes, so republishing the same recording under a
+        # different subject is a second document, and overwriting the stored decision would
+        # destroy the only evidence that the first one was ever published.
         stored = autoname.NameDecision.from_meta(row.meta.get(_META_NAMING))
         if stored is not None:
             return stored
+
+        if not bool(getattr(self.config, "naming", False)):
+            return autoname.NO_NAME
 
         try:
             probe = self._context(row, parsed, gate.transcript, gate.extraction, info,
@@ -1192,6 +1223,26 @@ class Pipeline:
                 why="something went wrong working out a name for it",
             )
 
+    def _recorded_at(self, row: Row, parsed: naming.ParsedName) -> tuple[datetime, str]:
+        """When the recording was made — the row's own answer once it has one.
+
+        Worked out once and pinned, because the output filenames are built from it. See
+        :data:`_META_RECORDED_AT` for what a moment that moves between attempts costs.
+        """
+        stored = str(row.meta.get(_META_RECORDED_AT) or "")
+        if stored:
+            try:
+                return (
+                    datetime.fromisoformat(stored),
+                    str(row.meta.get(_META_RECORDED_NOTE) or "") or "read from the filename",
+                )
+            except (TypeError, ValueError):
+                # Unreadable rather than absent. Fall through and work it out again: a
+                # wrong-looking prefix is recoverable, a crash in the publish path is not.
+                log.warning("recorded-at", "the stored moment could not be read; working it "
+                            "out again", item=row.item_id, stored=stored)
+        return naming.resolve_timestamp(parsed, row.created_at)
+
     def _context(
         self,
         row: Row,
@@ -1211,7 +1262,7 @@ class Pipeline:
         could drift from the one that actually publishes. ``resolve_timestamp`` is pure, so
         building this twice costs nothing.
         """
-        recorded_at, note = naming.resolve_timestamp(parsed, row.created_at)
+        recorded_at, note = self._recorded_at(row, parsed)
         return outputs.OutputContext(
             item_id=row.item_id,
             source_name=row.name,

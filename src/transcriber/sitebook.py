@@ -157,6 +157,16 @@ def bind_site(text: str, vocab: Mapping[str, Any]) -> tuple[str | None, dict[str
 # --- ours -----------------------------------------------------------------------------
 
 
+def _stands_as_a_word(term: str, text: str) -> bool:
+    """Whether ``term`` appears in ``text`` as a whole word rather than inside one.
+
+    Deliberately NOT what the record does — the record's own matching is a substring test,
+    and that is right for it: an email mentioning "Beachwood" probably is about Beach Court.
+    It is wrong for a title, which is read by a person as a claim about where he was.
+    """
+    return re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text) is not None
+
+
 @dataclass(frozen=True)
 class SiteBook:
     """The sites the record knows about, and the vocabulary that recognises them.
@@ -188,19 +198,64 @@ class SiteBook:
         return bind_site(text, self.vocab)
 
     def sites_named_by(self, span: str) -> frozenset[str]:
-        """Every site whose own discriminating vocabulary appears in this span of text.
+        """Every site this span actually names. Two conditions, both learned the hard way.
 
-        The guard against naming a recording after an ordinary English word. The model may
-        answer ``site: "House"`` or ``"North"`` or ``"Green"``, all of which appear in real
-        site titles — but the record drops any term it uses of more than two sites, so none
-        of them is a discriminating term and none of them names anything here. A span that
-        names no site, or names more than one, is not a name.
+        The guard against naming a recording after something that is not a site. The model
+        may answer ``"House"``, ``"North"`` or ``"Green"``, all of which appear in real site
+        titles — but the record drops any term it uses of more than two sites, so none of
+        them discriminates anything and none of them names anywhere.
+
+        **The term has to stand as a word.** This was a substring test, and an adversarial
+        sweep of the record's own correspondence found what that costs: ``SHARON`` became a
+        title for *277 Imam Haron Road*; ``DURBANVILLE`` — which is Orion Concrete Yard's own
+        address, eleven occurrences in his own emails — for *Urban Artisan*; ``PRINCESS
+        COURT`` for *Prince Court*; ``BEACHWOOD`` for *Beach Court*. Not invented cases:
+        every one is a word that appears in his correspondence and happens to contain a
+        site's term.
+
+        **And it has to carry at least half of the site's own name.** ``CONCRETE``,
+        ``FLOORING``, ``CLADDING``, ``STEELWORKS``, ``GARDENS`` — the ordinary nouns of the
+        trade — each match exactly one site through a contractor or client entry while
+        sharing nothing with what the site is actually called, and each would otherwise be
+        published as a title on the record's most-read surface.
+
+        Half rather than most, deliberately: ``CANTERBURY`` is one word of *Canterbury
+        Square* and is exactly what he writes on his own files — ``CANTERBURY SNAG WALK 14
+        AUGUST``, ``CANTERBURY 6 AUGUST``. A rule that refused his own naming convention
+        would be tuned for the tests rather than for him.
+
+        **What this still lets through, stated rather than hidden:** a trade noun that is
+        itself half of a site's title — ``FLOORING`` for *BLSA Flooring*, ``CLADDING`` for
+        *Roggebaai Cladding*, ``STEELWORKS`` for *Ashton Steelworks*. Structurally identical
+        to ``CANTERBURY`` for *Canterbury Square*, so nothing here can separate them without
+        a hand-kept list of trade words, which is the maintained vocabulary this design
+        exists to avoid. The cost is bounded and different in kind from the cases above:
+        the site is the RIGHT one and the title is merely terse, where ``SHARON`` for *277
+        Imam Haron Road* named nowhere at all. Pinned by a test so it is a decision rather
+        than a surprise.
         """
-        lowered = (span or "").lower()
-        return frozenset(
-            slug for slug, terms in self.vocab.items()
-            if any(t and t in lowered for t in terms)
-        )
+        lowered = " ".join((span or "").lower().split())
+        if not lowered:
+            return frozenset()
+
+        words = {w for w in re.findall(r"[a-z0-9]+", lowered) if w not in STOPWORDS}
+        hits: set[str] = set()
+        for slug, terms in self.vocab.items():
+            if not any(t and _stands_as_a_word(t, lowered) for t in terms):
+                continue
+            # More than half of what the record itself calls this site. A title carrying one
+            # word of it is a coincidence; carrying most of it is a naming.
+            title_words = {
+                w for w in re.findall(r"[a-z0-9]+", str((self.sites.get(slug) or {}).get("title") or "").lower())
+                if len(w) > 3 and w not in STOPWORDS
+            }
+            if not title_words:
+                continue
+            shared = title_words & words
+            if len(shared) * 2 < len(title_words):
+                continue
+            hits.add(slug)
+        return frozenset(hits)
 
     def title_of(self, slug: str) -> str:
         """The site's name as a person would say it, for anything he reads.

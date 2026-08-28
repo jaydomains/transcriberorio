@@ -671,25 +671,33 @@ class TheFourWaysAModelGetsItWrong(RealRecordTestCase):
         self.assertEqual(decision.code, "N6")
         self.assertEqual(decision.name, "")
 
-    def test_a_new_site_sharing_one_word_with_an_old_one_is_named_after_itself(self) -> None:
-        """A residual, asserted as it is rather than as it should be. See the report.
+    def test_a_new_site_sharing_one_word_with_an_old_one_is_partly_still_a_problem(self) -> None:
+        """A residual, asserted as it is rather than as I would like it. Half closed.
 
-        "Beach Road" is not in the record. The record has "Beach Court bc", and 'beach' is
+        "Beach Road" is not in the record. The record has "Beach Court bc", and *beach* is
         one of its discriminating terms — so the record files a recording about Beach Road
-        into Beach Court's log, with or without a title, and the naming rule then agrees
-        with it and writes BEACH ROAD on the subject line.
+        into Beach Court's log with or without a title, and the naming rule agrees with it
+        and writes BEACH ROAD on the subject line.
 
-        N6's stated job is "the span names that site, and no other". What it actually
-        checks is that the span *contains* one of that site's terms, and the record's
-        binding was decided by the same substring, so the two agree with each other rather
-        than checking anything. The name that comes out is true of the recording and false
-        of the log it lands in.
+        **Tightening ``sites_named_by`` closed one of the three.** A span now has to carry
+        at least half of what the record itself calls the site, so "Milton Road" no longer
+        names *Milton Court - Sea Point* — one word of three. "Beach Road" and "Canterbury
+        Road" still do, because those titles are two words and the shared one is half.
 
-        It is not asserted as a refusal because it is not one, and writing the assertion I
-        would prefer would hide it.
+        The remaining two cannot be separated from the case they look exactly like:
+        ``CANTERBURY`` naming *Canterbury Square* is the same shape, and it is what he
+        writes on his own files. Closing it would need a hand-kept list of road names, which
+        is the maintained vocabulary this whole design exists to avoid.
+
+        The bound on the damage is the last assertion below: the record files it in the same
+        place with the title and without, so a title never *moved* anything. It makes a
+        pre-existing misfile look deliberate, which is bad — and strictly less bad than
+        causing one.
         """
+        # Closed by the half-of-the-title rule.
+        self.assertEqual(decide(walk_at("Milton Road"), "Milton Road").code, "N6")
+
         for spoken_name, expected_slug in (("Beach Road", "beach-court-bc"),
-                                           ("Milton Road", "milton-court-sea-point"),
                                            ("Canterbury Road", "canterbury-square")):
             with self.subTest(site=spoken_name):
                 decision = decide(walk_at(spoken_name), spoken_name)

@@ -326,14 +326,18 @@ cron entry that already rebuilds the record:
             /srv/transcriber/ops/build-site-book.py . /var/lib/transcriber/sites.json
 ```
 
-Nothing breaks if this stops running. A list a few weeks old just names slightly fewer
-recordings, and the morning email prints the list's date every day, so you can see at a
-glance if it has gone stale.
+Nothing breaks if this stops running, and nothing is ever named wrongly because of it — an
+old list simply describes the sites as they were, so a new job it has never heard of gets no
+name. The morning email prints the list's date whenever it has anything to say, and says so
+loudly every morning if the file has gone missing altogether.
 
-**3. Tell the service where it is.** The wizard in the next step asks. Or afterwards:
+**3. Tell the service where it is.** The wizard in the next step asks. If you skipped it
+there, it takes **two** settings, not one — skipping the wizard question switches the whole
+thing off, so pointing at the file alone would leave it off:
 
 ```
 transcriber config set NAMING_SITES_FILE /var/lib/transcriber/sites.json
+transcriber config set NAMING true
 ```
 
 **It starts by only telling you what it would do.** For the first few weeks the morning

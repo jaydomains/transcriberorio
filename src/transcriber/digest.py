@@ -1723,9 +1723,9 @@ def _naming_lines(naming: Mapping[str, Any] | None) -> list[str]:
     if not facts:
         return []
 
+    unreadable = str(facts.get("unreadable") or "")
     lines = ["", f"  {facts.get('book') or 'site list: unknown'}"]
 
-    unreadable = str(facts.get("unreadable") or "")
     if unreadable:
         # A fault and a quiet day are the same empty list and must never be the same
         # sentence. Saying "nothing came in" here would report a broken read as good news,
@@ -1737,12 +1737,22 @@ def _naming_lines(naming: Mapping[str, Any] | None) -> list[str]:
         lines.append(f"  than empty: {unreadable}")
         return lines
 
+    if facts.get("book_fault"):
+        # Not a quiet day: the site list is missing or unreadable, so nothing can be named
+        # and nothing will be until somebody looks. Said every morning until it is fixed.
+        lines.append("  Nothing is being named until that is sorted out. Nothing else is")
+        lines.append("  affected — every recording is still transcribed and filed as usual.")
+        return lines
+
     eligible = int(facts.get("eligible") or 0)
     if not eligible:
-        # Printed on a quiet day too, so silence never means "working" and "the site list
-        # vanished a fortnight ago" at the same time.
-        lines.append("  Nothing came in under the voice recorder's own name.")
-        return lines
+        # Nothing to say, so say nothing — this sits under "WORTH A LOOK (nothing failed)",
+        # and a section that prints every morning on every install to report that nothing
+        # happened trains him to skip the part of the email that matters.
+        #
+        # The exception is a site list that is missing or unreadable, handled above: that is
+        # not a quiet day, it is a feature that has silently stopped, and it prints.
+        return []
 
     lines.append("")
     for chunk in _wrap(
@@ -1811,6 +1821,10 @@ def naming_report(config: Any, ledger: Ledger, *, day: str) -> Mapping[str, Any]
         "eligible": len(eligible),
         "named": sum(1 for d in eligible if d.get("name")),
         "rows": eligible,
+        #: The site list could not be loaded. Distinct from "nothing came in": one is a
+        #: quiet day and the other is the feature having silently stopped, and they must
+        #: never render the same way — which for a quiet day is not at all.
+        "book_fault": bool(book.fault or not book),
         #: Set when the ledger could not be asked. Carried rather than swallowed, because
         #: an empty list from a failed read and an empty list from a quiet day are the same
         #: value and must never be the same sentence.

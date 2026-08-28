@@ -86,6 +86,13 @@ STOP_SITES = frozenset({
     "site", "the site", "this site", "site office", "office", "head office",
     "the building", "the house", "the block", "the yard", "the unit", "the job",
     "here", "there", "on site", "unknown", "n/a", "none", "various", "multiple",
+    # The definite article plus the kind of place. The prompt asks the model "which
+    # building, site, unit, block or scheme this is about", and these are exactly what it
+    # answers when it does not know — each one matched a real site's vocabulary and would
+    # have been published as a title.
+    "the shopping centre", "the shopping center", "the concrete yard", "the walkway",
+    "the gardens", "the carports", "the centre", "the center", "the development",
+    "the scheme", "the complex", "the property", "the premises", "the depot",
 })
 
 #: Shortest and longest a proposed name may be. Sixty leaves room inside the subject line's

@@ -311,13 +311,25 @@ class _Morning(unittest.TestCase):
 # ================================================== 1. the site list line, every morning
 
 
-class TheSiteListLinePrintsEveryMorning(_Morning):
-    """One line about the site list, in every digest, on every kind of day.
+class TheSiteListLinePrintsWheneverItSaysSomething(_Morning):
+    """The site list line, on every morning where it changes what he would do.
 
-    This is the line that separates the two states that look identical from the outside: a
-    fortnight in which nothing arrived under the recorder's own name, and a fortnight in
-    which the record's nightly build stopped writing the file and nothing *could* be named.
-    Both produce an email with no names in it. Only this line tells them apart.
+    It exists to separate two states that look identical from the outside: a fortnight in
+    which nothing arrived under the recorder's own name, and a fortnight in which the
+    record's nightly build stopped writing the file so nothing *could* be named. Both
+    produce an email with no names in it.
+
+    **It used to print on all four kinds of morning, and now prints on three.** Two
+    adversarial passes disagreed about this and both had a point: one wanted it daily so a
+    feature that silently stopped could not read as a quiet week; the other counted the
+    cost, which is a section appearing every morning on every install, forever, under a
+    heading that says "WORTH A LOOK" — and a heading that cries wolf gets skipped, taking
+    the failures underneath it along with it.
+
+    Resolved by making the *failure* loud rather than the routine: a missing, empty or
+    unreadable site list prints every morning until it is fixed, and says plainly that
+    nothing is being named. A healthy book with nothing to report is silent. The state the
+    daily line was protecting against is still impossible to miss; the noise is gone.
     """
 
     def test_it_prints_on_a_day_when_a_recording_was_named(self) -> None:
@@ -327,11 +339,11 @@ class TheSiteListLinePrintsEveryMorning(_Morning):
         self.assertIn(RECORDER_DEFAULT, block)
         self.assertIn(NAME, block)
 
-    def test_it_prints_on_a_day_when_nothing_came_in_under_the_recorders_name(self) -> None:
-        # Most mornings. Without this line, this email and the one below are the same email.
-        block = self.section([])
-        self.assertIn(f"site list: {SITE_BOOK_SIZE} sites", block)
-        self.assertIn("Nothing came in under the voice recorder's own name.", block)
+    def test_it_is_silent_on_a_day_when_nothing_came_in_and_the_book_is_fine(self) -> None:
+        # Most mornings, and there is nothing here for him to do. The two states this used
+        # to disambiguate are still disambiguated — by the tests below, which print loudly
+        # on every kind of broken book.
+        self.assertEqual(self.section([]).strip(), "")
 
     def test_it_says_so_when_the_book_lists_no_sites(self) -> None:
         # The nightly build ran and produced a file with nothing in it. Nothing will be
@@ -367,11 +379,16 @@ class TheSiteListLinePrintsEveryMorning(_Morning):
             "no book configured": self.section(
                 [], config=self.deployment(naming_sites_file="")),
         }
+        # The healthy book says nothing at all, which is its own fourth answer and the one
+        # that needs no words: nothing is wrong and nothing came in.
+        self.assertEqual(lines.pop("a book with sites in it").strip(), "")
         first = {
             what: next(line.strip() for line in block.splitlines() if "site list:" in line)
             for what, block in lines.items()
         }
-        self.assertEqual(len(set(first.values())), 4, first)
+        self.assertEqual(len(set(first.values())), 3, first)
+        for what, line in first.items():
+            self.assertIn("not loaded", line + what) if "never written" in what else None
 
     def test_the_line_is_there_even_when_the_book_names_no_recording_that_day(self) -> None:
         # A book that loaded fine and a day on which the rule refused every recording. The
@@ -409,12 +426,20 @@ class TheSectionPrintsOnANamingOnlyDay(_Morning):
         self.assertIn("WORTH A LOOK", body)
         self.assertIn(RECORDER_DEFAULT, body)
 
-    def test_worth_a_look_prints_even_when_no_recording_was_named(self) -> None:
-        # The quiet morning still has to carry the site-list line, and the section is the
-        # only place it is printed from.
+    def test_worth_a_look_stays_away_when_naming_has_nothing_to_say(self) -> None:
+        # A quiet morning with a healthy site list adds no section. "WORTH A LOOK (nothing
+        # failed)" appearing every day on every install, forever, to report that nothing
+        # happened is how a heading stops being read — and the failures live under it.
         body = self.body([])
+        self.assertNotIn("site list:", body)
+
+    def test_but_it_prints_when_the_site_list_is_the_news(self) -> None:
+        # The state the daily line existed to make visible. Loud every morning until it is
+        # fixed, because this is a feature that has silently stopped.
+        body = self.body([], config=self.deployment(naming_sites_file=MISSING_BOOK))
         self.assertIn("WORTH A LOOK", body)
-        self.assertIn("site list:", body)
+        self.assertIn("site list: not loaded", body)
+        self.assertIn("Nothing is being named", body)
 
     def test_the_naming_lines_are_inside_the_section_and_before_the_ledger(self) -> None:
         body = self.body([_decision()])
@@ -639,7 +664,9 @@ class TheOnesHeNamedHimselfAreNotNews(_Morning):
             for index in range(40)
         ]
         block = self.section(rows)
-        self.assertIn("Nothing came in under the voice recorder's own name.", block)
+        # Silent, not chatty: a healthy site list with nothing to report says nothing.
+        # A BROKEN one still prints every morning — see the site-list tests.
+        self.assertEqual(block.strip(), "")
         self.assertNotIn("CJ ", block)
         # Still short: forty non-events must not become forty lines.
         self.assertLess(len(block.splitlines()), 6)
@@ -650,7 +677,9 @@ class TheOnesHeNamedHimselfAreNotNews(_Morning):
                          source_name="Call Carel_260824_091500.m4a")]
         block = self.section(rows)
         self.assertNotIn("Call Carel", block)
-        self.assertIn("Nothing came in under the voice recorder's own name.", block)
+        # Silent, not chatty: a healthy site list with nothing to report says nothing.
+        # A BROKEN one still prints every morning — see the site-list tests.
+        self.assertEqual(block.strip(), "")
 
     def test_a_recording_that_was_too_short_to_judge_IS_news(self) -> None:
         # The line between the two: he did not name this one, the service could have, and it
@@ -841,7 +870,9 @@ class ARecordingPublishedLaterIsReportedOnceAndOnce(_Morning):
         # cannot pass the class above by reporting it on the wrong morning.
         block = naming_block(self.shipped_body(day=DAY_BEFORE))
         self.assertNotIn(RECORDER_DEFAULT, block)
-        self.assertIn("Nothing came in under the voice recorder's own name.", block)
+        # Silent, not chatty: a healthy site list with nothing to report says nothing.
+        # A BROKEN one still prints every morning — see the site-list tests.
+        self.assertEqual(block.strip(), "")
 
 
 class AFailedReadIsReportedAsGoodNews(_Morning):
