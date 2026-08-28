@@ -41,7 +41,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from . import config as config_mod
 from .config import ENGINES
-from .models import DEFAULT_ROUTE, Route, is_route_name, route_env_var
+from .config_cmd import comments_would_be_lost
+from .models import Route, is_route_name
 from .setup_wizard import (
     FEEDBACK_LOOP,
     SUGGESTED_ROUTES,
@@ -50,6 +51,7 @@ from .setup_wizard import (
     _supports_colour,
     load_env_file,
     route_problems,
+    shared_archive_notes,
     routes_from_values,
     routes_to_values,
     write_env_file,
@@ -94,6 +96,7 @@ class _Drive:
         self.problem = ""
         self._names: dict[str, str] = {}
         self._children: dict[str, list[tuple[str, str]]] = {}
+        self._ancestors: dict[str, tuple[str, ...]] = {}
 
     def _fail(self, exc: Exception) -> None:
         if not self.problem:
@@ -112,6 +115,37 @@ class _Drive:
             self._fail(exc)
             self._names[wanted] = ""
         return self._names[wanted]
+
+    def ancestors(self, folder_id: str) -> tuple[str, ...]:
+        """Every folder above this one, nearest first — or nothing when it cannot be asked.
+
+        A folder id says nothing about what contains it, and OneDrive reports a folder and
+        everything under it: a route whose watched folder sits inside another route's
+        watched folder has its recordings claimed by that other route. So it is asked here,
+        where a live drive is already being browsed to pick the ids.
+        """
+        wanted = (folder_id or "").strip()
+        if not wanted or self.client is None:
+            return ()
+        if wanted in self._ancestors:
+            return self._ancestors[wanted]
+        chain: list[str] = []
+        seen = {wanted}
+        current = wanted
+        for _ in range(32):   # bounded: a tree has no cycles, but a walk should not trust that
+            try:
+                item = self.client.get_item(current)
+            except Exception as exc:  # noqa: BLE001 - offline is a normal state here
+                self._fail(exc)
+                break
+            parent = str(getattr(item, "parent_id", "") or "").strip()
+            if not parent or parent in seen:
+                break
+            chain.append(parent)
+            seen.add(parent)
+            current = parent
+        self._ancestors[wanted] = tuple(chain)
+        return self._ancestors[wanted]
 
     def folders(self, parent_id: str | None) -> list[tuple[str, str]]:
         """(id, name) of every folder directly inside ``parent_id``, name order."""
@@ -156,14 +190,19 @@ def _drive_for(values: Mapping[str, str], *, offline: bool) -> _Drive:
         )
         return drive
     try:
-        from .graph import GraphClient
+        from .graph import GraphClient, RetryPolicy
 
         client = GraphClient(
             tenant_id=str(values["GRAPH_TENANT_ID"]),
             client_id=str(values["GRAPH_CLIENT_ID"]),
             client_secret=str(values["GRAPH_CLIENT_SECRET"]),
             user_id=str(values["GRAPH_USER_ID"]),
-            timeout=float(str(values.get("HTTP_TIMEOUT_S") or 30) or 30),
+            timeout=15.0,
+            # Deliberately impatient, and nothing like the service's own policy. A folder
+            # name is a convenience: somebody standing at a terminal on a laptop with no
+            # route to Microsoft should see the ids a second later, not wait out six
+            # retries with exponential backoff for a listing they can do without.
+            retry=RetryPolicy(max_attempts=2, base_delay=0.5, max_delay=2.0),
         )
     except Exception as exc:  # noqa: BLE001
         drive = _Drive(None)
@@ -193,7 +232,8 @@ def _declared(values: Mapping[str, str]) -> bool:
     return bool(str(values.get("ROUTES") or "").strip())
 
 
-def _save(env_path: str, values: dict[str, str], routes: Sequence[Route]) -> list[str]:
+def _save(env_path: str, values: dict[str, str], routes: Sequence[Route],
+          drive: "_Drive | None" = None) -> list[str]:
     """Check the routes, then write them. Returns the problems; writes nothing if there are any.
 
     Two checks, because they answer different questions. ``route_problems`` says what is
@@ -202,7 +242,7 @@ def _save(env_path: str, values: dict[str, str], routes: Sequence[Route]) -> lis
     definition of "valid" that matters — and doing it before the write means a refusal
     leaves the file exactly as it was.
     """
-    problems = list(route_problems(routes))
+    problems = list(route_problems(routes, drive.ancestors if drive is not None else None))
     if problems:
         return problems
 
@@ -219,7 +259,12 @@ def _save(env_path: str, values: dict[str, str], routes: Sequence[Route]) -> lis
     except Exception as exc:  # noqa: BLE001
         return [f"{type(exc).__name__}: {exc}"]
 
+    lost = comments_would_be_lost(env_path)
     write_env_file(env_path, candidate, header=list(_ENV_HEADER))
+    if lost:
+        print("  Your own comments in that file were not kept — it is rewritten in the "
+              "standard grouped layout every time, which is what keeps the 0600 mode and "
+              "the grouping.")
     values.clear()
     values.update(candidate)
     return []
@@ -307,13 +352,18 @@ def cmd_list(ctx: _Ctx, args: argparse.Namespace, values: dict[str, str],
                 "  " + " and ".join(names) + " write into the same folder. That is allowed "
                 "on purpose."))
 
+    for note in shared_archive_notes(routes):
+        ctx.out()
+        for line in _wrap_note(note):
+            ctx.out(ctx.style.dim("  " + line))
+
     if drive.problem:
         ctx.out()
         ctx.out(ctx.style.dim(
             f"  Folder names could not be read from the drive ({drive.problem}), so the\n"
             "  ids are shown as they are. Nothing is wrong with the routes themselves."))
 
-    problems = route_problems(routes)
+    problems = route_problems(routes, drive.ancestors)
     if problems:
         _print_problems(ctx, problems, preamble="These routes would stop the service starting:")
 
@@ -321,6 +371,22 @@ def cmd_list(ctx: _Ctx, args: argparse.Namespace, values: dict[str, str],
     ctx.out(ctx.style.dim(
         "  routes add · routes edit <name> · routes disable <name> · routes remove <name>"))
     return EXIT_FAILED if problems else EXIT_OK
+
+
+def _wrap_note(text: str, width: int = 74) -> list[str]:
+    """Wrap one plain sentence for the terminal without pulling in textwrap's defaults."""
+    words = str(text).split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if current and len(current) + 1 + len(word) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        lines.append(current)
+    return lines
 
 
 def _pooled_outputs(routes: Sequence[Route]) -> list[list[str]]:
@@ -375,13 +441,15 @@ def _pick_folder(
 
         where = " / ".join(name for _id, name in trail) or "the top of the drive"
         options: list[tuple[str, str]] = [(fid, name) for fid, name in folders]
-        if not folders:
-            options.append((_BY_ID, "there are no folders here — type an id instead"))
-        else:
+        if folders:
             options.append((_INTO, "look inside one of these"))
         if trail:
             options.append((_UP, f"back to {trail[-2][1] if len(trail) > 1 else 'the top'}"))
-        options.append((_BY_ID, "type a folder id by hand"))
+        options.append((
+            _BY_ID,
+            "type a folder id by hand" if folders
+            else "there are no folders here — type an id instead",
+        ))
         if allow_none:
             options.append((_NONE, "none — this route never archives"))
 
@@ -532,7 +600,7 @@ def cmd_add(ctx: _Ctx, args: argparse.Namespace, values: dict[str, str],
         route = _ask_route(ctx, drive, values, existing=None,
                            taken=[r.name for r in routes])
         candidate = list(routes) + [route]
-        problems = _save(args.env, values, candidate)
+        problems = _save(args.env, values, candidate, drive)
         if not problems:
             ctx.out()
             ctx.out(ctx.style.green(f"  ✓ {route.display} is now being watched."))
@@ -561,7 +629,7 @@ def cmd_edit(ctx: _Ctx, args: argparse.Namespace, values: dict[str, str],
         edited = _ask_route(ctx, drive, values, existing=route,
                             taken=[r.name for r in routes])
         candidate = [edited if r.name == route.name else r for r in routes]
-        problems = _save(args.env, values, candidate)
+        problems = _save(args.env, values, candidate, drive)
         if not problems:
             ctx.out()
             ctx.out(ctx.style.green(f"  ✓ {edited.display} saved."))
@@ -570,6 +638,14 @@ def cmd_edit(ctx: _Ctx, args: argparse.Namespace, values: dict[str, str],
                     f"  It is now called {edited.name!r}. The {route.name!r} rows already in "
                     "the ledger keep that name — nothing was rewritten — so `status` will "
                     "show both until the old ones age out.")
+                ctx.out(
+                    f"  Recordings on {route.name!r} that have already finished will no "
+                    "longer be archived: the archive pass only runs for routes that are "
+                    "in the configuration.")
+                _say_stranding(
+                    ctx, route, _unfinished_in(_ledger_rows_for(values, route.name)),
+                    what="Renaming this route",
+                )
             ctx.out(ctx.style.dim(
                 "  The running service does not re-read .env — restart it to pick this up."))
             return EXIT_OK
@@ -598,12 +674,14 @@ def _find(ctx: _Ctx, routes: Sequence[Route], slug: str | None) -> Route | None:
     return None
 
 
-def _ledger_rows_for(values: Mapping[str, str], route: str) -> int | None:
-    """How many ledger rows this route has, or None when the ledger cannot be read.
+def _ledger_rows_for(values: Mapping[str, str], route: str) -> dict[str, int] | None:
+    """This route's ledger rows **by state**, or None when the ledger cannot be read.
 
     Read rather than assumed, because "the history is kept" is a claim, and a number is a
-    claim somebody can check. Never creates a ledger: a command about the ``.env`` has no
-    business bringing a database into existence.
+    claim somebody can check. The breakdown is kept rather than summed away: a total says
+    how much history there is, and what a person about to remove a route needs to know is
+    how much of it has not finished yet. Never creates a ledger: a command about the
+    ``.env`` has no business bringing a database into existence.
     """
     path = str(values.get("LEDGER_PATH") or "").strip()
     if not path or path == ":memory:" or not os.path.exists(path):
@@ -613,9 +691,44 @@ def _ledger_rows_for(values: Mapping[str, str], route: str) -> int | None:
 
         with Ledger(path) as ledger:
             counts = ledger.stats().get("by_route", {}).get(route, {})
-        return sum(int(n) for n in counts.values())
+        return {str(state): int(n) for state, n in counts.items()}
     except Exception:  # noqa: BLE001 - a ledger we cannot read is not a reason to refuse
         return None
+
+
+def _unfinished_in(counts: Mapping[str, int] | None) -> int:
+    """How many of this route's recordings have not reached a terminal state."""
+    from .models import State
+
+    if not counts:
+        return 0
+    return sum(int(n) for state, n in counts.items() if state not in State.TERMINAL)
+
+
+def _say_stranding(ctx: _Ctx, route: Route, unfinished: int, *, what: str) -> None:
+    """Say, before the confirm prompt, what happens to work that is still in flight.
+
+    Removing a route, or renaming one, leaves its unfinished recordings naming a route the
+    configuration no longer has. The pipeline will not guess where their transcripts belong,
+    so it stops each one for a person on the first attempt and never retries it. That is the
+    right behaviour and it was not being said out loud, which made "the ledger rows are kept"
+    read as "nothing is lost".
+    """
+    if unfinished <= 0:
+        return
+    ctx.out()
+    ctx.out(ctx.style.yellow(ctx.style.bold(
+        f"  {unfinished} of those recordings have not finished yet.")))
+    ctx.out(ctx.style.yellow(
+        f"  {what} stops them being transcribed. Each one will be stopped for you and"))
+    ctx.out(ctx.style.yellow(
+        "  marked as needing a person instead, because there would be no route left to say"))
+    ctx.out(ctx.style.yellow(
+        "  which folder its transcript belongs in."))
+    ctx.out(ctx.style.yellow(
+        f"  Let them finish first, or use `transcriber routes disable {route.name}` to stop"))
+    ctx.out(ctx.style.yellow(
+        "  watching the folder without abandoning them."))
 
 
 def cmd_remove(ctx: _Ctx, args: argparse.Namespace, values: dict[str, str],
@@ -624,7 +737,9 @@ def cmd_remove(ctx: _Ctx, args: argparse.Namespace, values: dict[str, str],
     if route is None:
         return EXIT_FAILED
 
-    rows = _ledger_rows_for(values, route.name)
+    counts = _ledger_rows_for(values, route.name)
+    rows = None if counts is None else sum(counts.values())
+    unfinished = _unfinished_in(counts)
     ctx.out()
     ctx.out(ctx.style.bold(f"  Removing {route.display} takes it out of the routes the "
                            "service watches."))
@@ -645,10 +760,17 @@ def cmd_remove(ctx: _Ctx, args: argparse.Namespace, values: dict[str, str],
         "  If that is not what you want, `routes disable` pauses it instead and keeps its\n"
         "  folders in the file, ready to switch back on."))
 
+    _say_stranding(ctx, route, unfinished, what="Removing this route")
+
     if not _converting(ctx, values, routes):
         ctx.out("  Nothing was written.")
         return EXIT_OK
-    if not ctx.confirm(f"Remove {route.name}?", default=False):
+    # `--yes` on the command line IS the consent for this one, so it must not be routed
+    # through ctx.confirm(). That returns the *default* when assuming, and the default for a
+    # destructive act is deliberately No — which made `routes remove --yes` decline the very
+    # removal it reads as confirming. A flag that does the opposite of what it says is worse
+    # than no flag.
+    if not (ctx.assume_yes or ctx.confirm(f"Remove {route.name}?", default=False)):
         ctx.out("  Nothing was written.")
         return EXIT_OK
 
@@ -775,6 +897,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="do not contact the drive: show folder ids rather than names, and type ids "
              "rather than picking them",
     )
-    parser.add_argument("--yes", action="store_true",
-                        help="take the default answer for every yes/no question")
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="do not stop to confirm — including the confirmation on `remove`",
+    )
     return parser

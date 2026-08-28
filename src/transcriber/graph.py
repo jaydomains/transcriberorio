@@ -760,8 +760,21 @@ class GraphClient:
 
     def move(self, item_id: str, parent_id: str, new_name: str | None = None) -> DriveItem:
         """Move (and optionally rename). The item id survives a move within a drive, which
-        is why the ledger keys on it."""
-        payload: dict[str, Any] = {"parentReference": {"id": parent_id}}
+        is why the ledger keys on it.
+
+        The conflict behaviour is stated rather than left to Graph's default, because this
+        is the one call in the service that touches somebody's only copy of a recording. Two
+        kinds of recording can carry the same name — a phone writes
+        ``Call Carel_260827_143005.m4a`` and WhatsApp writes ``PTT-20260827-WA0001.opus`` —
+        so a destination that already holds that name is reachable, and the two possible
+        defaults are "fail" and "replace the file that is there". ``fail`` makes it a visible
+        409 the archive pass reports in his words; the alternative would have this module
+        destroy an original, which it exists not to do.
+        """
+        payload: dict[str, Any] = {
+            "parentReference": {"id": parent_id},
+            "@microsoft.graph.conflictBehavior": "fail",
+        }
         if new_name:
             payload["name"] = new_name
         resp = self._request(

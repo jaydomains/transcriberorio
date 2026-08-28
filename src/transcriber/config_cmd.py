@@ -38,11 +38,11 @@ import difflib
 import os
 import re
 import sys
-from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Mapping
 
 from . import config as config_mod
-from .config import ENGINE_KEY_VARS, ENGINES, Config, ConfigError
+from .config import ENGINES, Config, ConfigError
 from .setup_wizard import load_env_file, mask, routes_from_values, write_env_file
 
 __all__ = [
@@ -56,6 +56,7 @@ __all__ = [
     "add_arguments",
     "run",
     "check_value",
+    "comments_would_be_lost",
 ]
 
 EXIT_OK = 0
@@ -429,6 +430,35 @@ def _unknown_key_message(name: str) -> str:
     return "\n".join(lines)
 
 
+def comments_would_be_lost(path: str) -> bool:
+    """True when this ``.env`` carries comments of somebody's own.
+
+    ``write_env_file`` rewrites the file in the standard grouped layout, which is what keeps
+    the grouping and the 0600 mode intact — and which drops any note a person added by
+    hand. Losing somebody's own comment silently would be a small betrayal of the same kind
+    this service exists to stop, so it is said out loud instead.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return False
+    header = {
+        "The transcriber's settings. Written by `transcriber setup`.",
+        "This file holds live credentials. It is chmod 0600 and .gitignore'd —",
+        "keep it that way, and never paste its contents into a chat or an email.",
+        "Re-run `python3 -m transcriber setup` to change any of it.",
+    }
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("#") or stripped.startswith("# ---"):
+            continue
+        if stripped.lstrip("#").strip() in header or stripped == "#":
+            continue
+        return True
+    return False
+
+
 def _bullet(problem: str) -> str:
     """One problem as a bullet, with its continuation lines lined up under the first."""
     first, *rest = problem.splitlines()
@@ -511,7 +541,7 @@ def _load(env_path: str, out: Any) -> dict[str, str] | None:
 
 def cmd_list(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
-    env = _load(args.env, sys.stderr if out is sys.stdout else out)
+    env = _load(args.env, out)
     if env is None:
         return EXIT_FAILED
     _print_list(args.env, env, out)
@@ -526,7 +556,7 @@ def cmd_list(args: argparse.Namespace, out: Any = None) -> int:
 
 def cmd_get(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
-    env = _load(args.env, sys.stderr if out is sys.stdout else out)
+    env = _load(args.env, out)
     if env is None:
         return EXIT_FAILED
     name = (args.key or "").strip().upper()
@@ -565,7 +595,12 @@ def _pending(args: argparse.Namespace, out: Any) -> list[tuple[str, str]] | None
             file=out,
         )
         return None
-    return changes
+    # A setting named twice in one invocation — `config set --model X ANALYSIS_MODEL_STRONG
+    # Y` — is one change, the last one, not two contradictory lines in the report.
+    deduped: dict[str, str] = {}
+    for name, value in changes:
+        deduped[name] = value
+    return list(deduped.items())
 
 
 def cmd_set(args: argparse.Namespace, out: Any = None) -> int:
@@ -616,6 +651,7 @@ def cmd_set(args: argparse.Namespace, out: Any = None) -> int:
         if not value.strip():
             candidate.pop(name, None)
 
+    lost_comments = comments_would_be_lost(args.env)
     write_env_file(
         args.env, candidate,
         header=[
@@ -633,6 +669,10 @@ def cmd_set(args: argparse.Namespace, out: Any = None) -> int:
         now = _shown(setting, value.strip())
         print(f"{name}: {was} -> {now}", file=out)
     print(f"\nWritten to {args.env}, readable only by you (0600).", file=out)
+    if lost_comments:
+        print("  Your own comments in that file were not kept — it is rewritten in the "
+              "standard\n  grouped layout every time, which is what keeps the 0600 mode "
+              "and the grouping.", file=out)
     print("The running service does not re-read this file — restart it to pick the change up.",
           file=out)
     if before:

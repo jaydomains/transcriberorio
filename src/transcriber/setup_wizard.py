@@ -39,6 +39,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Sequence
 
 from . import config as config_mod
+from .config import nested_folder_problems
 from .models import DEFAULT_ROUTE, Route, is_route_name, route_env_var
 
 __all__ = [
@@ -48,6 +49,7 @@ __all__ = [
     "routes_from_values",
     "routes_to_values",
     "route_problems",
+    "shared_archive_notes",
     "SUGGESTED_ROUTES",
     "FEEDBACK_LOOP",
 ]
@@ -356,8 +358,13 @@ def _phrase(route: Route) -> str:
     return f"{label} ({route.name})" if label else route.name
 
 
-def route_problems(routes: Sequence[Route]) -> list[str]:
+def route_problems(routes: Sequence[Route], ancestors_of: Any = None) -> list[str]:
     """Everything wrong with a set of routes, in the words he would use.
+
+    ``ancestors_of(folder_id) -> ancestor ids, nearest first`` adds the checks that folder
+    ids alone cannot answer — one route's watched folder sitting inside another's, an
+    archive folder inside a watched folder. Pass it whenever a live drive is at hand, which
+    is exactly where the ids are chosen; omitted, those checks are simply not made.
 
     This is the wizard's own copy of the rules so that a problem can be shown the moment it
     is created rather than at the end of a twenty-question run. It is deliberately no more
@@ -460,7 +467,40 @@ def route_problems(routes: Sequence[Route]) -> list[str]:
                     "and mixing the two makes it neither."
                 )
 
+    # And the overlaps an id cannot show, when there is a live drive to ask.
+    if ancestors_of is not None:
+        problems.extend(nested_folder_problems(routes, ancestors_of))
+
     return list(dict.fromkeys(problems))
+
+
+def shared_archive_notes(routes: Sequence[Route]) -> list[str]:
+    """Routes filing their old recordings into one archive folder — said, never refused.
+
+    Sharing a folder is his to choose, and pooling is a thing he asked for, so this is not a
+    problem and does not stop anything starting. But transcripts and originals are not the
+    same case: this service names a transcript and gives it a timestamp prefix, so two of
+    ours cannot collide, while an original keeps the name the phone or WhatsApp gave it. Two
+    of those arriving in one archive folder with the same name means the second one cannot be
+    moved — reported plainly at the time rather than discovered as a failed archive months
+    later.
+    """
+    by_folder: dict[str, list[Route]] = {}
+    for route in routes:
+        if route.archives:
+            by_folder.setdefault(route.archive_folder_id, []).append(route)
+    notes: list[str] = []
+    for sharing in by_folder.values():
+        if len(sharing) < 2:
+            continue
+        names = " and ".join(_phrase(r) for r in sharing)
+        notes.append(
+            f"{names} file their old recordings into the same archive folder. That is "
+            "allowed. Worth knowing: originals keep the name the phone gave them, so if two "
+            "of them ever have the same name the second cannot be moved — it will be "
+            "reported in the morning email rather than replacing the first."
+        )
+    return notes
 
 
 # ---------------------------------------------------------------------------------------
@@ -774,6 +814,7 @@ class _Folders:
         self._children: dict[str, list[Any]] = {}
         self._names: dict[str, str] = {}
         self._errors: dict[str, str] = {}
+        self._ancestors: dict[str, tuple[str, ...]] = {}
         self._warned = False
 
     @property
@@ -806,6 +847,42 @@ class _Folders:
                 self._names[item.id] = item.name
         self._children[folder_id] = items
         return items
+
+    def ancestors(self, folder_id: str) -> tuple[str, ...]:
+        """Every folder above this one on the drive, nearest first. Empty when unknown.
+
+        A folder id says nothing about what contains it, and containment is the difference
+        between two routes that happen to sit near each other and two routes where one is
+        quietly reading the other's recordings — OneDrive reports a folder and everything
+        under it. So it is asked here, at the keyboard, where the ids are being chosen and
+        there is a live drive to ask.
+
+        Never raises and never asks twice: a chain that cannot be walked comes back empty,
+        which the checks read as "not known" rather than as "no overlap".
+        """
+        wanted = (folder_id or "").strip()
+        if not wanted or self.client is None:
+            return ()
+        if wanted in self._ancestors:
+            return self._ancestors[wanted]
+        chain: list[str] = []
+        seen = {wanted}
+        current = wanted
+        # Bounded: a cycle cannot happen in a drive tree, but a walk that trusted the drive
+        # to say so would hang the wizard if one ever did.
+        for _ in range(32):
+            try:
+                item = self.client.get_item(current)
+            except Exception:  # noqa: BLE001 - an unanswerable question is not a problem
+                break
+            parent = str(getattr(item, "parent_id", "") or "").strip()
+            if not parent or parent in seen:
+                break
+            chain.append(parent)
+            seen.add(parent)
+            current = parent
+        self._ancestors[wanted] = tuple(chain)
+        return self._ancestors[wanted]
 
     def describe(self, folder_id: str) -> str:
         """A folder's name if it can be had, otherwise its id — never nothing at all."""
@@ -943,9 +1020,11 @@ def _show_routes(ctx: _Ctx, routes: Sequence[Route], folders: _Folders) -> None:
             ctx.out(f"      transcribed by         {route.engine}")
 
 
-def _report_routes(ctx: _Ctx, routes: Sequence[Route]) -> list[str]:
+def _report_routes(
+    ctx: _Ctx, routes: Sequence[Route], folders: "_Folders | None" = None
+) -> list[str]:
     """Say what is wrong with these routes, now, rather than at the end of the wizard."""
-    problems = route_problems(routes)
+    problems = route_problems(routes, folders.ancestors if folders is not None else None)
     if not problems:
         return problems
     ctx.out()
@@ -1003,10 +1082,10 @@ def _settle_route(ctx: _Ctx, others: Sequence[Route], route: Route, folders: _Fo
     folder, and two routes watching one folder — only exist between routes.
     """
     while True:
-        problems = route_problems([*others, route])
+        problems = route_problems([*others, route], folders.ancestors)
         if not problems:
             return route
-        _report_routes(ctx, [*others, route])
+        _report_routes(ctx, [*others, route], folders)
         if not ctx.confirm("Choose different folders for this one?", default=True):
             ctx.notes.append(
                 f"{_phrase(route)} is not usable as it stands: {problems[0]}"
@@ -1090,7 +1169,7 @@ def _edit_route(ctx: _Ctx, routes: list[Route], folders: _Folders) -> list[Route
                 if route.enabled else
                 "paused. Its folder is no longer watched; everything it has already "
                 "processed is kept.")))
-        _report_routes(ctx, [*others, route])
+        _report_routes(ctx, [*others, route], folders)
     # No settle loop here on purpose: the edit menu he has just left is itself the way to
     # change the folders again, and a problem like "every route is paused" is not one that
     # asking about folders can fix. Anything still wrong is printed by the routes menu he
@@ -1196,7 +1275,7 @@ def _routes(ctx: _Ctx, client: Any) -> None:
 
     while True:
         _show_routes(ctx, routes, folders)
-        _report_routes(ctx, routes)
+        _report_routes(ctx, routes, folders)
         what = ctx.choose(
             "What now?",
             [
@@ -1219,8 +1298,10 @@ def _routes(ctx: _Ctx, client: Any) -> None:
         elif what == "restart":
             routes = _first_routes(ctx, folders)
 
-    for problem in route_problems(routes):
+    for problem in route_problems(routes, folders.ancestors):
         ctx.notes.append(problem)
+    for note in shared_archive_notes(routes):
+        ctx.notes.append(note)
     routes_to_values(ctx.values, routes)
 
 

@@ -677,7 +677,7 @@ def sweep(
             log.error("%s", report.headline())
 
     if route is None:
-        _report_orphaned_routes(ledger, run, watched={r.route for r in run.reports})
+        _report_unswept_routes(ledger, run, config=config, swept={r.route for r in run.reports})
 
     if not dry_run and run.ok:
         mark_run(config, ledger, now=clock)
@@ -876,20 +876,29 @@ def sweep_route(
     return report
 
 
-def _report_orphaned_routes(ledger: Ledger, run: SweepRun, *, watched: set[str]) -> None:
-    """Unfinished work on a route nobody watches any more — visible, never swept away.
+def _report_unswept_routes(
+    ledger: Ledger, run: SweepRun, *, config: Any, swept: set[str]
+) -> None:
+    """Unfinished work on a route this sweep did not enumerate — and why it did not.
 
-    Taking a route out of ``ROUTES`` deletes nothing, which is the point; but it also means
-    no zero-cursor pass will ever look at that folder again. A recording left half-processed
-    on it would otherwise be reconciled by nobody and reported by nobody.
+    Two quite different situations, and they used to be reported as one. A **paused** route
+    is still in the configuration: its folder is not enumerated, but the worker's drain is
+    deliberately not filtered by route, so recordings already in the ledger keep being
+    processed to the end. A route that is **gone** from the configuration is the other case,
+    and its rows do not sit untouched either — the first time the worker picks one up the
+    pipeline can find no route to say where the transcript goes, and stops it for a person.
+
+    Telling him a paused route "is not in the configuration any more" sent him to fix a file
+    that was correct, in the one report whose whole job is making a real failure visible.
     """
     try:
         seen = ledger.routes_seen()
     except LedgerError as exc:  # noqa: BLE001 - a reporting extra never fails the sweep
         log.warning("could not list the routes in the ledger: %s", exc)
         return
+    configured = {str(getattr(r, "name", "") or ""): r for r in routes_of(config)}
     for name in seen:
-        if name in watched:
+        if name in swept:
             continue
         try:
             stranded = ledger.unfinished(route=name)
@@ -897,13 +906,30 @@ def _report_orphaned_routes(ledger: Ledger, run: SweepRun, *, watched: set[str])
             continue
         if not stranded:
             continue
+        route = configured.get(name)
+        if route is not None:
+            run.add(
+                "paused-route",
+                "",
+                name,
+                f"{len(stranded)} unfinished recording(s) are on {route_display(route)}, which "
+                "is switched off. Its folder is not being enumerated, so nothing new will be "
+                "found there — but the recordings already in the ledger are still being worked "
+                f"through as normal. Run `transcriber routes enable {name}` to start watching "
+                "the folder again",
+                route=name,
+            )
+            continue
         run.add(
             "unwatched-route",
             "",
             name,
             f"{len(stranded)} unfinished recording(s) are on the route {name!r}, which is not "
-            "in the configuration any more, so nothing enumerates its folder and nothing will "
-            "pick them up. Their ledger history is intact; put the route back if they matter",
+            "in the configuration any more, so nothing enumerates its folder. They are not "
+            "being left alone either: there is no route left to say where their transcripts "
+            "should go, so each one will be stopped for you the next time it is picked up. "
+            f"Their ledger history is intact — put the route back in ROUTES, or move those "
+            "recordings into a folder a route does watch",
             needs_a_person=True,
             route=name,
         )

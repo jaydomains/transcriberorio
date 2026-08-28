@@ -389,13 +389,18 @@ def cmd_backfill(args: argparse.Namespace) -> int:
 
 
 def backfill_cursor_name(route: str) -> str:
-    """This lane's own delta cursor for one route.
+    """This lane's own delta cursor for one route: ``delta:backfill:calls``.
 
-    The one route a pre-routes ``.env`` has keeps the name the cursor has always had, so an
-    installation that has already backfilled half its history does not start again from
-    zero the first time it runs a version that knows about routes.
+    Every route, ``default`` included. The bare ``delta:backfill`` this lane used to keep
+    for the one route a pre-routes ``.env`` has was also, letter for letter, the live delta
+    cursor of a route named ``backfill`` — and nothing refused that name. The two lanes
+    would have shared one token: the ``backfill`` route would have polled Graph with a
+    cursor belonging to a different folder's change feed and advanced it as though its own
+    recordings had been seen. Schema step 3 carries the old value across to
+    ``delta:backfill:default``, so an installation half way through its history does not
+    start again from zero.
     """
-    return BACKFILL_CURSOR if route == DEFAULT_ROUTE else f"{BACKFILL_CURSOR}:{route}"
+    return f"{BACKFILL_CURSOR}:{route}"
 
 
 def _enumerate_all(
@@ -581,6 +586,14 @@ def _route_status(config: Config | None, ledger: Ledger, stats: dict[str, Any]) 
     """
     configured: list[Route] = list(sweep_module.routes_of(config)) if config is not None else []
     by_route: dict[str, dict[str, int]] = dict(stats.get("by_route") or {})
+    # Recordings two routes have both claimed. Written into the event log since routes
+    # existed and read by nobody, which meant a recording being transcribed into the wrong
+    # folder — and eventually archived into the wrong folder — was invisible unless somebody
+    # opened SQLite by hand.
+    try:
+        clashes = ledger.route_disagreement_counts()
+    except Exception:  # noqa: BLE001 - status must still print from a sick ledger
+        clashes = {}
 
     ordered: list[str] = [r.name for r in configured]
     ordered.extend(name for name in sorted(by_route) if name not in ordered)
@@ -612,6 +625,7 @@ def _route_status(config: Config | None, ledger: Ledger, stats: dict[str, Any]) 
             "delta_cursor_set": bool(
                 (stats.get("cursors", {}).get(delta_cursor_name(name)) or {}).get("value_present")
             ),
+            "route_disagreements": int(clashes.get(name, 0)),
             "sweep_cursor_at": (
                 stats.get("cursors", {}).get(sweep_cursor_name(name)) or {}
             ).get("updated_at") or "",
@@ -633,7 +647,8 @@ def _print_route_table(routes: Sequence[dict[str, Any]]) -> None:
         print("\n  no routes: nothing is configured and the ledger has no history")
         return
 
-    header = ("route", "watches", "writes to", "known", "done", "failed", "last success")
+    header = ("route", "watches", "writes to", "known", "done", "failed", "clashes",
+              "last success")
     rows: list[tuple[str, ...]] = []
     for route in routes:
         name = route["route"]
@@ -648,11 +663,12 @@ def _print_route_table(routes: Sequence[dict[str, Any]]) -> None:
             str(route["known"]),
             str(route["done"]),
             str(route["failed"]),
+            str(route.get("route_disagreements", 0)),
             route["last_success"] or "never",
         ))
     widths = [max(len(header[i]), *(len(r[i]) for r in rows)) for i in range(len(header))]
-    # The three counts read as numbers, so they line up as numbers.
-    numeric = {3, 4, 5}
+    # The counts read as numbers, so they line up as numbers.
+    numeric = {3, 4, 5, 6}
 
     def cell(index: int, text: str) -> str:
         return text.rjust(widths[index]) if index in numeric else text.ljust(widths[index])
@@ -675,6 +691,19 @@ def _print_route_table(routes: Sequence[dict[str, Any]]) -> None:
         if not route["configured"]:
             print(f"    - {name} is no longer one of the configured routes. Its "
                   f"{route['known']} row(s) are kept, and nothing of it was deleted.")
+    # Said once, however many routes are named in it: it is one fact about a pair of
+    # routes, and repeating the whole explanation per route buries the counts above it.
+    clashing = [r for r in routes if r.get("route_disagreements")]
+    if clashing:
+        named = ", ".join(f"{r['route']} ({r['route_disagreements']})" for r in clashing)
+        print(f"    ! recordings claimed by two routes at once: {named}")
+        print("      Either they were moved between watched folders, or one route's folder "
+              "sits inside")
+        print("      another's — OneDrive reports a folder and everything under it. Until "
+              "that is sorted")
+        print("      out their transcripts may be going to the wrong folder, and they are "
+              "held back from")
+        print("      archiving. Run: transcriber routes")
 
 
 def _print_status(

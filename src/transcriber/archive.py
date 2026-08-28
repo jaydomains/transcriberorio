@@ -45,11 +45,11 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from .ledger import Ledger, LedgerError
 from .models import DEFAULT_ROUTE, Row, State, utc_now_iso
-from .sweep import local_now, parse_stamp, route_display, select_routes
+from .sweep import local_now, parse_stamp, route_display, routes_of, select_routes
 
 log = logging.getLogger("transcriber.archive")
 
@@ -330,7 +330,10 @@ def archive(
         log.info("%s", report.headline())
 
     if route is None:
-        _note_unwatched_routes(ledger, run, days=days, clock=clock, watched={r.route for r in run.reports})
+        _note_unarchived_routes(
+            ledger, run, days=days, clock=clock, config=config,
+            passed={r.route for r in run.reports},
+        )
 
     if run.ok and not dry_run:
         mark_run(config, ledger, now=clock)
@@ -383,10 +386,25 @@ def archive_route(
     if limit is not None:
         candidates = candidates[: max(0, int(limit))]
 
+    disputed = _disputed_items(ledger)
+
     consecutive_failures = 0
-    for row in candidates:
+    for candidate in candidates:
         report.considered += 1
-        verdict, detail = _may_move(row, days, clock, route_name=name)
+        # Re-read the row rather than work from the snapshot the query above produced. That
+        # query runs once, and the pass then confirms and moves one recording at a time, so
+        # by the time this one is reached somebody may have run `transcriber requeue` on it
+        # and a worker may already be downloading it. The old code checked a DONE row that
+        # no longer existed and moved the file out from under the download. One indexed
+        # lookup per candidate makes _may_move's "second, independent check" true.
+        try:
+            row = ledger.get(candidate.item_id) or candidate
+        except LedgerError as exc:
+            report.add(candidate.item_id, candidate.name, FAILED,
+                       f"the ledger could not be re-read for it, so it was left alone ({exc})")
+            continue
+
+        verdict, detail = _may_move(row, days, clock, route_name=name, disputed=disputed)
         if not verdict:
             report.add(row.item_id, row.name, HELD_BACK, detail)
             continue
@@ -404,7 +422,13 @@ def archive_route(
 
         report.add(row.item_id, row.name, result, detail)
 
-        if result == FAILED:
+        if result == FAILED and _is_name_clash(detail):
+            # A name already taken in the archive folder is about this one recording, not
+            # about OneDrive being hammered, so it does not count towards the stop below:
+            # stopping the whole route on it would leave every later recording unarchived
+            # and report the wrong cause.
+            consecutive_failures = 0
+        elif result == FAILED:
             consecutive_failures += 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 report.stopped_early = (
@@ -421,28 +445,50 @@ def archive_route(
     return report
 
 
-def _note_unwatched_routes(
-    ledger: Ledger, run: ArchiveRun, *, days: int, clock: float, watched: set[str]
+def _note_unarchived_routes(
+    ledger: Ledger, run: ArchiveRun, *, days: int, clock: float, config: Any, passed: set[str]
 ) -> None:
-    """Finished recordings on a route that is no longer configured.
+    """Aged recordings on a route this pass did not archive, and the honest reason why.
 
-    Nothing is moved for them — there is no folder to move them to — but they are said out
-    loud, because "the archive pass ran and did not mention them" would otherwise be the
-    only record of a whole kind of recording ageing quietly in the working folder.
+    Two cases, and saying the wrong one sends him to fix a file that is correct. A **paused**
+    route is still in the configuration and usually still has an archive folder; its
+    recordings simply are not moved while it is switched off. A route that is **gone** from
+    the configuration genuinely has no folder to move them to.
+
+    Nothing is moved for either — but both are said out loud, because "the archive pass ran
+    and did not mention them" would otherwise be the only record of a whole kind of recording
+    ageing quietly in the working folder.
     """
     try:
         seen = ledger.routes_seen()
     except LedgerError as exc:  # noqa: BLE001 - a reporting extra never fails the pass
         log.warning("could not list the routes in the ledger: %s", exc)
         return
+    configured = {str(getattr(r, "name", "") or ""): r for r in routes_of(config)}
     for name in seen:
-        if name in watched:
+        if name in passed:
             continue
         try:
             waiting = ledger.due_for_archive(days, now=clock, route=name)
         except LedgerError:
             continue
         if not waiting:
+            continue
+        route = configured.get(name)
+        if route is not None:
+            has_folder = bool(str(getattr(route, "archive_folder_id", "") or "").strip())
+            where = (
+                "It has an archive folder; nothing is moved while a route is switched off."
+                if has_folder else
+                "It has no archive folder either, so its recordings would stay where they are "
+                "in any case."
+            )
+            run.notes.append(
+                f"{len(waiting)} finished recording(s) on {route_display(route)} are older "
+                f"than {days} days, and that route is switched off. {where} Run "
+                f"`transcriber routes enable {name}` if you want them archived. They are "
+                "untouched and their ledger history is intact."
+            )
             continue
         run.notes.append(
             f"{len(waiting)} finished recording(s) on the route {name!r} are older than "
@@ -451,8 +497,30 @@ def _note_unwatched_routes(
         )
 
 
-def _may_move(row: Row, days: int, clock: float, *, route_name: str = "") -> tuple[bool, str]:
-    """The second, independent age, state and route check. Fails closed on anything unclear."""
+def _may_move(
+    row: Row,
+    days: int,
+    clock: float,
+    *,
+    route_name: str = "",
+    disputed: Mapping[str, str] | None = None,
+) -> tuple[bool, str]:
+    """The second, independent age, state and route check. Fails closed on anything unclear.
+
+    Genuinely independent now: the caller re-reads the row from the ledger immediately
+    before calling this, so a recording re-queued since the candidate list was built is
+    seen as re-queued rather than as the DONE row it was a minute ago.
+    """
+    if disputed and row.item_id in disputed:
+        # Two routes have both claimed this recording. Which route owns it is exactly what
+        # is in doubt, and this pass would move the only copy of the audio into one of the
+        # two archives on the strength of that doubt. It stays where it is until a person
+        # has looked; nothing is decided here.
+        return False, (
+            "two routes have both claimed this recording "
+            f"({disputed[row.item_id]}), so which archive folder it belongs in is exactly "
+            "what is not settled. It stays where it is until that is sorted out"
+        )
     if route_name and (row.route or DEFAULT_ROUTE) != route_name:
         # Belt and braces over the ledger's own filter. A recording belongs to the route it
         # arrived on, and that route's archive folder is the only folder it may be moved to.
@@ -523,7 +591,18 @@ def _archive_one(
     if dry_run:
         return MOVED, f"would be moved to this route's archive folder ({detail})"
 
-    graph.move(row.item_id, archive_folder_id)
+    try:
+        graph.move(row.item_id, archive_folder_id)
+    except Exception as exc:  # noqa: BLE001 - reported in his words, then re-raised as a result
+        if _is_name_clash(f"{type(exc).__name__}: {exc}") or _clash_status(exc):
+            return FAILED, (
+                f"a recording called {row.name!r} is already in the archive folder, so this "
+                "one was not moved — moving it would have meant replacing the file that is "
+                "there, and nothing in this service replaces an original. Rename one of the "
+                "two, or give this route an archive folder of its own, and it will move on "
+                f"the next pass ({type(exc).__name__}: {exc})"
+            )
+        raise
     # Only after the move has actually returned. If this write fails, the next pass finds
     # the item already in the archive folder and records it then.
     ledger.set_fields(row.item_id, archived_at=utc_now_iso(clock), parent_id=archive_folder_id)
@@ -608,6 +687,42 @@ def _named_output_present(graph: Any, route: Any, name: str) -> tuple[bool, str]
         if str(getattr(child, "name", "")) == name and int(getattr(child, "size", 0) or 0) > 0:
             return True, ""
     return False, "no id was recorded for it and it was not found in this route's output folder"
+
+
+def _disputed_items(ledger: Ledger) -> dict[str, str]:
+    """Recordings a second route has also claimed, and the two routes that claimed them.
+
+    Read once per route pass. A disagreement means either the recording moved between two
+    watched folders or one route's source folder is nested inside another's; in both cases
+    the route the row carries may not be the route the recording belongs to, and this pass
+    would act on it by moving the original.
+    """
+    try:
+        events = ledger.route_disagreements()
+    except Exception as exc:  # noqa: BLE001 - a missing extra never fails the pass
+        log.warning("could not read the route disagreements: %s", exc)
+        return {}
+    out: dict[str, str] = {}
+    for event in events:
+        item_id = str(event.get("item_id") or "")
+        if item_id and item_id not in out:
+            out[item_id] = str(event.get("detail") or "seen on two routes")
+    return out
+
+
+#: What Graph says when the destination folder already holds a file of that name. The move
+#: asks for ``conflictBehavior: fail`` precisely so this is a refusal rather than a silent
+#: replacement of somebody's original.
+_NAME_CLASH_MARKERS = ("namealreadyexists", "409", "nameconflict")
+
+
+def _is_name_clash(detail: str) -> bool:
+    text = str(detail or "").lower()
+    return any(marker in text for marker in _NAME_CLASH_MARKERS)
+
+
+def _clash_status(exc: Exception) -> bool:
+    return int(getattr(exc, "status", 0) or 0) == 409
 
 
 def _looks_missing(exc: Exception) -> bool:

@@ -325,10 +325,18 @@ class Digest:
     #: The same morning, counted one route at a time. The subject line is still the whole
     #: service; this is what the body breaks it down into.
     routes: tuple[RouteDigest, ...] = ()
+    #: Recordings two routes have both claimed. Not a failure — the recording is being
+    #: processed — but the transcript may be landing in the wrong folder, and that is only
+    #: ever fixed by a person looking at the folders.
+    route_disagreements: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def needs_a_person(self) -> bool:
-        return self.open_failures > 0 or self.counts.nothing_arrived
+        return (
+            self.open_failures > 0
+            or self.counts.nothing_arrived
+            or bool(self.route_disagreements)
+        )
 
     @property
     def alarm(self) -> bool:
@@ -402,6 +410,7 @@ def build(
     service_error = _service_error(ledger)
     attention = _attention(ledger, target)
     routes = route_digests(config, ledger, target)
+    disagreements = route_disagreements(ledger, target)
     if sweep_report is None:
         sweep_report = _stored_report(ledger, "sweep")
     if archive_report is None:
@@ -417,6 +426,7 @@ def build(
         older_failures=older_failures,
         stats=ledger.stats(),
         routes=routes,
+        disagreements=disagreements,
         sweep_report=sweep_report,
         archive_report=archive_report,
         service_error=service_error,
@@ -460,6 +470,7 @@ def build(
         service_error=service_error,
         credential_warning=warnings[0][1] if warnings else "",
         routes=routes,
+        route_disagreements=disagreements,
     )
 
 
@@ -532,6 +543,22 @@ def _attention(ledger: Ledger, day: str) -> Mapping[str, Any]:
         return {}
 
 
+def route_disagreements(ledger: Ledger, day: str) -> tuple[Mapping[str, Any], ...]:
+    """Recordings two routes have both claimed, from the reported day onwards.
+
+    A disagreement is either a recording he moved between two watched folders or two routes
+    watching folders one of which is inside the other — OneDrive reports a folder and
+    everything under it. The second sends a transcript to the wrong folder and would, at
+    sixty days, move the original into the wrong archive, so it belongs in the one thing he
+    reads every morning rather than only in the event log.
+    """
+    try:
+        return tuple(ledger.route_disagreements(since=day))
+    except Exception as exc:  # noqa: BLE001 - the digest must be sendable from a sick ledger
+        log.warning("could not read the route disagreements: %s", exc)
+        return ()
+
+
 def _stored_report(ledger: Ledger, name: str) -> str:
     """Last night's rendered report, read back after a restart lost the in-memory one."""
     try:
@@ -551,6 +578,7 @@ def _render(
     stats: Mapping[str, Any],
     sweep_report: Any,
     routes: Sequence["RouteDigest"] = (),
+    disagreements: Sequence[Mapping[str, Any]] = (),
     archive_report: Any,
     service_error: str = "",
     attention: Mapping[str, Any] | None = None,
@@ -646,6 +674,33 @@ def _render(
         for entry in routes:
             marker = "!" if entry.needs_a_person else " "
             lines.append(f"  {marker} {entry.line()}")
+        lines.append("")
+
+    if disagreements:
+        # Next to the per-route breakdown, because it is a fact about two routes rather than
+        # about one recording. Nothing here is decided: which of the two routes a recording
+        # belongs to is exactly the question, and only a person can answer it.
+        lines += [f"TWO ROUTES CLAIMED THE SAME RECORDING — {len(disagreements)}", _RULE]
+        for chunk in _wrap(
+            "Each of these was seen on one route and then seen again on another. Either you "
+            "moved it between two watched folders, or one route's folder is inside another "
+            "route's folder — OneDrive reports a folder and everything underneath it, so "
+            "both routes see the same recording."
+        ):
+            lines.append(f"  {chunk}")
+        lines.append("")
+        for event in list(disagreements)[:10]:
+            what = str(event.get("item_name") or event.get("item_id") or "a recording")
+            lines.append(f"  - {what}: {event.get('detail') or 'seen on two routes'}")
+        if len(disagreements) > 10:
+            lines.append(f"  - and {len(disagreements) - 10} more")
+        lines.append("")
+        for chunk in _wrap(
+            "Its transcript went to the folder of the route it stayed on, which may not be "
+            "the right one, and it will not be archived until this is sorted out. Run "
+            "`transcriber routes` to see which folders each route watches."
+        ):
+            lines.append(f"  {chunk}")
         lines.append("")
 
     facts = dict(attention or {})

@@ -119,6 +119,114 @@ alarm:
 
 ---
 
+## Routes — a folder for each kind of recording
+
+You do not record one kind of thing. A phone call is not a site walk, and a WhatsApp voice
+note is neither. A **route** is one kind: **the folder its recordings arrive in, and the
+folder its transcripts are written to.** The service runs as many routes as you give it,
+watching each folder separately.
+
+Each route has:
+
+| | |
+| --- | --- |
+| **a short name** | `calls`, `site-meetings`, `whatsapp`. Lowercase, no spaces. It is written next to every recording in the ledger and appears in the morning email, so it stays as it is once recordings have used it. |
+| **a label** | What you call it in plain words — *Site meetings*. This is what the morning email shows. |
+| **the folder it watches** | Where those recordings arrive. |
+| **the folder it writes to** | Where the three markdown files go. |
+| **an archive folder** | Where the originals move once they are 60 days old and their transcripts are confirmed. You can leave this empty, and then that kind of recording simply stays where it is, for good. |
+| **an engine** | Usually blank, meaning "the same as everything else". Set it only if one kind of recording needs a different transcription service. |
+| **on or off** | A route can be paused. Its folder stops being watched; nothing else changes. |
+
+**Two routes may write into the same folder.** If you want the calls and the site meetings
+to land together, point both at one transcripts folder — that is allowed on purpose, and
+the transcripts cannot collide because the service names them.
+
+**Two routes may not watch the same folder**, and the service refuses to start if they do:
+a recording can only belong to one kind, and the other route would step past it as though
+it had been handled.
+
+**No route's watched folder may sit inside another route's watched folder.** OneDrive
+reports a folder *and everything underneath it*, so a route watching `/Recordings` also
+sees everything in `/Recordings/Site meetings`. Keep the folders side by side. The wizard
+and `transcriber routes` check this for you while you are picking the folders, and if it
+ever happens anyway, `transcriber status` and the morning email say which two routes
+claimed the same recording, and that recording is not archived until you have sorted it out.
+
+**Never point a route's transcripts folder at any route's recordings folder.** The service
+would read its own transcripts back in as new recordings and transcribe them, over and over.
+It refuses to start on that one, and names both routes.
+
+### The commands
+
+```
+transcriber routes                    list them, with the real folder names from OneDrive
+transcriber routes add                add one — it asks the questions and shows you the folders
+transcriber routes edit calls         change one
+transcriber routes disable whatsapp   stop watching that folder, keep everything else
+transcriber routes enable whatsapp    start again
+transcriber routes remove whatsapp    take it out of the file altogether
+```
+
+`remove` deletes nothing. Not one recording is moved, renamed or deleted, and every line the
+route ever wrote in the ledger is kept. What stops is the watching. If some of that route's
+recordings have not been transcribed yet, `remove` says so before it asks you to confirm,
+because those ones will be set aside for you rather than finished — **use `disable` instead
+if you just want it to stop watching for a while.** Renaming a route through
+`routes edit` has the same effect on work that is still in flight, and says so too.
+
+Nothing takes effect until the service is restarted: it reads the file once, at startup.
+
+### His three kinds, worked through
+
+*Phone calls into their own folder, transcripts to their own folder, originals archived:*
+
+```
+transcriber routes add
+  What do you call this kind of recording?   Phone calls
+  And a short name for it?                   calls
+  Which folder do they arrive in?            Recordings / Calls
+  Where should their transcripts go?         Transcripts / Calls
+  Where should they move to at 60 days?      Archive / Calls
+  Which service should transcribe them?      the same as everything else
+```
+
+*Site meetings, kept together with the calls' transcripts in one folder:*
+
+```
+transcriber routes add
+  What do you call this kind of recording?   Site meetings
+  And a short name for it?                   site-meetings
+  Which folder do they arrive in?            Recordings / Site meetings
+  Where should their transcripts go?         Transcripts / Calls        ← the same folder. Allowed.
+  Where should they move to at 60 days?      Archive / Site meetings
+```
+
+*WhatsApp voice notes, which you would rather leave where they are for good:*
+
+```
+transcriber routes add
+  What do you call this kind of recording?   WhatsApp voice notes
+  And a short name for it?                   whatsapp
+  Which folder do they arrive in?            Recordings / WhatsApp
+  Where should their transcripts go?         Transcripts / WhatsApp
+  Where should they move to at 60 days?      n — no folder, they stay where they are
+```
+
+Then `transcriber status` shows one line per route — how many arrived, how many finished,
+how many need you, and when each folder was last read successfully — and the morning email
+breaks the day down the same way, so *"site meetings all fine, WhatsApp broken"* is one line
+rather than something to work out from a total.
+
+### If you have only ever had one folder
+
+You do not have to do anything. A `.env` written before routes existed keeps working exactly
+as it did, as a single route called `default`. The first time you run `transcriber routes
+add`, it is written out as a list of routes and tells you it is doing so; nothing about what
+is watched, what is written, or what is in the ledger changes.
+
+---
+
 ## Running it
 
 Python 3.11 or newer. **There is nothing to install** — every import is from Python's own
@@ -144,6 +252,11 @@ python3 -m transcriber run
 | `transcriber archive` | Runs the monthly archive pass now. `--dry-run` is safe. |
 | `transcriber backfill` | Walks the whole folder from the beginning, for a first run against an existing pile of recordings. |
 | `transcriber requeue <id>` | Puts one recording back in the queue. |
+| `transcriber routes` | Lists your routes, adds one, changes one, pauses one. See **Routes** above. |
+| `transcriber config` | Reads and changes one setting at a time — `config set ANALYSIS_MODEL_STRONG claude-opus-5` — checking it before it writes. |
+
+`once`, `sweep`, `archive`, `backfill` and `status` all take `--route <short name>` to act
+on one route only. Left off, they act on every route that is switched on.
 
 ### Checking a change
 
@@ -169,13 +282,35 @@ start without it — and it reports *every* missing variable at once, not one pe
 | `GRAPH_CLIENT_ID` | **REQUIRED.** The app registration's id. |
 | `GRAPH_CLIENT_SECRET` | **REQUIRED.** The app registration's secret. Never logged, never emailed, never written to the ledger. |
 | `GRAPH_USER_ID` | **REQUIRED.** Whose OneDrive holds the recordings. |
-| `SOURCE_FOLDER_ID` | **REQUIRED.** The recordings folder (`/CALLS`). |
-| `OUTPUT_FOLDER_ID` | **REQUIRED.** Where the three `.md` files are written. |
-| `ARCHIVE_FOLDER_ID` | **REQUIRED.** Where recordings older than 60 days are moved. Nothing is ever deleted. |
+| `SOURCE_FOLDER_ID` | The recordings folder, if you are running the old single-folder shape. **REQUIRED unless `ROUTES` is set.** |
+| `OUTPUT_FOLDER_ID` | Where the three `.md` files are written, in that same single-folder shape. |
+| `ARCHIVE_FOLDER_ID` | Where recordings older than 60 days are moved, in that same shape. Nothing is ever deleted. |
 | `ORPHAN_FOLDER_ID` | Optional. If an upload half-finishes, the stray files are moved here rather than left in the output folder. Leave it empty and the strays are named in the error and replaced on the next attempt. **Never point this at the archive folder** — nothing ever looks in there. |
 
-**These must be four different folders.** The service refuses to start if any two are the
-same, because a file it wrote and a file it must read would then be indistinguishable.
+### The routes — one entry per kind of recording
+
+Written by `transcriber setup` and `transcriber routes`; you should rarely need to edit
+these by hand. See **Routes** above for what they mean.
+
+| Variable | Meaning |
+| --- | --- |
+| `ROUTES` | The short names, comma separated: `calls,site-meetings,whatsapp`. Set it and the three single-folder variables above are ignored. |
+| `ROUTE_<NAME>_LABEL` | What the morning email calls this kind — `Site meetings`. |
+| `ROUTE_<NAME>_SOURCE` | **REQUIRED per route.** The folder its recordings arrive in. |
+| `ROUTE_<NAME>_OUTPUT` | **REQUIRED per route.** The folder its transcripts are written to. Two routes may share one. |
+| `ROUTE_<NAME>_ARCHIVE` | Where its originals move at 60 days. Empty means this kind stays where it is, for good. |
+| `ROUTE_<NAME>_ENGINE` | Empty means the service default. Set it only if this kind needs a different transcription service. |
+| `ROUTE_<NAME>_ENABLED` | `false` pauses the route: its folder stops being watched, and nothing else changes. |
+
+`<NAME>` is the short name in capitals with hyphens as underscores, so `site-meetings`
+becomes `ROUTE_SITE_MEETINGS_SOURCE`.
+
+**A folder may only have one job.** No route may write its transcripts into any route's
+recordings folder — that is a loop, and the service would transcribe its own output for as
+long as nobody noticed — no two switched-on routes may watch the same folder, and no
+archive folder may be a recordings or transcripts folder. The service refuses to start on
+any of those and names the routes involved. It also refuses if the single-folder variables
+are the same folder as each other.
 
 ### The transcription engine
 

@@ -44,6 +44,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from .logging_setup import get_logger
 from .models import (
     DEFAULT_ROUTE,
     DriveItem,
@@ -56,6 +57,8 @@ from .models import (
     strip_owner_paths,
     utc_now_iso,
 )
+
+log = get_logger(__name__)
 
 __all__ = [
     "Ledger",
@@ -108,8 +111,8 @@ SWEEP_CURSOR = "sweep:default"   # and that route's nightly re-enumeration mark
 
 #: A cursor holding a delta link may only be written by record_page. Two shapes qualify:
 #: anything under ``delta`` (which is where they have always lived, including the backfill's
-#: own ``delta:backfill``) and a route's ``sweep:<route>``. The sweep pass keeps other marks
-#: under the same ``sweep:`` prefix — ``sweep:last_attempt_at``, ``sweep:last_report`` — and
+#: own ``delta:backfill:<route>``) and a route's ``sweep:<route>``. The sweep pass keeps
+#: other marks under the same ``sweep:`` prefix — ``sweep:last_attempt_at``, ``sweep:last_report`` — and
 #: those are ordinary bookkeeping; a route name cannot contain an underscore, which is what
 #: keeps the two apart.
 _GUARDED_PREFIX = "delta"
@@ -133,7 +136,7 @@ class LedgerStateError(LedgerError):
     """An attempt to move a row somewhere the state machine does not allow."""
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Migrations run in order, each in its own transaction, each recorded. To add one: append
 # (2, "note", (sql, sql, ...)) below and raise SCHEMA_VERSION. Never edit an entry that has
@@ -226,6 +229,21 @@ _MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
             # value being moved is the older one either way, and re-reading loses nothing.
             "UPDATE OR REPLACE cursors SET name='delta:default' WHERE name='delta:source'",
             "UPDATE OR REPLACE cursors SET name='sweep:default' WHERE name='delta:sweep'",
+        ),
+    ),
+    (
+        3,
+        "the backfill lane gets its own namespace, one cursor per route",
+        (
+            # ``delta:backfill`` was the backfill's cursor for the one route a pre-routes
+            # .env has, and it is *also* the live delta cursor of a route somebody calls
+            # ``backfill`` — a name nothing refused. That route would then read the backfill
+            # lane's token, walk a different folder's change feed, and advance its cursor as
+            # though its own new recordings had been seen. Moving the backfill lane under
+            # ``delta:backfill:<route>`` for every route, ``default`` included, closes the
+            # namespace instead of fencing off a word. The value moves with the name so an
+            # installation half way through backfilling its history does not start again.
+            "UPDATE OR REPLACE cursors SET name='delta:backfill:default' WHERE name='delta:backfill'",
         ),
     ),
 )
@@ -426,7 +444,7 @@ class Ledger:
         can move past a recording that was not recorded.
 
         ``cursor_name`` is for the one caller that keeps a delta cursor which is not a
-        route's — the backfill's ``delta:backfill``. Leave it alone and the route's own live
+        route's — the backfill's ``delta:backfill:<route>``. Leave it alone and the route's own live
         cursor is what moves.
         """
         if not isinstance(new_cursor, str) or not new_cursor.strip():
@@ -503,15 +521,29 @@ class Ledger:
             ),
         )
         if existing["route"] != route:
-            # The same recording turning up on a second route means it moved between watched
-            # folders. The row keeps the route it was discovered on, because that is where
-            # its outputs went and where its archive is; but a recording that appears to
-            # belong to two routes is a configuration somebody should look at, so it is
-            # written into the history rather than resolved silently.
+            # The same recording turning up on a second route is one of two things, and both
+            # need a person: he moved it between watched folders, or one route's source
+            # folder sits inside another's and Graph's subtree delta feed is handing the same
+            # recording to both. The second is the dangerous one — the transcript goes to the
+            # wrong folder and, sixty days later, the only copy of the audio is moved into
+            # the wrong archive — so this is said out loud at error level, on the spot, as
+            # well as written into the history. The row keeps the route it was discovered on,
+            # because that is where its outputs went; nothing is decided here.
             self._event(
                 conn, item.item_id, "route-disagreement", now, existing["state"], existing["state"],
                 f"discovered on route {existing['route']}, seen again on route {route}; "
                 f"it stays on {existing['route']}",
+            )
+            log.error(
+                "route-disagreement",
+                f"{item.name!r} was discovered on the route {existing['route']!r} and has now "
+                f"been seen again on the route {route!r}. It stays on {existing['route']!r}, so "
+                f"its transcript goes to that route's output folder and it would age into that "
+                f"route's archive. Either it was moved between watched folders, or those two "
+                f"routes are watching folders one of which is inside the other — check that "
+                f"before the archive pass moves it",
+                item=item.item_id,
+                route=route,
             )
 
         changed = int(existing["size"] or 0) != int(item.size or 0) or existing["etag"] != item.etag
@@ -1089,6 +1121,46 @@ class Ledger:
         ).fetchall()
         return [dict(r) for r in records]
 
+    def route_disagreements(
+        self, since: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Recordings two routes have both claimed, newest first — read by somebody.
+
+        ``since`` is a timestamp or a bare ``YYYY-MM-DD``; events at or after it are
+        returned. Omitted, the whole history comes back.
+
+        This exists because writing the event was not the same as reporting it. A
+        disagreement means either a recording moved between watched folders or one route's
+        source folder is nested inside another's, and the second sends a transcript to the
+        wrong folder and, at sixty days, the original into the wrong archive. It is read by
+        ``transcriber status`` and by the morning email, so nobody has to open SQLite to
+        find out.
+        """
+        clause = " AND at >= ?" if (since or "").strip() else ""
+        params: tuple[Any, ...] = ((since,) if clause else ())
+        records = self._conn().execute(
+            "SELECT events.*, items.name AS item_name, items.route AS item_route,"
+            " items.state AS item_state"
+            " FROM events LEFT JOIN items ON items.item_id = events.item_id"
+            f" WHERE events.kind='route-disagreement'{clause}"
+            " ORDER BY events.id DESC LIMIT ?",
+            (*params, int(limit)),
+        ).fetchall()
+        return [dict(r) for r in records]
+
+    def route_disagreement_counts(self, since: str | None = None) -> dict[str, int]:
+        """How many disagreements each route is named in, for the ``status`` table.
+
+        Both routes are counted: the one the recording stays on and the one that saw it
+        again. Which of the two is misconfigured is not something this can know, and it is
+        not going to guess.
+        """
+        counts: dict[str, int] = {}
+        for event in self.route_disagreements(since):
+            for name in _routes_in_disagreement(event):
+                counts[name] = counts.get(name, 0) + 1
+        return counts
+
     def recent_events(self, limit: int = 200) -> list[dict[str, Any]]:
         records = self._conn().execute(
             "SELECT * FROM events ORDER BY id DESC LIMIT ?", (int(limit),)
@@ -1147,6 +1219,30 @@ def _decode_meta(raw: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return dict(value) if isinstance(value, dict) else {}
+
+
+_DISAGREEMENT_RE = re.compile(
+    r"discovered on route (?P<first>\S+), seen again on route (?P<second>\S+);"
+)
+
+
+def _routes_in_disagreement(event: Mapping[str, Any]) -> tuple[str, ...]:
+    """Both route names out of a ``route-disagreement`` event's detail line.
+
+    Parsed from the detail because that is where both names are: the row itself only ever
+    carries the one it stayed on, and reporting only that route would hide the other half
+    of the pair — which is the half a person has to look at.
+    """
+    detail = str(event.get("detail") or "")
+    match = _DISAGREEMENT_RE.search(detail)
+    names: list[str] = []
+    if match:
+        names = [match.group("first"), match.group("second")]
+    else:
+        current = str(event.get("item_route") or "").strip()
+        if current:
+            names = [current]
+    return tuple(dict.fromkeys(n for n in names if n))
 
 
 def _adapt(column: str, value: Any) -> Any:
