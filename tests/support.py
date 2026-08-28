@@ -323,3 +323,25 @@ class StubExtraction:
 
     def for_category(self, category: str) -> tuple[Any, ...]:
         return tuple(p for p in self.proposals if p.category == category)
+
+def quiesce_scheduled_jobs(config, ledger) -> None:
+    """Mark today's scheduled jobs already done.
+
+    Without this, whether a test passes depends on the wall-clock hour it runs at: the
+    digest is due from 06:00 local, so a test that drives a worker cycle after that hour
+    fires a real digest, which fails offline and writes an error mark. That made at least
+    one assertion pass only between midnight and 06:00 SAST. A test whose result depends on
+    what time you run it is worse than no test, because it teaches you to ignore a red run.
+    """
+    from transcriber import digest as _digest
+
+    today = _digest.local_now(config, None).date().isoformat()
+    ledger.cursor_set(_digest.DIGEST_DAY_MARK, today)
+    for module_name, mark_suffix in (("sweep", "SWEEP_DAY_MARK"), ("archive", "ARCHIVE_DAY_MARK")):
+        try:
+            module = __import__(f"transcriber.{module_name}", fromlist=[module_name])
+        except Exception:
+            continue
+        for name in dir(module):
+            if name.endswith("_DAY_MARK") or name.endswith("_MONTH_MARK"):
+                ledger.cursor_set(getattr(module, name), today)

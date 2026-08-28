@@ -21,7 +21,7 @@ says "copy this", it means copy it into your password manager or a note on your 
 | 5 | Set up the morning email | 10 min | you |
 | 6 | Set up the "is it still alive" alarm | 5 min | you |
 | 7 | Choose where it runs | — | decide with me |
-| 8 | Fill in the settings file | 15 min | you |
+| 8 | Run the setup wizard | 10 min | you |
 | 9 | Prove it works before it touches anything | 5 min | me, with you watching |
 
 **Start with step 1 today.** It is the only one that might need somebody else, and everything else
@@ -195,17 +195,42 @@ Let's decide this together once you know whether you have an Azure subscription.
 
 ---
 
-## Step 8 — Fill in the settings file
+## Step 8 — Run the setup wizard
 
-The repository has a file called `.env.example`. Copy it to `.env` and fill in what you gathered
-above. Every line has a comment explaining it.
+Don't edit any files. Run this:
 
-**`.env` must never be committed to the repository.** It's already in `.gitignore`, so this should be
-impossible by accident — but if you're ever unsure whether a secret got committed, ask me and I'll
-check before it goes anywhere.
+```
+python3 -m transcriber setup
+```
 
-When it's deployed for real, these go into the host's own secrets store rather than a file on disk.
-I'll set that up with you.
+It asks for everything above, one question at a time, in plain words — and **checks each answer
+against the real service before moving on**. A wrong tenant id costs you thirty seconds here instead
+of a day of recordings later.
+
+What it does that saves you the fiddly parts:
+
+- **Signs in to Microsoft and then lists your OneDrive folders**, so you pick the recordings folder
+  from a numbered menu instead of hunting for a folder id.
+- **Tests each API key** by making one real call, and tells you plainly if a key is wrong.
+- **Sends you a test email**, so you know the morning report can reach you before you rely on it.
+- **Pings the healthchecks alarm** to prove it's wired up.
+- **Hides every password as you type it**, and never prints one back — not even inside an error
+  message.
+- Writes `.env` readable only by you, and re-running it keeps your previous answers as the defaults,
+  so changing one thing later means pressing Enter through the rest.
+
+Two flags worth knowing:
+
+```
+python3 -m transcriber setup --no-verify     # skip the live checks (before admin consent, or offline)
+python3 -m transcriber setup --env /path/.env  # write somewhere other than ./.env
+```
+
+**Never paste the contents of `.env` into a chat, an email, or a support ticket.** It holds live
+credentials. It's already in `.gitignore` so it can't be committed by accident.
+
+When this is deployed for real, these values go into the host's own secrets store rather than a file
+on disk — I'll set that up with you.
 
 ---
 
@@ -256,5 +281,7 @@ Only after those three do we turn on the loop.
       everything else failing.
 - [ ] Tell me whether you have an **Azure subscription**, so we can settle step 7.
 - [ ] Tell me **which address** the morning email should go to.
+
+Once step 1 is approved, the whole of steps 2–9 is one command: `python3 -m transcriber setup`.
 
 Everything else can wait for the engine comparison.

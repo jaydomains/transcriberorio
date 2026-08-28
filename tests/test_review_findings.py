@@ -705,8 +705,11 @@ class AnExpiredCredentialStopsTheService(unittest.TestCase):
         with Ledger(":memory:") as ledger:
             ledger.cursor_set("worker:last_cycle_error_detail", "something was wrong")
             graph = support.FakeGraph([([support.FakeGraph.item("A", "a.m4a")], "c1")])
-            hand = worker.Worker(support.make_config(), ledger, graph,
-                                 heartbeat=_SilentHeartbeat())
+            cfg = support.make_config()
+            # A "good cycle" means nothing failed. Leave the digest due and it fires here,
+            # fails with no network, and writes the very mark this asserts is cleared.
+            support.quiesce_scheduled_jobs(cfg, ledger)
+            hand = worker.Worker(cfg, ledger, graph, heartbeat=_SilentHeartbeat())
             report = hand.run_once(limit=0)
             self.assertTrue(report.poll.ok)
             self.assertEqual(ledger.cursor_get("worker:last_cycle_error_detail"), "")

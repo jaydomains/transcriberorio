@@ -150,6 +150,17 @@ def _parser() -> argparse.ArgumentParser:
     selftest.add_argument("--verbose", action="store_true", help="print every check, not only failures")
     selftest.set_defaults(handler=cmd_selftest)
 
+    setup = sub.add_parser(
+        "setup", help="interactive wizard — asks for everything, checks it, writes .env"
+    )
+    setup.add_argument("--env", default=".env", help="path to write (default: .env)")
+    setup.add_argument(
+        "--no-verify", action="store_true",
+        help="do not check the answers against the real services (offline, or before consent is granted)",
+    )
+    setup.add_argument("--yes", action="store_true", help="take the default for every yes/no question")
+    setup.set_defaults(handler=cmd_setup)
+
     return parser
 
 
@@ -173,6 +184,14 @@ def _service(args: argparse.Namespace) -> tuple[Config, Ledger, Any]:
 
 
 # --------------------------------------------------------------------------- commands
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """The wizard writes .env, so it must NOT go through _config() first — that would
+    refuse to start for exactly the settings the wizard exists to collect."""
+    from .setup_wizard import run_setup
+
+    return run_setup(env_path=args.env, verify=not args.no_verify, assume_yes=args.yes)
 
 
 def cmd_once(args: argparse.Namespace) -> int:

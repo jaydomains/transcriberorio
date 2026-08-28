@@ -106,9 +106,9 @@ _SPEC: tuple[_Var, ...] = (
     _Var("azure_region", "AZURE_SPEECH_REGION", "str", "", "Azure Speech region, required when TRANSCRIBE_ENGINE=azure"),
     # --- the analysis pass -----------------------------------------------------------
     _Var("analysis_api_key", "ANALYSIS_API_KEY", "str", _REQUIRED, "API key for the analysis models (defaults to OPENAI_API_KEY when that is set)"),
-    _Var("analysis_base_url", "ANALYSIS_BASE_URL", "str", "https://api.openai.com/v1", "analysis API base url"),
-    _Var("analysis_model_cheap", "ANALYSIS_MODEL_CHEAP", "str", "gpt-4o-mini", "the router model — classifies every recording, so nothing is skipped on a guess"),
-    _Var("analysis_model_strong", "ANALYSIS_MODEL_STRONG", "str", "gpt-4o", "the model that runs on substantive recordings"),
+    _Var("analysis_base_url", "ANALYSIS_BASE_URL", "str", "https://api.anthropic.com", "analysis API base url"),
+    _Var("analysis_model_cheap", "ANALYSIS_MODEL_CHEAP", "str", "", "the router model — classifies every recording, so nothing is skipped on a guess"),
+    _Var("analysis_model_strong", "ANALYSIS_MODEL_STRONG", "str", "", "the model that runs on substantive recordings"),
     _Var("engine_key_expires_on", "ENGINE_KEY_EXPIRES_ON", "str", "", "ISO date the transcription engine key expires, if it has one (optional)"),
     _Var("analysis_key_expires_on", "ANALYSIS_KEY_EXPIRES_ON", "str", "", "ISO date the analysis API key expires, if it has one (optional)"),
     # --- digest email ----------------------------------------------------------------
@@ -169,9 +169,9 @@ class Config:
     azure_region: str = ""
     # analysis
     analysis_api_key: str = ""
-    analysis_base_url: str = "https://api.openai.com/v1"
-    analysis_model_cheap: str = "gpt-4o-mini"
-    analysis_model_strong: str = "gpt-4o"
+    analysis_base_url: str = "https://api.anthropic.com"
+    analysis_model_cheap: str = ""
+    analysis_model_strong: str = ""
     engine_key_expires_on: str = ""
     analysis_key_expires_on: str = ""
     # digest
