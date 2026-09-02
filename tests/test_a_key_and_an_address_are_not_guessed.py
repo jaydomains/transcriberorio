@@ -129,3 +129,20 @@ class ThePreAuthenticatedUrlDoesNotComeBackOutInAnError(unittest.TestCase):
 
     def test_and_the_clients_own_secret_is_always_hidden(self) -> None:
         self.assertNotIn("azure-key-abcdef", self.client.scrub("key azure-key-abcdef here"))
+
+    def test_a_failed_job_cannot_carry_the_link_out_in_its_error_document(self) -> None:
+        """The likeliest reason a batch job fails is that Azure could not read the link.
+
+        In which case its error document says so by quoting it. That message is built in
+        the engine rather than by the HTTP layer, so the surrounding block does not reach
+        it on its own — it has to be routed through the scrubber by hand.
+        """
+        import json as _json
+
+        azure_said = {"code": "InvalidUri", "message": f"could not fetch {self.URL}"}
+        with self.client.hiding(self.URL):
+            said = self.client.scrub(
+                "azure batch transcription failed: " + _json.dumps(azure_said)[:400]
+            )
+        self.assertNotIn("tempauth", said)
+        self.assertIn("InvalidUri", said, "the reason it failed must survive")

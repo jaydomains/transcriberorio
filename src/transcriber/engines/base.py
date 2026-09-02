@@ -43,7 +43,7 @@ import uuid
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException
-from typing import Any, BinaryIO, Callable, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 
 from ..models import Hints, Segment, Transcript, strip_emails
 from ..ratelimit import RateLimiter, configure_shared, shared_limiter

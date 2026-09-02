@@ -254,9 +254,18 @@ class AzureSpeechEngine:
                 return last
             if last == "Failed":
                 error = doc.get("properties", {}).get("error") if isinstance(doc, dict) else None
+                # Through the client's scrubber, not straight out. This is the vendor's own
+                # error document dumped whole, and the most likely reason a batch job fails
+                # is that Azure could not read the content URL — in which case the document
+                # says so BY QUOTING IT. That would carry the pre-authenticated link to the
+                # recording into last_error, the ledger and the morning email, on the one
+                # path the surrounding `hiding()` block cannot reach on its own, because
+                # this message is built here rather than by the HTTP layer.
                 raise EngineError(
-                    "azure batch transcription failed: "
-                    + json.dumps(error or doc.get("error") or {"status": last})[:400]
+                    self.client.scrub(
+                        "azure batch transcription failed: "
+                        + json.dumps(error or doc.get("error") or {"status": last})[:400]
+                    )
                 )
             if last not in ("NotStarted", "Running"):
                 raise EngineResponseError(
@@ -285,8 +294,11 @@ class AzureSpeechEngine:
             if not content_url:
                 continue
             # The result URL is pre-authenticated; sending the subscription key as well is
-            # two credentials on one request, which Azure storage rejects.
-            payload = self.client.get(content_url, expected=(200,))
+            # two credentials on one request, which Azure storage rejects. Hidden for the
+            # same reason the audio's URL is: it is a link to the transcript that needs no
+            # credential, so it must not come back out in an error message.
+            with self.client.hiding(str(content_url)):
+                payload = self.client.get(content_url, expected=(200,))
             result = payload.json()
             if isinstance(result, dict):
                 return result
