@@ -799,11 +799,29 @@ class Ledger:
             )
             self._event(conn, item_id, "quarantined", now, current["state"], State.QUARANTINED, clean)
 
-    def requeue(self, item_id: str, reason: str, state: str = State.DISCOVERED) -> None:
+    def requeue(
+        self,
+        item_id: str,
+        reason: str,
+        state: str = State.DISCOVERED,
+        *,
+        reset_attempts: bool = False,
+    ) -> None:
         """Deliberately put a row back in the queue — after a person fixed what was wrong.
 
         Separate from advance() because moving work backwards should be something somebody
         chose, with a reason recorded, rather than something a caller did by accident.
+
+        ``reset_attempts`` is for the manual path and is what makes it mean anything. A
+        recording quarantined after three engine failures still carries ``attempts=3``, so
+        putting it back in the queue with the count intact bought it nothing: the first
+        transient failure took it straight past ``max_attempts`` again, and if the worker
+        did not reach it first the nightly sweep re-quarantined it on the count alone —
+        naming, as the reason, the errors from before the person fixed the cause. Either
+        way the requeue was undone within hours and the recording had never actually been
+        retried once. ``cmd_requeue`` passes it; the sweep's own automatic requeue does not,
+        so ``max_attempts`` still bounds the machine. Nothing is destroyed either way —
+        every attempt that ever happened is still in the ``events`` table.
         """
         if not State.is_known(state):
             raise LedgerStateError(f"{state!r} is not a state")
@@ -824,11 +842,19 @@ class Ledger:
             meta = _decode_meta(current["meta"])
             for key in ("retry_at", "retry_reason", "gate_first_seen"):
                 meta.pop(key, None)
-            conn.execute(
-                "UPDATE items SET state=?, claimed_by=NULL, lease_until=NULL, updated_at=?,"
-                " meta=? WHERE item_id=?",
-                (state, now, json.dumps(meta, sort_keys=True), item_id),
-            )
+            if reset_attempts:
+                conn.execute(
+                    "UPDATE items SET state=?, claimed_by=NULL, lease_until=NULL,"
+                    " updated_at=?, meta=?, attempts=0, quarantine_reason=NULL,"
+                    " quarantined_at=NULL, last_error=NULL WHERE item_id=?",
+                    (state, now, json.dumps(meta, sort_keys=True), item_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE items SET state=?, claimed_by=NULL, lease_until=NULL,"
+                    " updated_at=?, meta=? WHERE item_id=?",
+                    (state, now, json.dumps(meta, sort_keys=True), item_id),
+                )
             self._event(conn, item_id, "requeued", now, current["state"], state, clean)
 
     def reassign_route(self, item_id: str, route: str, reason: str) -> None:

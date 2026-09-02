@@ -2319,25 +2319,71 @@ def send(
                   _own_queue_subject(digest, who))
         )
 
+    scrub = getattr(config, "scrub", None)
+
+    def _said(exc: Exception) -> str:
+        detail = f"{type(exc).__name__}: {exc}"
+        return scrub(detail) if callable(scrub) else detail
+
+    # One address the relay will not take must not stop the others. It used to: every
+    # message went inside one try, so a mailbox deleted when somebody left aborted the loop
+    # at that address. Everyone earlier in the list had already received the email, everyone
+    # later got nothing, and the whole send reported ok=False — which leaves DIGEST_DAY_MARK
+    # unwritten, so `should_run` fires again fifteen minutes later and sends the same email
+    # to the same people. Roughly seventy-two copies before midnight, every day, while the
+    # log and the monitor both said it could not be sent. That is the mail loop RETRY_AFTER_S
+    # was written to prevent, arriving as delivered mail rather than as retries.
+    #
+    # With the gate armed it also silently skipped every reviewer sorted after the bad
+    # address, so people never got the link to passages waiting on them, and nothing recorded
+    # who was missed.
+    refused: list[str] = []
+    delivered_recipients = 0
+    delivered_reviewers = 0
     try:
         with _connect(config, host, port, smtp_factory) as server:
-            for message in outgoing:
-                server.send_message(message)
-    except Exception as exc:  # noqa: BLE001 - every send failure is reported, none is raised
-        detail = f"{type(exc).__name__}: {exc}"
-        scrub = getattr(config, "scrub", None)
-        if callable(scrub):
-            detail = scrub(detail)
+            for index, message in enumerate(outgoing):
+                try:
+                    server.send_message(message)
+                except Exception as exc:  # noqa: BLE001 - one address, not the whole morning
+                    refused.append(f"{message['To']} ({_said(exc)})")
+                    continue
+                if index < len(recipients):
+                    delivered_recipients += 1
+                else:
+                    delivered_reviewers += 1
+    except Exception as exc:  # noqa: BLE001 - the connection itself; nothing went out
+        detail = _said(exc)
         # ERROR, not WARNING: an unsendable digest is the failure mode this service exists
         # to remove, and it must be loud even though nothing raises.
         log.error("the morning digest could NOT be sent via %s:%s — %s", host, port, detail)
         return SendResult(ok=False, detail=detail, recipients=len(recipients), host=host)
 
+    if refused:
+        # Loud, and named — but NOT a failed send, because the people who were reachable have
+        # the email in their hands and must not be sent it again every quarter of an hour.
+        log.error(
+            "the morning digest was refused for %d address(es) via %s:%s — %s",
+            len(refused), host, port, "; ".join(refused),
+        )
+    if not delivered_recipients and not delivered_reviewers:
+        # Nobody at all got it. That is a failed morning however the relay phrased it.
+        return SendResult(
+            ok=False, detail="; ".join(refused) or "no message was accepted",
+            recipients=len(recipients), host=host,
+        )
+
     log.info(
         "morning digest sent to %d recipient(s) and %d reviewer(s) via %s:%s — %s",
-        len(recipients), len(others), host, port, digest.subject,
+        delivered_recipients, delivered_reviewers, host, port, digest.subject,
     )
-    return SendResult(ok=True, recipients=len(recipients), host=host, reviewers=len(others))
+    return SendResult(
+        ok=True,
+        detail="; ".join(refused),
+        recipients=delivered_recipients,
+        host=host,
+        reviewers=delivered_reviewers,
+    )
 
 
 def _own_queue_subject(digest: Digest, who: str) -> str:

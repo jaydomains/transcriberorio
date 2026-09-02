@@ -1198,7 +1198,9 @@ def cmd_requeue(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             return EXIT_FAILED
         was = row.state
-        ledger.requeue(args.item_id, args.reason)
+        # A person fixing the cause is what makes the previous attempts irrelevant, so
+        # they are cleared here and nowhere else. The sweep's own requeue keeps them.
+        ledger.requeue(args.item_id, args.reason, reset_attempts=True)
         print(f"{row.name or args.item_id}: {was} -> {State.DISCOVERED}; it will be picked up "
               f"on the next poll")
         return EXIT_OK
