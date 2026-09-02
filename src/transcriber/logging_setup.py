@@ -30,7 +30,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterable, Iterator, Mapping, TextIO
 
-from .models import EMAIL_RE, EMAIL_PLACEHOLDER
+from .models import (
+    EMAIL_RE,
+    EMAIL_PLACEHOLDER,
+    strip_dictated_emails,
+    strip_owner_paths,
+)
 
 __all__ = [
     "configure",
@@ -110,8 +115,14 @@ class SecretScrubber:
         for value in self._values:
             if value in text:
                 text = text.replace(value, REDACTED)
-        # The house rule, applied to our own diagnostics as well as to our outputs.
-        return EMAIL_RE.sub(EMAIL_PLACEHOLDER, text)
+        # The house rule, applied to our own diagnostics as well as to our outputs — and all
+        # three parts of it, not just the one. An address is stripped from the ledger, the
+        # morning email and every rendered file by these same three filters; the log was
+        # getting only the first, so the OneDrive `/personal/<upn>/` encoding of the drive
+        # owner's own address — which OWNER_PATH_RE exists for precisely because no address
+        # check can see it — went to stdout and into the journal on every line carrying a
+        # webUrl. A dictated address ("carel at example dot co dot za") did too.
+        return strip_owner_paths(strip_dictated_emails(EMAIL_RE.sub(EMAIL_PLACEHOLDER, text)))
 
 
 #: The one scrubber every handler this module installs shares.
