@@ -892,11 +892,16 @@ class Ledger:
         For the person at a terminal who has a filename and not a OneDrive item id. The
         morning email prints both, a few lines apart, and nobody retypes an id by hand.
         """
-        pattern = f"%{(needle or '').strip()}%"
+        # Every LIKE metacharacter in the needle is escaped before the wildcards that make
+        # this a "contains" search are put around it — backslash first, or it would escape
+        # the escapes added after it. Searching for "100%" used to match every recording,
+        # because the % in the filename was read as "anything at all".
+        raw = (needle or "").strip()
+        escaped = raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         records = self._conn().execute(
             "SELECT * FROM items WHERE name LIKE ? ESCAPE '\\' "
             "ORDER BY COALESCE(discovered_at, '') DESC LIMIT ?",
-            (pattern.replace("_", "\\_"), int(limit)),
+            (f"%{escaped}%", int(limit)),
         ).fetchall()
         return [Row.from_db(r) for r in records]
 

@@ -213,6 +213,45 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class LookingUpARecordingByNameIsExact(unittest.TestCase):
+    """`status --item` takes a filename, and a filename can contain LIKE's own characters.
+
+    The lookup wraps the needle in wildcards to make it a "contains" search. The needle's
+    own `%` and `_` were left as wildcards too, so searching for "100%" matched every
+    recording in the ledger, and the caller then asked which of them was meant.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.mkdtemp()
+        self.ledger = Ledger(os.path.join(tmp, "ledger.sqlite"))
+        self.ledger.migrate()
+        self.addCleanup(self.ledger.close)
+        for n, name in enumerate((
+            "100% SNAG LIST.m4a", "BEACH COURT WALK.m4a", "ANYTHING AT ALL.m4a", "A_B NOTE.m4a",
+        )):
+            self.ledger.upsert_discovered(
+                DriveItem(item_id=f"0{n}", name=name, size=10,
+                          created_at="2026-08-26T09:00:00Z", modified_at="2026-08-26T09:00:00Z"),
+                route="james",
+            )
+
+    def _names(self, needle: str) -> list[str]:
+        return [r.name for r in self.ledger.find_by_name(needle)]
+
+    def test_a_percent_in_the_name_is_not_a_wildcard(self) -> None:
+        self.assertEqual(self._names("%"), ["100% SNAG LIST.m4a"])
+
+    def test_an_underscore_is_not_a_single_character_wildcard(self) -> None:
+        self.assertEqual(self._names("A_B"), ["A_B NOTE.m4a"])
+        self.assertEqual(self._names("AXB"), [])
+
+    def test_a_lone_backslash_does_not_eat_the_escape(self) -> None:
+        self.assertEqual(self._names("\\"), [])
+
+    def test_and_an_ordinary_fragment_still_finds_its_recording(self) -> None:
+        self.assertEqual(self._names("BEACH"), ["BEACH COURT WALK.m4a"])
+
+
 class WhatTheRecordIsToldAboutWhyItWasRead(unittest.TestCase):
     """The sentence in the actions file, which goes into the record and stays there.
 

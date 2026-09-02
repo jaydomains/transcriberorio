@@ -905,8 +905,10 @@ class GraphClient:
                             exc.code, _parse_retry_after(hdrs.get("retry-after")), max(1, attempt)
                         )
                         log.warning(
-                            "download %s -> HTTP %d; retrying in %.1fs (attempt %d/%d)",
-                            item_id, exc.code, delay, total_attempts, self.retry.max_attempts,
+                            "download %s -> HTTP %d; retrying in %.1fs "
+                            "(%d in a row of %d allowed, %d interruptions so far)",
+                            item_id, exc.code, delay,
+                            max(1, attempt), self.retry.max_attempts, total_attempts,
                         )
                         self._sleep(delay)
                         if stale_url:
@@ -926,8 +928,9 @@ class GraphClient:
                         delay = self.retry.backoff(max(1, attempt), self._rng)
                         log.warning(
                             "download %s interrupted at %d bytes (%r); resuming in %.1fs "
-                            "(attempt %d/%d)",
-                            item_id, written, exc, delay, total_attempts, self.retry.max_attempts,
+                            "(%d in a row of %d allowed, %d interruptions so far)",
+                            item_id, written, exc, delay,
+                            max(1, attempt), self.retry.max_attempts, total_attempts,
                         )
                         resumed = True
                         self._sleep(delay)
