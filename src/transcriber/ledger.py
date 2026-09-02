@@ -886,6 +886,20 @@ class Ledger:
         record = self._conn().execute("SELECT * FROM items WHERE item_id=?", (item_id,)).fetchone()
         return None if record is None else Row.from_db(record)
 
+    def find_by_name(self, needle: str, limit: int = 20) -> list[Row]:
+        """Recordings whose filename contains ``needle``, newest first.
+
+        For the person at a terminal who has a filename and not a OneDrive item id. The
+        morning email prints both, a few lines apart, and nobody retypes an id by hand.
+        """
+        pattern = f"%{(needle or '').strip()}%"
+        records = self._conn().execute(
+            "SELECT * FROM items WHERE name LIKE ? ESCAPE '\\' "
+            "ORDER BY COALESCE(discovered_at, '') DESC LIMIT ?",
+            (pattern.replace("_", "\\_"), int(limit)),
+        ).fetchall()
+        return [Row.from_db(r) for r in records]
+
     def unfinished(self, route: str | None = None) -> list[Row]:
         """Everything not in a terminal state, oldest first — what the sweep re-queues.
 

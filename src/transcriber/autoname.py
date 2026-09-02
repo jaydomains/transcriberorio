@@ -110,12 +110,18 @@ _MAX_NAME = 66
 #: real name of forty-nine.
 _STAMP_ROOM = len(" 060826 1622")
 
-#: How early the first mention must fall, and how far apart the first and last must be, as
-#: fractions of the transcript. Together they say "this recording is ABOUT this site"
-#: rather than "this site came up". A phone call taken during a walk is local: it is a
-#: cluster somewhere in the middle, and it fails the spread.
-_FIRST_WITHIN = 0.25
-_MIN_SPREAD = 0.40
+# There were two constants here, _FIRST_WITHIN and _MIN_SPREAD, holding the earliness and
+# spread thresholds of an earlier rule: a site had to be named early and its mentions had to
+# be far apart before it could be believed. That rule is gone — it rejected his clearest
+# recordings, the ones where he states the site once on purpose in the first sentence and
+# never says it again (see :mod:`transcriber.declaration`) — and was replaced by the
+# declared-or-majority pair. The constants outlived it and were referenced nowhere, but
+# their comment still described a phone call "failing the spread", so the file promised a
+# protection the code had stopped providing. What actually keeps a passing phone call from
+# naming a recording now: it cannot be *declared*, because a call taken at minute twelve is
+# nowhere near the opening window; and it rarely wins the *majority*, because that counts
+# whole-word mentions across the body. Those are the two conditions, and they are in
+# :func:`decide` where they can be read.
 
 #: The fewest mentions that can propose a name.
 _MIN_MENTIONS = 2

@@ -636,7 +636,18 @@ class Redaction:
                 for start, end in reversed(found):
                     out = out[:start] + applied.marker + out[end:]
                 touched.append(applied.ref)
-                continue
+                # Deliberately NOT `continue`. Finding the passage whole says nothing about
+                # whether a piece of it is also somewhere else, and a speaker repeating
+                # themselves is the ordinary case: "Sipho got his second written warning on
+                # Friday" ... "Sorry, say again?" ... "I said he got his second written
+                # warning on Friday". Cutting the whole one and stopping left seven
+                # consecutive held words in the file. The backstop then found them and
+                # refused the publish, and HeldTextWouldLeak is in pipeline._NEVER_RETRY —
+                # so the recording quarantined permanently, with no transcript, no summary
+                # and nothing in the record, and a retry reached the same answer because
+                # the masker skipped the repeat again. Falling through costs one more pass
+                # over a string; the module's own "cutting twice does not corrupt" property
+                # holds because _marker_ranges protects what has already been replaced.
             cut, did = _cut_runs(
                 out, words, applied.marker, part_marker=part, min_run=min_run, edges_only=True,
             )

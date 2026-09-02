@@ -93,6 +93,7 @@ __all__ = [
     "HeldReport",
     "held_report",
     "held_store_for",
+    "HeldStoreUnavailable",
     "HELD_AGE_LINE",
     "HELD_AGE_NAMED",
     "HELD_AGE_SUBJECT",
@@ -575,6 +576,15 @@ HELD_AGE_SUBJECT = 7     # it reaches the subject line of the email
 # a property of the code rather than a promise about it.
 
 
+class HeldStoreUnavailable(Exception):
+    """The held-passage store exists but could not be opened.
+
+    Distinct from "there is no store", which is an ordinary and honest state on a service
+    that has never held anything. This one means the queue is unreadable, and the morning
+    email must say so rather than print a zero.
+    """
+
+
 def held_store_for(config: Any) -> WithheldStore | None:
     """Open the store of held passages, or ``None`` when this deployment has never used one.
 
@@ -595,7 +605,14 @@ def held_store_for(config: Any) -> WithheldStore | None:
         return WithheldStore(path, scrub=getattr(config, "scrub", None))
     except Exception as exc:  # noqa: BLE001 - the morning email goes out regardless
         log.warning("the held-passage store could not be opened: %s", exc)
-        return None
+        # The caller has to be able to tell this apart from "there is no store because
+        # nothing was ever held". Both used to arrive as None, so a store that could not be
+        # opened — a corrupt file, a permission that changed, a disk fault — rendered in the
+        # morning email as "nothing has been held", which is the one sentence this design
+        # exists to prevent anybody reading when it is not true. The words are still safe
+        # (nothing was read), but the queue's existence stopped being reported, and Jay does
+        # not read the log this warning goes to.
+        raise HeldStoreUnavailable(f"{type(exc).__name__}: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -1032,7 +1049,10 @@ def held_report(
     mode = normalise_mode(getattr(config, "gate_mode", MODE_SHADOW))
     owner = (principal or _principal_of(config)).strip()
     url = str(getattr(config, "gate_review_base_url", "") or "").strip()
-    held = store if store is not None else held_store_for(config)
+    try:
+        held = store if store is not None else held_store_for(config)
+    except HeldStoreUnavailable as exc:
+        return HeldReport(mode=mode, review_url=url, unavailable=str(exc))
     if held is None:
         return HeldReport(mode=mode, review_url=url)
 

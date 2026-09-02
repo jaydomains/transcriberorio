@@ -405,7 +405,16 @@ def _snap(text: str, start: int, end: int) -> tuple[int, int]:
 # ------------------------------------------------------------------------------ sentences
 
 
-_SENTENCE_END = re.compile(r"[.!?…]+[\s\"'’)\]]*|\n+")
+#: A full stop between two digits is a decimal point, not the end of a sentence. This is
+#: the difference between holding a passage and publishing half of it: the gate holds whole
+#: sentences, and "Don't minute this: the settlement is R1.5 million and we accept fault."
+#: split at the decimal leaves "5 million and we accept fault." outside the held span and in
+#: the record — the amount and an admission of fault, past a gate that reported success. He
+#: talks in rands all day and R1.5m is how he says it, so this is the common case rather
+#: than the exotic one. Runs of stops still end a sentence ("wait...") and so does a stop
+#: that merely touches a digit on ONE side ("the slab is 3." then a new sentence) —
+#: it takes a digit on both sides to be a decimal point.
+_SENTENCE_END = re.compile(r"(?:(?<!\d)\.|\.(?!\d)|[!?…])[.!?…]*[\s\"'’)\]]*|\n+")
 
 
 def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:

@@ -417,6 +417,15 @@ class WhenTheRouteHasGoneAway(unittest.TestCase):
 # ------------------------------------------------------------------ the morning email
 
 
+def _epoch(stamp: str) -> float:
+    """A fixture stamp as a POSIX timestamp, for the digest's ``now``."""
+    return (
+        _dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+        .replace(tzinfo=_dt.timezone.utc)
+        .timestamp()
+    )
+
+
 def _held_at(days_ago: int, now: str = "2026-08-28T06:00:00Z") -> str:
     when = _dt.datetime.strptime(now, "%Y-%m-%dT%H:%M:%SZ") - _dt.timedelta(days=days_ago)
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -658,7 +667,15 @@ class TheWholeEmail(unittest.TestCase):
         self.addCleanup(queue.close)
         if days_ago is not None:
             queue.add(days_ago=days_ago)
-        return queue, digest_module.build(queue.config, queue.ledger, day="2026-08-27")
+        # The clock is passed in, not taken from the machine. The held ages in this fixture
+        # are written relative to _Queue.NOW, and the digest computes "oldest N days"
+        # against whatever now it is given — so leaving it to the real clock pinned one side
+        # of that subtraction and let the other drift. It passed on the day it was written
+        # and started failing five days later with nothing changed, which is the sort of red
+        # build that trains people to stop reading red builds.
+        return queue, digest_module.build(
+            queue.config, queue.ledger, day="2026-08-27", now=_epoch(_Queue.NOW)
+        )
 
     def test_the_held_queue_is_in_the_body(self) -> None:
         _queue, built = self._build(2)

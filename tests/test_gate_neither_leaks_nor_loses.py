@@ -1274,8 +1274,13 @@ class NothingReleasesItself(_GateCase):
         self.estate = _Estate()
         self.addCleanup(self.estate.close)
         self.store = self.estate.store
-        self.thirty_days_ago = "2026-07-29T09:00:00Z"
-        self.now = "2026-08-28T09:00:00Z"
+        # Thirty days back from the real clock, not from a fixed date. The page is rendered
+        # by review_page with no now to pass it, so it ages the hold against the machine's
+        # clock — and a fixed fixture date meant "waiting 30 days" quietly became "waiting
+        # 35 days" as the calendar moved, failing on a day nobody had touched the code.
+        _now = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0)
+        self.thirty_days_ago = (_now - _dt.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.now = _now.strftime("%Y-%m-%dT%H:%M:%SZ")
         with self.store._tx() as tx:  # the only way to age a row without inventing a setter
             tx.execute("UPDATE holds SET held_at=?", (self.thirty_days_ago,))
 

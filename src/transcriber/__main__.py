@@ -222,6 +222,10 @@ def _parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="what is known, done, failed, and when it last worked")
     status.add_argument("--json", dest="as_json", action="store_true")
     status.add_argument("--day", default=None, help="the day to count (YYYY-MM-DD, default today)")
+    status.add_argument(
+        "--item", default=None, metavar="ID",
+        help="one recording: its state, its reasons and everything that has happened to it",
+    )
     _add_route_option(status)
     status.set_defaults(handler=cmd_status)
 
@@ -1200,6 +1204,71 @@ def cmd_requeue(args: argparse.Namespace) -> int:
         return EXIT_OK
 
 
+def _status_one_item(ledger: Ledger, needle: str) -> int:
+    """One recording, end to end: where it is now and everything that happened to it.
+
+    The morning email has been telling him to run ``transcriber status --item <id>`` since
+    the day it was written, and until now that printed ``unrecognized arguments: --item``.
+    The email is the one surface he reads, and the remedy it names has to work — an
+    instruction that errors is worse than no instruction, because it costs him the trust he
+    needs to act on the next one.
+
+    Accepts the item id the email prints, or a filename, because the same email lists these
+    recordings by name a few lines above and nobody transcribes a OneDrive id by hand.
+    """
+    row = ledger.get(needle)
+    if row is None:
+        matches = ledger.find_by_name(needle)
+        if len(matches) > 1:
+            print(f"{len(matches)} recordings match {needle!r}. Name one of them exactly, or "
+                  f"use its id:", file=sys.stderr)
+            for candidate in matches[:10]:
+                print(f"  {candidate.item_id}  {candidate.name}", file=sys.stderr)
+            return EXIT_FAILED
+        if not matches:
+            print(f"no recording here is called {needle!r} and none has that id. It may be on "
+                  f"another route, or older than this ledger.", file=sys.stderr)
+            return EXIT_FAILED
+        row = matches[0]
+
+    print(f"{row.name or '(no name of its own)'}")
+    print(f"  id           {row.item_id}")
+    print(f"  route        {row.route}")
+    print(f"  state        {row.state}")
+    if row.created_at:
+        print(f"  recorded     {row.created_at}")
+    if row.discovered_at:
+        print(f"  first seen   {row.discovered_at}")
+    if row.updated_at:
+        print(f"  last change  {row.updated_at}")
+    if row.duration_s:
+        print(f"  length       {int(row.duration_s // 60)}m {int(row.duration_s % 60)}s")
+    if row.size:
+        print(f"  size         {row.size:,} bytes")
+    if row.attempts:
+        print(f"  attempts     {row.attempts}")
+    if row.last_error:
+        print(f"  last reason  {row.last_error}")
+
+    events = ledger.history(row.item_id)
+    if not events:
+        print("\n  nothing has happened to it yet beyond being discovered.")
+        return EXIT_OK
+    print(f"\n  what has happened to it ({len(events)}):")
+    for event in events:
+        moved = ""
+        if event.get("to_state"):
+            moved = f" {event.get('from_state') or '-'} -> {event['to_state']}"
+        detail = str(event.get("detail") or "").strip()
+        # One line each. The detail is already scrubbed by the ledger on the way out; it is
+        # printed to a terminal a person asked for it on, never into a file or an email.
+        if len(detail) > 300:
+            detail = detail[:300] + "..."
+        print(f"    {event.get('at','')}  {event.get('kind','')}{moved}"
+              + (f"  {detail}" if detail else ""))
+    return EXIT_OK
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """Counts, failures with their reasons, and when this last worked — per route.
 
@@ -1231,6 +1300,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     day = args.day or datetime.date.today().isoformat()
     with Ledger(ledger_path, scrub=getattr(config, "scrub", None)) as ledger:
+        if args.item:
+            return _status_one_item(ledger, str(args.item))
         stats = ledger.stats()
         # The work in hand, before anything else is printed: a person running `status` after
         # a busy morning is asking "where are the other forty?", and the answer is a queue

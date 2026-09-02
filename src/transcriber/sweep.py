@@ -603,7 +603,9 @@ def sweep(
     """Re-enumerate every enabled route from zero, reconcile each with the ledger, report.
 
     ``route`` narrows the run to one route by name; omitted, every enabled route is swept,
-    each with its own zero-cursor pass and its own mark.
+    each with its own zero-cursor pass. There is ONE mark for the whole night, and only a
+    run over every route writes it — a narrowed run is somebody checking on one person, and
+    it must not take the night's sweep away from the other seven.
 
     ``stale_after_s`` is how long an unfinished row may sit untouched before the sweep
     concludes the live path has dropped it. It defaults to four lease periods, so a worker
@@ -679,7 +681,14 @@ def sweep(
     if route is None:
         _report_unswept_routes(ledger, run, config=config, swept={r.route for r in run.reports})
 
-    if not dry_run and run.ok:
+    if route is None and not dry_run and run.ok:
+        # Only a sweep of EVERY route may mark the night done. The mark is what
+        # should_run() reads, and it silences the sweep for the rest of the local day —
+        # so a one-route run marking it meant that `transcriber sweep --route dan` at nine
+        # in the morning cancelled that night's sweep for the other seven people, without
+        # saying so. The sweep is the backstop that makes "cannot miss a recording" true
+        # rather than "unlikely to", and it was being switched off by the command someone
+        # runs to check on one person.
         mark_run(config, ledger, now=clock)
 
     run.finished_at = utc_now_iso()
