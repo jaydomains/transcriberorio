@@ -182,3 +182,48 @@ class TheRemedyTheEmailNamesActuallyRuns(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WhatTheRecordIsToldAboutWhyItWasRead(unittest.TestCase):
+    """The sentence in the actions file, which goes into the record and stays there.
+
+    A router outage escalates to a full read — the right behaviour, since a router that
+    cannot be reached must never mean a recording is skipped. But the sentence explaining it
+    asserted a judgement no model had made, and with nothing to list it broke mid-clause.
+    """
+
+    def _routing(self, **kw):
+        from transcriber.extract import Routing
+
+        base = dict(label="substantive", forced=True, triggers=(), escalated=True,
+                    model="cheap", notes=())
+        base.update(kw)
+        return Routing(**base)
+
+    def test_an_outage_is_not_reported_as_a_judgement(self) -> None:
+        said = self._routing(model_label="unavailable", model_reason="503 from the provider").why()
+        self.assertIn("could not be reached", said)
+        self.assertNotIn(
+            "called this trivial", said,
+            "the record was told the model judged this recording, when it was unreachable",
+        )
+
+    def test_and_no_sentence_breaks_off_mid_clause(self) -> None:
+        for label in ("unavailable", "trivial"):
+            with self.subTest(model_label=label):
+                said = self._routing(model_label=label).why()
+                self.assertNotIn(
+                    "because it ,", said,
+                    "an empty reason list left a half-written sentence in the record",
+                )
+                self.assertTrue(said.endswith(("full", "anyway", "skipped")), said)
+
+    def test_a_real_override_still_says_what_it_saw(self) -> None:
+        from transcriber.extract import SafetyTrigger
+
+        said = self._routing(
+            model_label="trivial",
+            triggers=(SafetyTrigger("money", "R40k", "names an amount"),),
+        ).why()
+        self.assertIn("the safety check disagreed", said)
+        self.assertIn("names an amount", said)
