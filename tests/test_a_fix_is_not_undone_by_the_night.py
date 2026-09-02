@@ -146,6 +146,44 @@ class OneDeadMailboxDoesNotStopTheMorningEmail(unittest.TestCase):
         result = self._send()
         self.assertIn("office@kbc.example", result.detail)
 
+    def test_a_temporary_refusal_says_so(self) -> None:
+        """Greylisting is "not now"; a deleted mailbox is "not ever". Different jobs."""
+        import smtplib
+
+        class _Greylisting(_Relay):
+            def send_message(self, message, *a: object, **k: object) -> None:
+                to = str(message["To"])
+                if to == type(self).refused_address:
+                    raise smtplib.SMTPRecipientsRefused({to: (451, b"4.7.1 greylisted")})
+                type(self).sent.append(to)
+
+        _Greylisting.sent = []
+        _Greylisting.refused_address = "office@kbc.example"
+        from transcriber import digest as digest_module
+
+        built = digest_module.build(self.config, self.ledger, day="2026-08-27")
+        result = digest_module.send(self.config, built, smtp_factory=_Greylisting)
+        self.assertIn("temporarily", result.detail)
+        self.assertTrue(result.ok, "the reachable people still have it and must not be re-sent")
+
+    def test_a_permanent_refusal_says_that_instead(self) -> None:
+        import smtplib
+
+        class _Gone(_Relay):
+            def send_message(self, message, *a: object, **k: object) -> None:
+                to = str(message["To"])
+                if to == type(self).refused_address:
+                    raise smtplib.SMTPRecipientsRefused({to: (550, b"5.1.1 unknown")})
+                type(self).sent.append(to)
+
+        _Gone.sent = []
+        _Gone.refused_address = "office@kbc.example"
+        from transcriber import digest as digest_module
+
+        built = digest_module.build(self.config, self.ledger, day="2026-08-27")
+        result = digest_module.send(self.config, built, smtp_factory=_Gone)
+        self.assertIn("permanently", result.detail)
+
     def test_and_a_relay_that_takes_nothing_is_still_a_failed_morning(self) -> None:
         _Relay.refused_address = "jay@kbc.example"
         self.config.smtp_to = ["jay@kbc.example"]

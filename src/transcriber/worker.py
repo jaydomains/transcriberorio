@@ -60,6 +60,7 @@ not quarantine the backlog on the way down.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import signal
 import socket
@@ -440,6 +441,15 @@ def interleave_routes(
     return taken
 
 
+def _folder_fingerprint(folder_id: str | None) -> str:
+    """A short, stable, filter-proof stand-in for a watched folder's id.
+
+    Only ever compared with itself, so what it is does not matter — only that storing and
+    reading it back cannot change it. See the caller for why that is not a given.
+    """
+    return hashlib.sha256(str(folder_id or "").encode("utf-8")).hexdigest()[:16]
+
+
 class Worker:
     """Poll, process, schedule. One per process."""
 
@@ -753,7 +763,15 @@ class Worker:
         """
         mark = f"watched:{route.name}"
         seen = self.ledger.cursor_get(mark)
-        current = str(route.source_folder_id or "")
+        # A fingerprint rather than the id itself. `cursor_set` stores through the ledger's
+        # `_clean`, which runs the secret scrubber and the three address filters — so a
+        # stored id that the filters altered could never equal the raw id read back, the
+        # comparison would fail on every poll, and this would rewind the cursor and
+        # re-enumerate the whole folder every two minutes. Delta polling defeated by the
+        # thing meant to protect it. A hex digest passes through every one of those filters
+        # unchanged, and it also keeps a folder id out of a column that is scrubbed for a
+        # reason.
+        current = _folder_fingerprint(route.source_folder_id)
         if seen == current:
             return
         if seen:
@@ -761,8 +779,8 @@ class Worker:
             # nothing — the same reasoning rewind_cursor is written on.
             self.ledger.rewind_cursor(
                 cursor_name,
-                f"the folder watched by route {route.name} changed from {seen!r} to "
-                f"{current!r}; the stored cursor bookmarks the old folder's changes",
+                f"the folder watched by route {route.name} changed; the stored cursor "
+                f"bookmarks the changes of the folder it no longer watches",
             )
             log.warning(
                 "watched-folder-changed",

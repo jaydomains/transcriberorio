@@ -51,7 +51,40 @@ class WhenTheWatchedFolderChanges(unittest.TestCase):
 
     def test_the_first_poll_simply_remembers_the_folder(self) -> None:
         self._poll("FOLDER-A")
-        self.assertEqual(self.ledger.cursor_get("watched:james"), "FOLDER-A")
+        self.assertTrue(self.ledger.cursor_get("watched:james"))
+
+    def test_what_is_remembered_survives_being_stored(self) -> None:
+        """The mark is written through the ledger's scrubber, like every stored string.
+
+        So it may not be anything the scrubber would alter: a mark that came back changed
+        would never match, the folder would look different on every poll, and the cursor
+        would be rewound every two minutes — delta polling defeated by the check meant to
+        protect it. A hex fingerprint passes through unchanged; a folder id is not
+        guaranteed to.
+        """
+        self._poll("FOLDER-A")
+        stored = self.ledger.cursor_get("watched:james")
+        self.assertEqual(self.ledger._clean(stored), stored)
+
+    def test_and_the_same_folder_looks_the_same_next_time(self) -> None:
+        self._poll("FOLDER-A")
+        first = self.ledger.cursor_get("watched:james")
+        self._poll("FOLDER-A")
+        self.assertEqual(self.ledger.cursor_get("watched:james"), first)
+
+    def test_a_folder_id_the_scrubber_would_alter_still_works(self) -> None:
+        """The case the fingerprint exists for, made concrete."""
+        awkward = "carel@example.co.za"
+        self._poll(awkward)
+        before = self.ledger.cursor_get("watched:james")
+        self._poll(awkward)
+        self.assertEqual(
+            self.ledger.cursor_get("watched:james"), before,
+            "an unchanged folder was seen as changed, so the cursor would be thrown away "
+            "on every single poll",
+        )
+        kinds = [e["kind"] for e in self.ledger.recent_events()]
+        self.assertNotIn("cursor-rewound", kinds)
 
     def test_a_service_already_running_adopts_its_folder_without_rewinding(self) -> None:
         """Nothing was recorded before this existed, so the first sight is not a change."""

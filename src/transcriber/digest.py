@@ -2325,6 +2325,27 @@ def send(
         detail = f"{type(exc).__name__}: {exc}"
         return scrub(detail) if callable(scrub) else detail
 
+    def _temporary(exc: Exception) -> bool:
+        """Whether the relay said "not now" rather than "not ever".
+
+        A 4xx is greylisting or a full mailbox: the address is fine and tomorrow will
+        probably work. A 5xx is a mailbox that is gone. Both are reported; they are worth
+        telling apart because one is somebody's job to fix and the other is the mail system
+        doing what it does.
+        """
+        codes: list[int] = []
+        recipients = getattr(exc, "recipients", None)
+        if isinstance(recipients, dict):
+            for answer in recipients.values():
+                try:
+                    codes.append(int(answer[0]))
+                except (TypeError, ValueError, IndexError):
+                    pass
+        code = getattr(exc, "smtp_code", None)
+        if isinstance(code, int):
+            codes.append(code)
+        return bool(codes) and all(400 <= c < 500 for c in codes)
+
     # One address the relay will not take must not stop the others. It used to: every
     # message went inside one try, so a mailbox deleted when somebody left aborted the loop
     # at that address. Everyone earlier in the list had already received the email, everyone
@@ -2346,7 +2367,8 @@ def send(
                 try:
                     server.send_message(message)
                 except Exception as exc:  # noqa: BLE001 - one address, not the whole morning
-                    refused.append(f"{message['To']} ({_said(exc)})")
+                    when = "temporarily" if _temporary(exc) else "permanently"
+                    refused.append(f"{message['To']} ({when} — {_said(exc)})")
                     continue
                 if index < len(recipients):
                     delivered_recipients += 1
@@ -2362,6 +2384,13 @@ def send(
     if refused:
         # Loud, and named — but NOT a failed send, because the people who were reachable have
         # the email in their hands and must not be sent it again every quarter of an hour.
+        #
+        # The cost of that choice, stated rather than hidden: an address refused TEMPORARILY
+        # — greylisting, a full mailbox — misses this one morning rather than being retried,
+        # because retrying means re-sending to everyone who already has it. The alternative
+        # was the mail loop this replaced, which sent Jay seventy-two copies. The word
+        # "temporarily" in the line below is what tells a person which of the two happened,
+        # and tomorrow's send is the retry.
         log.error(
             "the morning digest was refused for %d address(es) via %s:%s — %s",
             len(refused), host, port, "; ".join(refused),
