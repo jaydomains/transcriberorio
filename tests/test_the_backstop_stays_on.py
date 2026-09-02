@@ -180,6 +180,35 @@ class TheRemedyTheEmailNamesActuallyRuns(unittest.TestCase):
         self.assertIn("does not account for the audio", printed)
 
 
+class _AcceptingSMTP:
+    """SMTP that takes the message and sends nothing anywhere."""
+
+    def __enter__(self) -> "_AcceptingSMTP":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def starttls(self, *a: object, **k: object) -> None:
+        return None
+
+    def login(self, *a: object, **k: object) -> None:
+        return None
+
+    def send_message(self, *a: object, **k: object) -> None:
+        return None
+
+    def sendmail(self, *a: object, **k: object) -> None:
+        return None
+
+    def quit(self) -> None:
+        return None
+
+
+def _accepting_smtp(*a: object, **k: object) -> _AcceptingSMTP:
+    return _AcceptingSMTP()
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -227,3 +256,52 @@ class WhatTheRecordIsToldAboutWhyItWasRead(unittest.TestCase):
         ).why()
         self.assertIn("the safety check disagreed", said)
         self.assertIn("names an amount", said)
+
+
+class ReadingBackAnOldMorningDoesNotCancelThisOne(unittest.TestCase):
+    """`transcriber digest --day <an older day>` used to suppress today's real email.
+
+    The mark that says "today's digest has gone out" is stamped with TODAY's date whatever
+    day was asked for. So looking back at an older morning — which is the entire purpose of
+    the option — told the service this morning was already done, and the 06:00 email never
+    went out. The scheduled run passes no day at all, so it is unaffected either way.
+    """
+
+    def setUp(self) -> None:
+        import datetime as _dt
+
+        tmp = tempfile.mkdtemp()
+        self.ledger = Ledger(os.path.join(tmp, "ledger.sqlite"))
+        self.ledger.migrate()
+        self.addCleanup(self.ledger.close)
+        self.today = digest.local_now(_Config(""), None).date().isoformat()
+        self.old_day = (
+            _dt.date.fromisoformat(self.today) - _dt.timedelta(days=6)
+        ).isoformat()
+
+    def test_reading_back_an_old_day_leaves_this_morning_still_due(self) -> None:
+        from . import support
+
+        digest.run(support.make_config(), self.ledger, day=self.old_day,
+                   smtp_factory=_accepting_smtp)
+        self.assertIsNone(
+            self.ledger.cursor_get(digest.DIGEST_DAY_MARK),
+            "looking at an older morning marked TODAY as sent, so the real 06:00 email "
+            "for today never went out",
+        )
+
+    def test_but_the_scheduled_run_still_marks_the_day(self) -> None:
+        from . import support
+
+        digest.run(support.make_config(), self.ledger, smtp_factory=_accepting_smtp)
+        self.assertEqual(self.ledger.cursor_get(digest.DIGEST_DAY_MARK), self.today)
+
+    def test_todays_date_is_what_the_mark_would_carry(self) -> None:
+        """The mark is date-stamped from the clock, not from the day that was asked for.
+
+        This is the mechanism, pinned so that a future change cannot quietly make the
+        stamp follow the requested day and reintroduce the other half of the bug.
+        """
+        digest.mark_run(_Config(""), self.ledger)
+        self.assertEqual(self.ledger.cursor_get(digest.DIGEST_DAY_MARK), self.today)
+        self.assertNotEqual(self.old_day, self.today)

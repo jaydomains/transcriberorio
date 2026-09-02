@@ -2428,17 +2428,28 @@ def run(
     # rewrote the history would make the answer depend on who looked.
     record_queue_depth(ledger, digest.queue.day or digest.day, digest.queue.queued)
 
+    # Is this THIS MORNING's email, or somebody looking at an older day? Only the first may
+    # touch the marks, and the difference is not cosmetic: `mark_run` stamps TODAY whatever
+    # day was asked for, so `transcriber digest --day 2026-08-27` — reading back an old
+    # morning, which is what the option is for — marked today as already sent and the real
+    # 06:00 email never went out. The heartbeat is deliberately left alone: pinging is the
+    # established contract for any run that actually sent an email, and narrowing it here
+    # would be a second change riding along with this one.
+    for_today = not day or day == local_now(config, clock).date().isoformat()
+
     monitor = heartbeat if heartbeat is not None else Heartbeat.from_config(config)
     if sent.ok and not digest.alarm:
-        mark_run(config, ledger, now=clock)
-        ledger.cursor_set(DIGEST_ERROR_MARK, "")
+        if for_today:
+            mark_run(config, ledger, now=clock)
+            ledger.cursor_set(DIGEST_ERROR_MARK, "")
         ping = monitor.success(digest.subject)
     elif sent.ok:
         # The email went out and says something is wrong. The day is still marked sent — this
         # is not a send failure and must not become a mail loop — but the monitor is told, so
         # a weekend of "nothing arrived" cannot pass with the alarm sitting green.
-        mark_run(config, ledger, now=clock)
-        ledger.cursor_set(DIGEST_ERROR_MARK, "")
+        if for_today:
+            mark_run(config, ledger, now=clock)
+            ledger.cursor_set(DIGEST_ERROR_MARK, "")
         ping = monitor.fail(digest.subject)
     else:
         ledger.cursor_set(DIGEST_ERROR_MARK, sent.detail[:500])
