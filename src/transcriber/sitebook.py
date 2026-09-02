@@ -157,6 +157,11 @@ def bind_site(text: str, vocab: Mapping[str, Any]) -> tuple[str | None, dict[str
 # --- ours -----------------------------------------------------------------------------
 
 
+#: Compiled whole-word patterns, keyed by term. The book holds ~56 sites with a handful of
+#: terms each and is re-read only when the file changes, so this is bounded by the book.
+_WORD_RE_CACHE: dict[str, "re.Pattern[str]"] = {}
+
+
 def _stands_as_a_word(term: str, text: str) -> bool:
     """Whether ``term`` appears in ``text`` as a whole word rather than inside one.
 
@@ -290,7 +295,15 @@ class SiteBook:
             for term in terms:
                 if not term or len(term) < 4:
                     continue
-                found = lowered.count(term)
+                # Whole words, for the same reason :func:`sites_named_by` counts that way.
+                # A plain substring count was inflating a site's score with words nobody
+                # said: "durbanville" scores for *Urban* Artisan, "princess court" scores
+                # for *Prince* Court, "imam haron road" scores for anyone called *Sharon*.
+                # The number this returns decides the majority test in N7 — "is this
+                # recording ABOUT this site" — so a term counted inside another word is a
+                # vote cast by a word that was never spoken.
+                found = len(_WORD_RE_CACHE.setdefault(term, re.compile(
+                    r"(?<!\w)" + re.escape(term) + r"(?!\w)")).findall(lowered))
                 if found > best:
                     best = found
             if best:

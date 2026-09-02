@@ -22,6 +22,7 @@ Everything in this module is data: strings, dicts and pure formatting helpers. N
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any, Sequence
 
 __all__ = [
@@ -699,6 +700,11 @@ def context_block(
     return "Context\n" + "\n".join(lines)
 
 
+#: Any spelling of the fence tags that a model would read as the fence: either case, and
+#: with whitespace anywhere the markup allows it.
+_FENCE_RE = re.compile(r"<\s*/?\s*transcript\s*>", re.IGNORECASE)
+
+
 def _wrap_transcript(transcript: str) -> str:
     """Fence the transcript so its own text cannot close the fence early.
 
@@ -709,8 +715,15 @@ def _wrap_transcript(transcript: str) -> str:
     stops an injected instruction manufacturing a *proposal*, since every item must carry
     words that are genuinely in the transcript; ``summary_en`` is free text and has no such
     guard, which is what this closes.
+
+    Matched loosely on purpose. The escape used to be a literal replace of the exact
+    lower-case spelling, so ``</TRANSCRIPT>``, ``</Transcript>`` and ``</transcript >`` all
+    went through untouched — and a model reading the prompt does not require the closing tag
+    to be spelled the way this module happens to spell it. One boundary that only holds for
+    one spelling of itself is not a boundary. The opening tag is neutralised the same way,
+    since a second ``<transcript>`` inside the body is the same trick from the other end.
     """
-    body = transcript.strip("\n").replace("</transcript>", "<\u200b/transcript>")
+    body = _FENCE_RE.sub(lambda m: "<\u200b" + m.group(0)[1:], transcript.strip("\n"))
     return "<transcript>\n" + body + "\n</transcript>"
 
 

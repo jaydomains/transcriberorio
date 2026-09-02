@@ -729,10 +729,11 @@ cannot be found in the transcript never reaches a file.
 
 | Variable | Meaning |
 | --- | --- |
-| `ANALYSIS_API_KEY` | **REQUIRED**, unless `OPENAI_API_KEY` is set and is the same key. |
-| `ANALYSIS_BASE_URL` | The API endpoint. Default is OpenAI's. |
-| `ANALYSIS_MODEL_CHEAP` | The router model. Default `gpt-4o-mini`. |
-| `ANALYSIS_MODEL_STRONG` | The reader model. Default `gpt-4o`. |
+| `ANALYSIS_API_KEY` | **REQUIRED.** `OPENAI_API_KEY` stands in for it only when the analysis pass really is calling OpenAI — that is, when `ANALYSIS_PROVIDER=openai` or `ANALYSIS_BASE_URL` names an OpenAI endpoint. On the default it is an Anthropic key and nothing else will do. |
+| `ANALYSIS_PROVIDER` | `anthropic` or `openai`. Optional: left unset it is read from `ANALYSIS_BASE_URL`. |
+| `ANALYSIS_BASE_URL` | The API endpoint. Default `https://api.anthropic.com`. |
+| `ANALYSIS_MODEL_CHEAP` | The router model. Default `claude-haiku-4-5` on Anthropic; on an OpenAI-compatible endpoint there is no default and you name your own. |
+| `ANALYSIS_MODEL_STRONG` | The reader model. Default `claude-opus-5` on Anthropic; likewise no default on OpenAI. |
 
 ### The morning email
 

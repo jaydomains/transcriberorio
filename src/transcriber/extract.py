@@ -931,11 +931,32 @@ class Routing:
         return tuple(seen)
 
     def why(self) -> str:
-        """Plain words for the actions file: why this recording was read, or was not."""
+        """Plain words for the actions file: why this recording was read, or was not.
+
+        This sentence goes into the record and stays there, so it may not assert something
+        that did not happen. Two ways it used to:
+
+        A router OUTAGE sets ``model_label="unavailable"`` and escalates — the right
+        behaviour, since a router that cannot be reached must never mean a recording is
+        skipped — and this then reported it as "the router model called this trivial",
+        which is a judgement no model made. And with no triggers to list, the clause
+        collapsed mid-sentence: *"the safety check disagreed because it , so it was read in
+        full"*, written into a file a person reads.
+        """
+        if self.model_label == "unavailable":
+            return (
+                "the router model could not be reached, so this was read in full rather "
+                "than skipped"
+            )
         if self.escalated:
+            reasons = _join(t.why for t in self.triggers)
+            if not reasons:
+                # Escalated with nothing to name — the transcript was too long to send
+                # whole, so it was read in full on those grounds rather than the router's.
+                return "the router model called this trivial; it was read in full anyway"
             return (
                 "the router model called this trivial; the safety check disagreed because "
-                "it " + _join(t.why for t in self.triggers) + ", so it was read in full"
+                "it " + reasons + ", so it was read in full"
             )
         if self.substantive and self.triggers:
             return "read in full — it " + _join(t.why for t in self.triggers)

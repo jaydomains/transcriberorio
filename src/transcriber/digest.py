@@ -93,6 +93,7 @@ __all__ = [
     "HeldReport",
     "held_report",
     "held_store_for",
+    "HeldStoreUnavailable",
     "HELD_AGE_LINE",
     "HELD_AGE_NAMED",
     "HELD_AGE_SUBJECT",
@@ -575,6 +576,15 @@ HELD_AGE_SUBJECT = 7     # it reaches the subject line of the email
 # a property of the code rather than a promise about it.
 
 
+class HeldStoreUnavailable(Exception):
+    """The held-passage store exists but could not be opened.
+
+    Distinct from "there is no store", which is an ordinary and honest state on a service
+    that has never held anything. This one means the queue is unreadable, and the morning
+    email must say so rather than print a zero.
+    """
+
+
 def held_store_for(config: Any) -> WithheldStore | None:
     """Open the store of held passages, or ``None`` when this deployment has never used one.
 
@@ -595,7 +605,14 @@ def held_store_for(config: Any) -> WithheldStore | None:
         return WithheldStore(path, scrub=getattr(config, "scrub", None))
     except Exception as exc:  # noqa: BLE001 - the morning email goes out regardless
         log.warning("the held-passage store could not be opened: %s", exc)
-        return None
+        # The caller has to be able to tell this apart from "there is no store because
+        # nothing was ever held". Both used to arrive as None, so a store that could not be
+        # opened — a corrupt file, a permission that changed, a disk fault — rendered in the
+        # morning email as "nothing has been held", which is the one sentence this design
+        # exists to prevent anybody reading when it is not true. The words are still safe
+        # (nothing was read), but the queue's existence stopped being reported, and Jay does
+        # not read the log this warning goes to.
+        raise HeldStoreUnavailable(f"{type(exc).__name__}: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -1032,7 +1049,10 @@ def held_report(
     mode = normalise_mode(getattr(config, "gate_mode", MODE_SHADOW))
     owner = (principal or _principal_of(config)).strip()
     url = str(getattr(config, "gate_review_base_url", "") or "").strip()
-    held = store if store is not None else held_store_for(config)
+    try:
+        held = store if store is not None else held_store_for(config)
+    except HeldStoreUnavailable as exc:
+        return HeldReport(mode=mode, review_url=url, unavailable=str(exc))
     if held is None:
         return HeldReport(mode=mode, review_url=url)
 
@@ -2299,25 +2319,100 @@ def send(
                   _own_queue_subject(digest, who))
         )
 
+    scrub = getattr(config, "scrub", None)
+
+    def _said(exc: Exception) -> str:
+        detail = f"{type(exc).__name__}: {exc}"
+        return scrub(detail) if callable(scrub) else detail
+
+    def _temporary(exc: Exception) -> bool:
+        """Whether the relay said "not now" rather than "not ever".
+
+        A 4xx is greylisting or a full mailbox: the address is fine and tomorrow will
+        probably work. A 5xx is a mailbox that is gone. Both are reported; they are worth
+        telling apart because one is somebody's job to fix and the other is the mail system
+        doing what it does.
+        """
+        codes: list[int] = []
+        recipients = getattr(exc, "recipients", None)
+        if isinstance(recipients, dict):
+            for answer in recipients.values():
+                try:
+                    codes.append(int(answer[0]))
+                except (TypeError, ValueError, IndexError):
+                    pass
+        code = getattr(exc, "smtp_code", None)
+        if isinstance(code, int):
+            codes.append(code)
+        return bool(codes) and all(400 <= c < 500 for c in codes)
+
+    # One address the relay will not take must not stop the others. It used to: every
+    # message went inside one try, so a mailbox deleted when somebody left aborted the loop
+    # at that address. Everyone earlier in the list had already received the email, everyone
+    # later got nothing, and the whole send reported ok=False — which leaves DIGEST_DAY_MARK
+    # unwritten, so `should_run` fires again fifteen minutes later and sends the same email
+    # to the same people. Roughly seventy-two copies before midnight, every day, while the
+    # log and the monitor both said it could not be sent. That is the mail loop RETRY_AFTER_S
+    # was written to prevent, arriving as delivered mail rather than as retries.
+    #
+    # With the gate armed it also silently skipped every reviewer sorted after the bad
+    # address, so people never got the link to passages waiting on them, and nothing recorded
+    # who was missed.
+    refused: list[str] = []
+    delivered_recipients = 0
+    delivered_reviewers = 0
     try:
         with _connect(config, host, port, smtp_factory) as server:
-            for message in outgoing:
-                server.send_message(message)
-    except Exception as exc:  # noqa: BLE001 - every send failure is reported, none is raised
-        detail = f"{type(exc).__name__}: {exc}"
-        scrub = getattr(config, "scrub", None)
-        if callable(scrub):
-            detail = scrub(detail)
+            for index, message in enumerate(outgoing):
+                try:
+                    server.send_message(message)
+                except Exception as exc:  # noqa: BLE001 - one address, not the whole morning
+                    when = "temporarily" if _temporary(exc) else "permanently"
+                    refused.append(f"{message['To']} ({when} — {_said(exc)})")
+                    continue
+                if index < len(recipients):
+                    delivered_recipients += 1
+                else:
+                    delivered_reviewers += 1
+    except Exception as exc:  # noqa: BLE001 - the connection itself; nothing went out
+        detail = _said(exc)
         # ERROR, not WARNING: an unsendable digest is the failure mode this service exists
         # to remove, and it must be loud even though nothing raises.
         log.error("the morning digest could NOT be sent via %s:%s — %s", host, port, detail)
         return SendResult(ok=False, detail=detail, recipients=len(recipients), host=host)
 
+    if refused:
+        # Loud, and named — but NOT a failed send, because the people who were reachable have
+        # the email in their hands and must not be sent it again every quarter of an hour.
+        #
+        # The cost of that choice, stated rather than hidden: an address refused TEMPORARILY
+        # — greylisting, a full mailbox — misses this one morning rather than being retried,
+        # because retrying means re-sending to everyone who already has it. The alternative
+        # was the mail loop this replaced, which sent Jay seventy-two copies. The word
+        # "temporarily" in the line below is what tells a person which of the two happened,
+        # and tomorrow's send is the retry.
+        log.error(
+            "the morning digest was refused for %d address(es) via %s:%s — %s",
+            len(refused), host, port, "; ".join(refused),
+        )
+    if not delivered_recipients and not delivered_reviewers:
+        # Nobody at all got it. That is a failed morning however the relay phrased it.
+        return SendResult(
+            ok=False, detail="; ".join(refused) or "no message was accepted",
+            recipients=len(recipients), host=host,
+        )
+
     log.info(
         "morning digest sent to %d recipient(s) and %d reviewer(s) via %s:%s — %s",
-        len(recipients), len(others), host, port, digest.subject,
+        delivered_recipients, delivered_reviewers, host, port, digest.subject,
     )
-    return SendResult(ok=True, recipients=len(recipients), host=host, reviewers=len(others))
+    return SendResult(
+        ok=True,
+        detail="; ".join(refused),
+        recipients=delivered_recipients,
+        host=host,
+        reviewers=delivered_reviewers,
+    )
 
 
 def _own_queue_subject(digest: Digest, who: str) -> str:
@@ -2408,17 +2503,28 @@ def run(
     # rewrote the history would make the answer depend on who looked.
     record_queue_depth(ledger, digest.queue.day or digest.day, digest.queue.queued)
 
+    # Is this THIS MORNING's email, or somebody looking at an older day? Only the first may
+    # touch the marks, and the difference is not cosmetic: `mark_run` stamps TODAY whatever
+    # day was asked for, so `transcriber digest --day 2026-08-27` — reading back an old
+    # morning, which is what the option is for — marked today as already sent and the real
+    # 06:00 email never went out. The heartbeat is deliberately left alone: pinging is the
+    # established contract for any run that actually sent an email, and narrowing it here
+    # would be a second change riding along with this one.
+    for_today = not day or day == local_now(config, clock).date().isoformat()
+
     monitor = heartbeat if heartbeat is not None else Heartbeat.from_config(config)
     if sent.ok and not digest.alarm:
-        mark_run(config, ledger, now=clock)
-        ledger.cursor_set(DIGEST_ERROR_MARK, "")
+        if for_today:
+            mark_run(config, ledger, now=clock)
+            ledger.cursor_set(DIGEST_ERROR_MARK, "")
         ping = monitor.success(digest.subject)
     elif sent.ok:
         # The email went out and says something is wrong. The day is still marked sent — this
         # is not a send failure and must not become a mail loop — but the monitor is told, so
         # a weekend of "nothing arrived" cannot pass with the alarm sitting green.
-        mark_run(config, ledger, now=clock)
-        ledger.cursor_set(DIGEST_ERROR_MARK, "")
+        if for_today:
+            mark_run(config, ledger, now=clock)
+            ledger.cursor_set(DIGEST_ERROR_MARK, "")
         ping = monitor.fail(digest.subject)
     else:
         ledger.cursor_set(DIGEST_ERROR_MARK, sent.detail[:500])

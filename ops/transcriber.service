@@ -24,6 +24,21 @@ Documentation=file:/opt/transcriber/README.md
 Wants=network-online.target
 After=network-online.target
 
+# Do not restart forever in a tight loop if something is badly wrong: five failures inside
+# ten minutes stops the unit, which shows up as `failed` in `systemctl status` and is a
+# state a person — or a monitor — can actually see.
+#
+# These belong in [Unit]. They were in [Service], where systemd 255 answers
+# "Unknown key name 'StartLimitIntervalSec' in section 'Service', ignoring." — so the
+# interval silently fell back to the 10s default while the burst was still read. With
+# RestartSec=30s the restarts are 30 seconds apart, so five could never land inside 10
+# seconds and the limit could never trip: a service that could not start — a bad
+# credential, a missing environment file — looped every 30 seconds forever, showing
+# `activating (auto-restart)` rather than `failed`, which is the state nothing is watching
+# for. Verified with `systemd-analyze verify` before and after.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=transcriber
@@ -51,11 +66,8 @@ TimeoutStopSec=120
 # credential is a line a minute rather than a busy loop.
 Restart=always
 RestartSec=30s
-# But do not restart forever in a tight loop if something is badly wrong: five failures
-# inside ten minutes stops the unit, which shows up as `failed` in `systemctl status` and is
-# a state a person can actually see.
-StartLimitIntervalSec=600
-StartLimitBurst=5
+# The rate limit that stops a tight restart loop lives in [Unit] above; systemd moved
+# those two keys out of [Service] in version 229 and ignores them here.
 
 # --- what it may touch ---------------------------------------------------------------
 # The ledger is the only proof a recording ever existed; the scratch directory holds the raw

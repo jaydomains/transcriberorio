@@ -490,9 +490,32 @@ class Config:
 
         # One key covers both when they are the same provider; still explicit, never guessed
         # from an unrelated variable.
+        #
+        # Which is what it was doing. The fallback fired on the mere presence of
+        # OPENAI_API_KEY, and the shipped default analysis provider is Anthropic — so an
+        # OpenAI key was accepted as the Anthropic credential and the "ANALYSIS_API_KEY is
+        # not set" problem was struck off the list. The service then starts clean and every
+        # analysis call comes back 401, which reads like the provider having a bad morning
+        # rather than like a setting nobody set. Now the substitution only happens when the
+        # analysis pass is genuinely going to call OpenAI, worked out the way extract.py
+        # works it out: the explicit setting first, then the host in the base URL.
         if "analysis_api_key" not in values:
+            declared = (source.get("ANALYSIS_PROVIDER") or "").strip().lower()
+            url = str(
+                values.get("analysis_base_url")
+                or source.get("ANALYSIS_BASE_URL")
+                or "https://api.anthropic.com"
+            ).lower()
+            if declared:
+                provider = declared
+            elif "anthropic" in url:
+                provider = "anthropic"
+            elif "openai" in url or "azure.com" in url:
+                provider = "openai"
+            else:
+                provider = ""
             fallback = (source.get("OPENAI_API_KEY") or "").strip()
-            if fallback:
+            if fallback and provider == "openai":
                 values["analysis_api_key"] = fallback
                 problems = [p for p in problems if not p.startswith("ANALYSIS_API_KEY")]
 

@@ -131,20 +131,35 @@ def opening(spoken: str, *, window_s: float = DEFAULT_WINDOW_S) -> Opening:
     kept: list[str] = []
     timed = False
 
+    advanced = False
     for line in lines:
         stamp = _STAMP_RE.match(line)
         if stamp is not None:
             timed = True
             hours = int(stamp.group(1) or 0)
             seconds = hours * 3600 + int(stamp.group(2)) * 60 + int(stamp.group(3))
+            if seconds > 0:
+                advanced = True
             if kept and seconds > window_s:
                 # Past the window. The line that crosses it is left out whole rather than
                 # cut mid-sentence: half a sentence is a good way to read half a site name.
                 break
-        elif kept and cut >= _WINDOW_CHARS:
+        # The character budget is a ceiling on BOTH paths, not the fallback for one of them.
+        # A stamped body whose clock never moves used to have no ceiling at all: every line
+        # reads "[00:00]", nothing is ever past the window, and "the first minute" quietly
+        # became the whole recording — so a site named once at minute seventy was read as a
+        # deliberate opening declaration, which is the strongest evidence tier there is and
+        # the exact misfile the window exists to prevent. That is reachable, not theoretical:
+        # engines/openai.py maps a segment with no start to 0.0, so one response shape with
+        # timings missing produces a body of "[00:00]" lines.
+        if kept and cut >= _WINDOW_CHARS:
             break
         kept.append(line)
         cut += len(line) + 1
+
+    # A clock that never advanced is not a clock. Say so, so the caller reports the rougher
+    # window honestly rather than claiming a precision the body does not carry.
+    timed = timed and advanced
 
     if not timed:
         # No clock anywhere. Take the character budget from the front, ending on a line

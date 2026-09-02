@@ -642,6 +642,43 @@ def refuse_held_text(
     )
 
 
+#: A sha256 as this service writes it into the provenance rows. Never a thing a person
+#: said, so never a thing a held passage can be a paraphrase of.
+_DIGEST_RE = re.compile(r"\b[0-9a-f]{32,64}\b")
+
+
+def _our_own_identifiers(files: Sequence[RenderedFile]) -> tuple[str, ...]:
+    """The strings this service generated and then wrote into its own files.
+
+    The three output names, and their stems without the extension, because the summary and
+    the proposals cross-reference each other by name. Longest first, so removing one cannot
+    leave the tail of another behind.
+    """
+    names: set[str] = set()
+    for rendered in files:
+        name = (rendered.name or "").strip()
+        if not name:
+            continue
+        names.add(name)
+        stem = name.rsplit(".", 1)[0]
+        if stem and stem != name:
+            names.add(stem)
+    return tuple(sorted(names, key=len, reverse=True))
+
+
+def _without(text: str, ours: Sequence[str]) -> str:
+    """``text`` with this service's own identifiers taken out, for the rules to read.
+
+    Replaced with a marker of the same shape rather than deleted, so offsets stay roughly
+    honest and two sentences either side of a filename do not run together into one.
+    """
+    cleaned = text
+    for name in ours:
+        if name:
+            cleaned = cleaned.replace(name, "[our own filename]")
+    return _DIGEST_RE.sub("[our own hash]", cleaned)
+
+
 def refuse_written_down_again(
     files: Sequence[RenderedFile],
     *,
@@ -671,6 +708,21 @@ def refuse_written_down_again(
     """
     if not armed:
         return
+    # What this service itself wrote into the file is not what this check is looking for.
+    # It is looking for the MODEL restating a held passage in prose of its own, and our own
+    # filenames and hashes are neither prose nor the model's. Scanning them was not merely
+    # pointless, it was actively destructive: the summary and the proposals each carry
+    # backticked cross-references to the other two names, and a stem like
+    # ``_20260827-143005-...`` strips to the fourteen digits ``20260827143005``, which sits
+    # in the 13-to-19 range the identifier rule calls a card and passes Luhn about one time
+    # in ten. Measured over five thousand plausible recording moments: 10.6% trip it. Once
+    # the gate is armed that refuses the publish, and HeldTextWouldLeak is in
+    # ``pipeline._NEVER_RETRY`` — so roughly one gated recording in nine would have been
+    # quarantined for ever, re-rendering the identical bytes on every retry, and the morning
+    # email would have reported a near-leak of a card number that does not exist. A gate
+    # that eats a day's recordings for a number it invented is a gate that gets switched
+    # off, which is the failure the whole design is built against.
+    ours = _our_own_identifiers(files)
     problems: list[str] = []
     leaking: list[str] = []
     for rendered in files:
@@ -680,7 +732,7 @@ def refuse_written_down_again(
             # classifier deliberately let through, and refusing there would quarantine
             # ordinary recordings.
             continue
-        for finding in sensitivity.rule_findings(rendered.text):
+        for finding in sensitivity.rule_findings(_without(rendered.text, ours)):
             if not finding.held:
                 continue
             problems.append(

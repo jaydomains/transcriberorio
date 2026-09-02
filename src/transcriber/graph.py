@@ -51,6 +51,11 @@ DOWNLOAD_CHUNK = 1024 * 1024
 TOKEN_REFRESH_SKEW_S = 300.0
 
 RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 509})
+
+#: How many times one download may fetch a fresh pre-authenticated URL. Two covers a long
+#: recording outliving its URL twice; beyond that a 403 is what it looks like — a refusal —
+#: and spinning on it would turn a clear error into a slow one.
+_MAX_URL_REFRESHES = 2
 RETRY_AFTER_STATUSES = frozenset({429, 503, 504})
 
 
@@ -815,11 +820,23 @@ class GraphClient:
         written = 0
         declared_total: int | None = expected_size
         attempt = 0
+        total_attempts = 0
+        url_refreshes = 0
         resumed = False
         try:
             with open(part_path, "wb") as sink:
                 while True:
                     attempt += 1
+                    total_attempts += 1
+                    # Where this attempt starts. `attempt` bounds CONSECUTIVE failures, not
+                    # total interruptions over the whole file, and this is what tells the two
+                    # apart. The chunked-upload loop below has always reset on progress; this
+                    # one did not, so an hour-long recording pulled over a site LTE link that
+                    # drops every fifteen megabytes exhausted the budget while making steady
+                    # forward progress, and the .part file holding everything fetched so far
+                    # was deleted on the way out. The next pipeline attempt then started from
+                    # zero against the same link and reached the same end.
+                    before = written
                     headers: dict[str, str] = {"Accept-Encoding": "identity"}
                     if written:
                         headers["Range"] = f"bytes={written}-"
@@ -859,7 +876,21 @@ class GraphClient:
                             pass
                         hdrs = {k.lower(): v for k, v in (exc.headers or {}).items()}
                         code, message, request_id = _error_fields(payload)
-                        if exc.code not in RETRYABLE_STATUSES or attempt >= self.retry.max_attempts:
+                        if written > before:
+                            attempt = 0
+                        # A 401 or 403 HERE is not the credential fault it is on an API call.
+                        # The download URL is pre-authenticated and expires — roughly an hour
+                        # — so on a long recording that has been sleeping through 503s with a
+                        # Retry-After, storage answers 403 because the URL went stale, not
+                        # because the app may not read it. Re-resolving is the whole answer,
+                        # and the line that did it sat below a guard that raised first, so it
+                        # could never run: the recording was quarantined on its first attempt
+                        # with a message saying a retry would not change the answer, when the
+                        # next attempt would have fetched a fresh URL and finished. Bounded,
+                        # so a genuinely forbidden download still fails quickly and says so.
+                        stale_url = exc.code in (401, 403) and url_refreshes < _MAX_URL_REFRESHES
+                        if ((exc.code not in RETRYABLE_STATUSES and not stale_url)
+                                or attempt >= self.retry.max_attempts):
                             raise GraphHTTPError(
                                 exc.code,
                                 method="GET",
@@ -867,31 +898,39 @@ class GraphClient:
                                 code=code,
                                 message=message,
                                 request_id=request_id,
-                                attempts=attempt,
+                                attempts=total_attempts,
                                 body=payload[:2000].decode("utf-8", "replace"),
                             ) from exc
-                        delay = self._retry_delay(exc.code, _parse_retry_after(hdrs.get("retry-after")), attempt)
+                        delay = self._retry_delay(
+                            exc.code, _parse_retry_after(hdrs.get("retry-after")), max(1, attempt)
+                        )
                         log.warning(
-                            "download %s -> HTTP %d; retrying in %.1fs (attempt %d/%d)",
-                            item_id, exc.code, delay, attempt, self.retry.max_attempts,
+                            "download %s -> HTTP %d; retrying in %.1fs "
+                            "(%d in a row of %d allowed, %d interruptions so far)",
+                            item_id, exc.code, delay,
+                            max(1, attempt), self.retry.max_attempts, total_attempts,
                         )
                         self._sleep(delay)
-                        if exc.code in (403, 401):  # a pre-auth URL can expire mid-download
+                        if stale_url:
+                            url_refreshes += 1
                             url, _ = self._resolve_download_url(item_id)
                     except (urllib.error.URLError, HTTPException, socket.timeout, ConnectionError, OSError) as exc:
+                        if written > before:
+                            attempt = 0
                         if attempt >= self.retry.max_attempts:
                             raise GraphTransportError(
-                                f"download of {item_id} failed after {attempt} attempts "
+                                f"download of {item_id} failed after {total_attempts} attempts "
                                 f"at {written} bytes: {exc!r}",
                                 method="GET",
                                 url=redact_url(url),
-                                attempts=attempt,
+                                attempts=total_attempts,
                             ) from exc
-                        delay = self.retry.backoff(attempt, self._rng)
+                        delay = self.retry.backoff(max(1, attempt), self._rng)
                         log.warning(
                             "download %s interrupted at %d bytes (%r); resuming in %.1fs "
-                            "(attempt %d/%d)",
-                            item_id, written, exc, delay, attempt, self.retry.max_attempts,
+                            "(%d in a row of %d allowed, %d interruptions so far)",
+                            item_id, written, exc, delay,
+                            max(1, attempt), self.retry.max_attempts, total_attempts,
                         )
                         resumed = True
                         self._sleep(delay)

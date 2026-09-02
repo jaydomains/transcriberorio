@@ -201,12 +201,17 @@ service has been switched off, deleted, or its card has expired.
 
 1. Go to **https://healthchecks.io** and sign up. Free.
 2. **Add Check**. Name it `KBC Transcriber`.
-3. Set **Period** to 1 hour and **Grace Time** to 2 hours.
+3. Set **Period** to 1 day and **Grace Time** to 3 hours.
 4. Copy the **Ping URL** it gives you.
 5. Add your phone number or email under Notifications.
 
-The transcriber pings that URL every time it completes a cycle. If it stops pinging, healthchecks
-emails you within two hours instead of you finding out four days later.
+The transcriber pings that URL once every morning, after the 06:00 email has actually gone out.
+If a morning goes by without it, healthchecks tells you within three hours instead of you finding
+out four days later.
+
+(Period must be a *day*, not an hour. The ping is sent when the morning email goes out, so a
+one-hour period would go red every day by mid-morning on a service that is working perfectly — and
+an alarm that cries wolf every day is one you switch off, which leaves you with no alarm at all.)
 
 ---
 

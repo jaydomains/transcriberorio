@@ -109,7 +109,10 @@ class TheNewSettingsAreValidatedWithEverythingElse(unittest.TestCase):
     BASE = {
         "GRAPH_TENANT_ID": "t", "GRAPH_CLIENT_ID": "c", "GRAPH_CLIENT_SECRET": "s",
         "GRAPH_USER_ID": "u", "SOURCE_FOLDER_ID": "S", "OUTPUT_FOLDER_ID": "O",
-        "TRANSCRIBE_ENGINE": "openai", "OPENAI_API_KEY": "k", "SMTP_HOST": "h",
+        "TRANSCRIBE_ENGINE": "openai", "OPENAI_API_KEY": "k",
+        # Stated rather than inferred from OPENAI_API_KEY: the analysis pass defaults to
+        # Anthropic, so an OpenAI key is not its credential and is no longer taken as one.
+        "ANALYSIS_API_KEY": "a", "SMTP_HOST": "h",
         "SMTP_USER": "u", "SMTP_PASSWORD": "p", "SMTP_FROM": "f", "SMTP_TO": "t",
         "HEARTBEAT_URL": "https://example.invalid/hb", "LEDGER_PATH": ":memory:",
     }

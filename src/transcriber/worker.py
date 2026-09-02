@@ -60,6 +60,7 @@ not quarantine the backlog on the way down.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import signal
 import socket
@@ -440,6 +441,15 @@ def interleave_routes(
     return taken
 
 
+def _folder_fingerprint(folder_id: str | None) -> str:
+    """A short, stable, filter-proof stand-in for a watched folder's id.
+
+    Only ever compared with itself, so what it is does not matter — only that storing and
+    reading it back cannot change it. See the caller for why that is not a given.
+    """
+    return hashlib.sha256(str(folder_id or "").encode("utf-8")).hexdigest()[:16]
+
+
 class Worker:
     """Poll, process, schedule. One per process."""
 
@@ -735,6 +745,51 @@ class Worker:
         )
         return combined
 
+    def _forget_the_cursor_if_the_folder_changed(self, route: Route, cursor_name: str) -> None:
+        """A delta cursor belongs to the folder it was minted against, not to the route.
+
+        Point a route at a different folder — `routes edit`, the wizard, or a hand-edited
+        .env — and the stored cursor is still a bookmark in the OLD folder's change feed.
+        Graph answers it happily, because it is a valid link; it just describes changes
+        somewhere the service is no longer watching. So the poll reports "0 new" every
+        cycle, for ever, while recordings pile up in the new folder — and the one thing
+        that would have caught it, the nightly sweep, re-enumerates from zero and would
+        have found them, except that nothing says the live path has gone deaf.
+
+        The fix belongs here rather than in `routes edit` because the folder can change
+        without that command being the thing that changed it. The mark is written whatever
+        happens, so a service that has been running since before this existed adopts its
+        current folder on the next poll and rewinds only if it changes after that.
+        """
+        mark = f"watched:{route.name}"
+        seen = self.ledger.cursor_get(mark)
+        # A fingerprint rather than the id itself. `cursor_set` stores through the ledger's
+        # `_clean`, which runs the secret scrubber and the three address filters — so a
+        # stored id that the filters altered could never equal the raw id read back, the
+        # comparison would fail on every poll, and this would rewind the cursor and
+        # re-enumerate the whole folder every two minutes. Delta polling defeated by the
+        # thing meant to protect it. A hex digest passes through every one of those filters
+        # unchanged, and it also keeps a folder id out of a column that is scrubbed for a
+        # reason.
+        current = _folder_fingerprint(route.source_folder_id)
+        if seen == current:
+            return
+        if seen:
+            # Rewinding re-reads pages already recorded, which costs a little work and loses
+            # nothing — the same reasoning rewind_cursor is written on.
+            self.ledger.rewind_cursor(
+                cursor_name,
+                f"the folder watched by route {route.name} changed; the stored cursor "
+                f"bookmarks the changes of the folder it no longer watches",
+            )
+            log.warning(
+                "watched-folder-changed",
+                f"{route.display}: the watched folder changed, so its change feed is being "
+                f"re-read from the beginning",
+                route=route.name,
+            )
+        self.ledger.cursor_set(mark, current)
+
     def poll_route(
         self, route: Route, *, own_outputs: frozenset[str] | None = None
     ) -> PollResult:
@@ -747,6 +802,7 @@ class Worker:
         """
         result = PollResult(route=route.name)
         cursor_name = delta_cursor_name(route.name)
+        self._forget_the_cursor_if_the_folder_changed(route, cursor_name)
         cursor = self.ledger.cursor_get(cursor_name)
         if own_outputs is None:
             own_outputs = _output_ids(self.ledger)

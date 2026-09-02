@@ -55,9 +55,16 @@ __all__ = [
     "day_of",
 ]
 
-# Deliberately the same pattern the downstream record uses (tools/ingest.py: ADDR_RE), so
-# that what we call an address and what it calls an address are the same thing.
-EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+# Shaped on the downstream record's own address check (tools/ingest.py: ADDR_RE) but
+# deliberately WIDER than it, in the one way that matters here: letters outside ASCII count
+# as letters. The record's pattern is ASCII-only, and this is the Cape — Müller, José,
+# Voëlklip. Measured against the ASCII version: "muller@site.co.za" was removed and
+# "müller@site.co.za" was published untouched, and "joão.silva@kbc.co.za" came out as
+# "joão[address removed]", which is worse than leaving it alone because it looks handled.
+# Being wider than the record is safe in a way that being narrower is not: everything we
+# remove, it never sees, and the only thing that could go wrong the other way is an address
+# reaching the record because our pattern was the stricter of the two.
+EMAIL_RE = re.compile(r"\b[\w.%+\-]+@[\w.\-]+\.[^\W\d_]{2,}\b")
 EMAIL_PLACEHOLDER = "[address removed]"
 
 #: The same rule, spelled the way somebody says it out loud: "carel at example dot co dot

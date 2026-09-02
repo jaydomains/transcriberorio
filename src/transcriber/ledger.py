@@ -799,11 +799,29 @@ class Ledger:
             )
             self._event(conn, item_id, "quarantined", now, current["state"], State.QUARANTINED, clean)
 
-    def requeue(self, item_id: str, reason: str, state: str = State.DISCOVERED) -> None:
+    def requeue(
+        self,
+        item_id: str,
+        reason: str,
+        state: str = State.DISCOVERED,
+        *,
+        reset_attempts: bool = False,
+    ) -> None:
         """Deliberately put a row back in the queue — after a person fixed what was wrong.
 
         Separate from advance() because moving work backwards should be something somebody
         chose, with a reason recorded, rather than something a caller did by accident.
+
+        ``reset_attempts`` is for the manual path and is what makes it mean anything. A
+        recording quarantined after three engine failures still carries ``attempts=3``, so
+        putting it back in the queue with the count intact bought it nothing: the first
+        transient failure took it straight past ``max_attempts`` again, and if the worker
+        did not reach it first the nightly sweep re-quarantined it on the count alone —
+        naming, as the reason, the errors from before the person fixed the cause. Either
+        way the requeue was undone within hours and the recording had never actually been
+        retried once. ``cmd_requeue`` passes it; the sweep's own automatic requeue does not,
+        so ``max_attempts`` still bounds the machine. Nothing is destroyed either way —
+        every attempt that ever happened is still in the ``events`` table.
         """
         if not State.is_known(state):
             raise LedgerStateError(f"{state!r} is not a state")
@@ -824,11 +842,19 @@ class Ledger:
             meta = _decode_meta(current["meta"])
             for key in ("retry_at", "retry_reason", "gate_first_seen"):
                 meta.pop(key, None)
-            conn.execute(
-                "UPDATE items SET state=?, claimed_by=NULL, lease_until=NULL, updated_at=?,"
-                " meta=? WHERE item_id=?",
-                (state, now, json.dumps(meta, sort_keys=True), item_id),
-            )
+            if reset_attempts:
+                conn.execute(
+                    "UPDATE items SET state=?, claimed_by=NULL, lease_until=NULL,"
+                    " updated_at=?, meta=?, attempts=0, quarantine_reason=NULL,"
+                    " quarantined_at=NULL, last_error=NULL WHERE item_id=?",
+                    (state, now, json.dumps(meta, sort_keys=True), item_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE items SET state=?, claimed_by=NULL, lease_until=NULL,"
+                    " updated_at=?, meta=? WHERE item_id=?",
+                    (state, now, json.dumps(meta, sort_keys=True), item_id),
+                )
             self._event(conn, item_id, "requeued", now, current["state"], state, clean)
 
     def reassign_route(self, item_id: str, route: str, reason: str) -> None:
@@ -885,6 +911,25 @@ class Ledger:
     def get(self, item_id: str) -> Row | None:
         record = self._conn().execute("SELECT * FROM items WHERE item_id=?", (item_id,)).fetchone()
         return None if record is None else Row.from_db(record)
+
+    def find_by_name(self, needle: str, limit: int = 20) -> list[Row]:
+        """Recordings whose filename contains ``needle``, newest first.
+
+        For the person at a terminal who has a filename and not a OneDrive item id. The
+        morning email prints both, a few lines apart, and nobody retypes an id by hand.
+        """
+        # Every LIKE metacharacter in the needle is escaped before the wildcards that make
+        # this a "contains" search are put around it — backslash first, or it would escape
+        # the escapes added after it. Searching for "100%" used to match every recording,
+        # because the % in the filename was read as "anything at all".
+        raw = (needle or "").strip()
+        escaped = raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        records = self._conn().execute(
+            "SELECT * FROM items WHERE name LIKE ? ESCAPE '\\' "
+            "ORDER BY COALESCE(discovered_at, '') DESC LIMIT ?",
+            (f"%{escaped}%", int(limit)),
+        ).fetchall()
+        return [Row.from_db(r) for r in records]
 
     def unfinished(self, route: str | None = None) -> list[Row]:
         """Everything not in a terminal state, oldest first — what the sweep re-queues.
@@ -1201,12 +1246,20 @@ class Ledger:
         return [dict(r) for r in records]
 
     def route_disagreements(
-        self, since: str | None = None, limit: int = 200
+        self, since: str | None = None, limit: int | None = 200
     ) -> list[dict[str, Any]]:
         """Recordings two routes have both claimed, newest first — read by somebody.
 
         ``since`` is a timestamp or a bare ``YYYY-MM-DD``; events at or after it are
-        returned. Omitted, the whole history comes back.
+        returned. Omitted, every disagreement since that point comes back.
+
+        ``limit`` caps the rows for the places that are *displaying* them — the status
+        table and the morning email, where two hundred is already more than anybody reads.
+        Pass ``None`` where the answer is used as a SET rather than a list: the archive
+        excludes disputed recordings from being moved, and a set that silently stops at two
+        hundred is not an exclusion, it is a guard that quietly lets the oldest ones
+        through — into the wrong route's archive folder, which is the exact outcome this
+        query exists to prevent.
 
         This exists because writing the event was not the same as reporting it. A
         disagreement means either a recording moved between watched folders or one route's
@@ -1222,8 +1275,8 @@ class Ledger:
             " items.state AS item_state"
             " FROM events LEFT JOIN items ON items.item_id = events.item_id"
             f" WHERE events.kind='route-disagreement'{clause}"
-            " ORDER BY events.id DESC LIMIT ?",
-            (*params, int(limit)),
+            " ORDER BY events.id DESC" + (" LIMIT ?" if limit is not None else ""),
+            (*params, *((int(limit),) if limit is not None else ())),
         ).fetchall()
         return [dict(r) for r in records]
 
