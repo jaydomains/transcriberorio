@@ -189,6 +189,14 @@ class AzureSpeechEngine:
     # -- batch --------------------------------------------------------------------
 
     def _transcribe_batch(self, path: str, hints: Hints, content_url: str) -> Transcript:
+        # The content URL is a bearer capability to the recording: no header, no token,
+        # anyone holding the link has the audio. It is handed to Azure on purpose — that is
+        # what batch transcription is — but it must not come back out in an error message,
+        # and an Azure 4xx that echoes the request body is exactly how it would.
+        with self.client.hiding(content_url):
+            return self._batch(content_url, hints)
+
+    def _batch(self, content_url: str, hints: Hints) -> Transcript:
         job = self._submit_batch(content_url, hints)
         job_url = job.get("self") or ""
         if not job_url:

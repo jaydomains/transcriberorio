@@ -88,3 +88,44 @@ class TheLogGetsTheSameThreeFiltersAsEverythingElse(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThePreAuthenticatedUrlDoesNotComeBackOutInAnError(unittest.TestCase):
+    """Azure batch is handed OneDrive's download URL, which is a capability, not a name.
+
+    No header, no token: anyone holding the link has the recording. Handing it to the
+    vendor is what batch transcription IS, and that is fine — but the client's fixed secret
+    list held only the Azure API key, so a 4xx whose body echoed the request carried the URL
+    verbatim into the exception, into `last_error`, into the ledger and into the 06:00
+    email, where it would sit until somebody read their inbox.
+    """
+
+    URL = (
+        "https://kbc-my.sharepoint.com/personal/x/_layouts/download.aspx"
+        "?tempauth=SECRET-BEARER-TOKEN-abc123"
+    )
+
+    def setUp(self) -> None:
+        from transcriber.engines.base import HttpClient
+
+        self.client = HttpClient(secrets=("azure-key-abcdef",))
+        self.said = f'azure said 400: {{"error":"bad contentUrls: {self.URL}"}}'
+
+    def test_it_is_hidden_while_the_batch_call_is_in_flight(self) -> None:
+        with self.client.hiding(self.URL):
+            self.assertNotIn("tempauth", self.client.scrub(self.said))
+
+    def test_the_error_still_says_what_went_wrong(self) -> None:
+        with self.client.hiding(self.URL):
+            said = self.client.scrub(self.said)
+        self.assertIn("azure said 400", said)
+        self.assertIn("bad contentUrls", said)
+
+    def test_it_does_not_accumulate_across_recordings(self) -> None:
+        """One recording's URL must not stay in the list for the life of the process."""
+        with self.client.hiding(self.URL):
+            pass
+        self.assertEqual(self.client.scrub(self.said), self.said)
+
+    def test_and_the_clients_own_secret_is_always_hidden(self) -> None:
+        self.assertNotIn("azure-key-abcdef", self.client.scrub("key azure-key-abcdef here"))

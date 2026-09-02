@@ -32,6 +32,7 @@ import json
 import logging
 import mimetypes
 import os
+import contextlib
 import random
 import socket
 import time
@@ -533,6 +534,8 @@ class HttpClient:
         self.policy = policy or RetryPolicy()
         self.user_agent = user_agent
         self._secrets = tuple(s for s in secrets if isinstance(s, str) and len(s) >= 4)
+        #: Secrets belonging to one request rather than to the client. See :meth:`hiding`.
+        self._transient: list[str] = []
         self._opener = opener or urllib.request.build_opener()
         self._sleep = sleep
         self._rng = rng or random.Random()
@@ -548,9 +551,32 @@ class HttpClient:
     def scrub(self, text: str) -> str:
         if not text:
             return text
-        for secret in self._secrets:
+        for secret in tuple(self._secrets) + tuple(self._transient):
             text = text.replace(secret, "***REDACTED***")
         return strip_emails(text)
+
+    @contextlib.contextmanager
+    def hiding(self, *values: str) -> "Iterator[None]":
+        """Scrub ``values`` from anything this client reports, for the length of the block.
+
+        For a secret that belongs to one request rather than to the client. The Azure batch
+        path is the case it was written for: it hands the vendor OneDrive's
+        pre-authenticated download URL, which is a bearer capability to the recording — no
+        header, no token, anyone with the link has the audio — and the client's fixed secret
+        list holds only the Azure API key. A 4xx whose body echoes the request therefore
+        carried that URL verbatim into the exception, into ``last_error``, into the ledger
+        and into the 06:00 email.
+        """
+        keep = [v for v in values if isinstance(v, str) and len(v) >= 8]
+        self._transient.extend(keep)
+        try:
+            yield
+        finally:
+            for value in keep:
+                try:
+                    self._transient.remove(value)
+                except ValueError:  # pragma: no cover - only if something else cleared it
+                    pass
 
     # -- the one request method --------------------------------------------------
 
