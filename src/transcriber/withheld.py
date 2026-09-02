@@ -1096,19 +1096,55 @@ class WithheldStore:
                     "SELECT * FROM holds WHERE hold_id=?", (hold_id,)
                 ).fetchone()
                 if existing is not None:
-                    tx.execute(
-                        "UPDATE holds SET times_seen=times_seen+1 WHERE hold_id=?", (hold_id,)
-                    )
+                    # A shadow row says, in its own words, that "nothing was actually cut"
+                    # — that is what NOT_WITHHELD means. Once the gate is armed and this
+                    # same passage is classified again, that stops being true: the masker
+                    # cuts it, because masking works off the spans and the mode and never
+                    # consults this row. The row was then a hold that had happened and that
+                    # nobody could answer — absent from every queue, absent from the review
+                    # page, absent from the morning email, with the words gone from the
+                    # transcript and no way through the product to release them. That is the
+                    # gate emptying itself quietly, which is the one failure this design
+                    # exists to make impossible, arriving from the other direction.
+                    #
+                    # So an armed run promotes a shadow row to PENDING. This is the only
+                    # state a machine may set (see Decision), and it is the conservative
+                    # direction — it puts the passage IN FRONT OF a person, never past one.
+                    # A row a person has already answered is never touched: RELEASED and
+                    # REFUSED carry somebody's name and nothing here may overrule them.
+                    became = existing["decision"]
+                    promoted = mode == MODE_ON and existing["decision"] == Decision.NOT_WITHHELD
+                    if promoted:
+                        became = Decision.PENDING
+                        # held_at moves to now because now is when it was actually held. The
+                        # age on the review page is how long a person has been sitting on
+                        # it, and nobody could have been sitting on something that was not
+                        # in their queue.
+                        tx.execute(
+                            "UPDATE holds SET times_seen=times_seen+1, decision=?, mode=?, "
+                            "held_at=? WHERE hold_id=?",
+                            (Decision.PENDING, mode, stamp, hold_id),
+                        )
+                    else:
+                        tx.execute(
+                            "UPDATE holds SET times_seen=times_seen+1 WHERE hold_id=?", (hold_id,)
+                        )
                     self._event(
                         tx,
                         hold_id,
                         span.item_id,
-                        "seen-again",
+                        "armed" if promoted else "seen-again",
                         stamp,
                         actor="",
                         was=existing["decision"],
-                        became=existing["decision"],
-                        detail=f"classified again in mode {mode}; the decision is untouched",
+                        became=became,
+                        detail=(
+                            "the gate was armed after this passage was first seen in shadow, "
+                            "so the words are now actually cut and somebody has to answer for "
+                            "them; moved into the review queue and nothing was decided"
+                            if promoted else
+                            f"classified again in mode {mode}; the decision is untouched"
+                        ),
                     )
                     refreshed = tx.execute(
                         "SELECT * FROM holds WHERE hold_id=?", (hold_id,)
