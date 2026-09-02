@@ -698,7 +698,10 @@ def _disputed_items(ledger: Ledger) -> dict[str, str]:
     would act on it by moving the original.
     """
     try:
-        events = ledger.route_disagreements()
+        # Every one of them, not the newest two hundred. This is an exclusion set — the
+        # recordings this pass must NOT move — and a truncated exclusion set is worse than
+        # none, because it looks like a guard while letting the oldest disputes through.
+        events = ledger.route_disagreements(limit=None)
     except Exception as exc:  # noqa: BLE001 - a missing extra never fails the pass
         log.warning("could not read the route disagreements: %s", exc)
         return {}

@@ -1215,12 +1215,20 @@ class Ledger:
         return [dict(r) for r in records]
 
     def route_disagreements(
-        self, since: str | None = None, limit: int = 200
+        self, since: str | None = None, limit: int | None = 200
     ) -> list[dict[str, Any]]:
         """Recordings two routes have both claimed, newest first — read by somebody.
 
         ``since`` is a timestamp or a bare ``YYYY-MM-DD``; events at or after it are
-        returned. Omitted, the whole history comes back.
+        returned. Omitted, every disagreement since that point comes back.
+
+        ``limit`` caps the rows for the places that are *displaying* them — the status
+        table and the morning email, where two hundred is already more than anybody reads.
+        Pass ``None`` where the answer is used as a SET rather than a list: the archive
+        excludes disputed recordings from being moved, and a set that silently stops at two
+        hundred is not an exclusion, it is a guard that quietly lets the oldest ones
+        through — into the wrong route's archive folder, which is the exact outcome this
+        query exists to prevent.
 
         This exists because writing the event was not the same as reporting it. A
         disagreement means either a recording moved between watched folders or one route's
@@ -1236,8 +1244,8 @@ class Ledger:
             " items.state AS item_state"
             " FROM events LEFT JOIN items ON items.item_id = events.item_id"
             f" WHERE events.kind='route-disagreement'{clause}"
-            " ORDER BY events.id DESC LIMIT ?",
-            (*params, int(limit)),
+            " ORDER BY events.id DESC" + (" LIMIT ?" if limit is not None else ""),
+            (*params, *((int(limit),) if limit is not None else ())),
         ).fetchall()
         return [dict(r) for r in records]
 
