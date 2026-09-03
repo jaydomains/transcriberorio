@@ -137,7 +137,7 @@ class LedgerStateError(LedgerError):
     """An attempt to move a row somewhere the state machine does not allow."""
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Migrations run in order, each in its own transaction, each recorded. To add one: append
 # (2, "note", (sql, sql, ...)) below and raise SCHEMA_VERSION. Never edit an entry that has
@@ -245,6 +245,20 @@ _MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
             # namespace instead of fencing off a word. The value moves with the name so an
             # installation half way through backfilling its history does not start again.
             "UPDATE OR REPLACE cursors SET name='delta:backfill:default' WHERE name='delta:backfill'",
+        ),
+    ),
+    (
+        4,
+        "somebody may ask to be forgotten",
+        (
+            # Three columns rather than one JSON blob in meta, because these are the fields
+            # that must survive when meta itself is emptied — erasing a recording clears
+            # meta, and a tombstone that erased its own explanation would be worse than no
+            # tombstone at all.
+            "ALTER TABLE items ADD COLUMN erased_at TEXT",
+            "ALTER TABLE items ADD COLUMN erased_by TEXT",
+            "ALTER TABLE items ADD COLUMN erased_because TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_items_erased ON items(erased_at)",
         ),
     ),
 )
@@ -762,6 +776,95 @@ class Ledger:
             )
             self._event(conn, item_id, "advanced", now, was, state, _summarise(fields))
 
+    #: Everything on a row that describes the recording rather than the fact of it. Emptied
+    #: by :meth:`erase`. Listed here rather than inline so that a column added later is
+    #: noticed: :func:`transcriber.erase.columns_not_covered` walks the table against this
+    #: list and fails a test if something new holds content nobody thought to clear.
+    CONTENT_COLUMNS = (
+        "name", "etag", "web_url", "content_hash", "graph_hash", "last_error",
+        "quarantine_reason", "skipped_reason", "transcript_name", "summary_name",
+        "actions_name", "output_item_ids", "container", "language", "meta",
+    )
+
+    def erase(self, item_id: str, *, by: str, because: str) -> None:
+        """Empty a row of everything that described the recording, and say who asked.
+
+        The one write in this class that deliberately goes backwards. :meth:`advance`
+        refuses to move a DONE row anywhere else, for good reasons that do not apply here:
+        somebody has asked to be forgotten, and a finished recording is exactly the kind
+        that needs forgetting.
+
+        What is kept: the item id, the route, the dates it arrived and finished, its size
+        and duration, and the three erasure fields. What is gone: its name, the names of
+        its three output files, its hashes, its error text and its metadata. A person
+        reading the ledger afterwards can see that a recording existed and was removed on a
+        stated date at a stated person's request; they cannot see what it was.
+
+        ``by`` is a PERSON. Not a hostname, not "the service", not the empty string — the
+        same rule the sensitivity gate applies to releasing a held passage, and for the same
+        reason: an erasure nobody's name is on is an erasure nobody decided.
+        """
+        who = (by or "").strip()
+        why = (because or "").strip()
+        if not who:
+            raise LedgerError(
+                "erase() needs the name of the person who decided it. A recording removed "
+                "at nobody's request is indistinguishable from one lost to a bug."
+            )
+        if not why:
+            raise LedgerError("erase() needs the reason it was asked for")
+        now = utc_now_iso()
+        with self._tx() as conn:
+            current = conn.execute(
+                "SELECT state, name FROM items WHERE item_id=?", (item_id,)
+            ).fetchone()
+            if current is None:
+                raise LedgerError(f"no ledger row for {item_id!r}")
+            was = current["state"]
+            if was == State.ERASED:
+                return          # idempotent: erasing twice is not an error, it is a re-run
+            blanks = ", ".join(f"{c}=?" for c in self.CONTENT_COLUMNS)
+            # NULL where the column allows it, and the column's own empty value where it
+            # does not. Read off the table rather than listed here, so a NOT NULL added
+            # later cannot make an erasure fail at the moment somebody needs it to work.
+            notnull = {
+                r["name"]: (r["notnull"], r["dflt_value"])
+                for r in conn.execute("PRAGMA table_info(items)").fetchall()
+            }
+            empties: list[Any] = []
+            for column in self.CONTENT_COLUMNS:
+                required, default = notnull.get(column, (0, None))
+                if not required:
+                    empties.append(None)
+                elif default is not None:
+                    empties.append(str(default).strip("'"))
+                else:
+                    empties.append("")
+            conn.execute(
+                f"UPDATE items SET state=?, updated_at=?, {blanks},"
+                " erased_at=?, erased_by=?, erased_because=?,"
+                " claimed_by=NULL, lease_until=NULL WHERE item_id=?",
+                (State.ERASED, now, *empties, now, who, why, item_id),
+            )
+            # EVERY EARLIER EVENT'S DETAIL GOES TOO, and this is the half that is easy to
+            # miss. The row is not the only place the recording's name was written: the
+            # events table carries "discovered: Carel dismissal call.m4a" and, on the DONE
+            # event, all three output filenames. Emptying the row and leaving those would
+            # be an erasure that removed the record and kept the description of it — and
+            # the names here are often the most telling part, because a person names a
+            # recording after what it is about.
+            #
+            # The events themselves stay. What happened and when is the audit trail this
+            # tombstone exists to preserve; the detail is what described the recording.
+            conn.execute(
+                "UPDATE events SET detail=NULL WHERE item_id=? AND detail IS NOT NULL",
+                (item_id,),
+            )
+            # Written after the clearing, so this one keeps its detail: it carries WHO and
+            # WHY and never the name of what was removed.
+            self._event(conn, item_id, "erased", now, was, State.ERASED,
+                        f"at {who}'s request: {why}"[:400])
+
     def set_fields(self, item_id: str, **fields: Any) -> None:
         """Update fields without touching the state (archival stamps, hashes, metadata)."""
         if not fields:
@@ -912,11 +1015,16 @@ class Ledger:
         record = self._conn().execute("SELECT * FROM items WHERE item_id=?", (item_id,)).fetchone()
         return None if record is None else Row.from_db(record)
 
-    def find_by_name(self, needle: str, limit: int = 20) -> list[Row]:
+    def find_by_name(self, needle: str, limit: int | None = 20) -> list[Row]:
         """Recordings whose filename contains ``needle``, newest first.
 
         For the person at a terminal who has a filename and not a OneDrive item id. The
         morning email prints both, a few lines apart, and nobody retypes an id by hand.
+
+        ``limit=None`` means every match. That exists for ``transcriber forget``, where a
+        cap is not a convenience but a hazard: matching two hundred recordings, removing the
+        newest twenty and reporting success would tell somebody who asked to be forgotten
+        that they had been.
         """
         # Every LIKE metacharacter in the needle is escaped before the wildcards that make
         # this a "contains" search are put around it — backslash first, or it would escape
@@ -926,8 +1034,9 @@ class Ledger:
         escaped = raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         records = self._conn().execute(
             "SELECT * FROM items WHERE name LIKE ? ESCAPE '\\' "
-            "ORDER BY COALESCE(discovered_at, '') DESC LIMIT ?",
-            (f"%{escaped}%", int(limit)),
+            "ORDER BY COALESCE(discovered_at, '') DESC"
+            + ("" if limit is None else " LIMIT ?"),
+            (f"%{escaped}%",) if limit is None else (f"%{escaped}%", int(limit)),
         ).fetchall()
         return [Row.from_db(r) for r in records]
 
@@ -1001,6 +1110,20 @@ class Ledger:
             (name, name, name),
         ).fetchone()
         return None if record is None else str(record["item_id"])
+
+    def rows_in_route(self, route: str) -> list[Row]:
+        """Every row on one route, whatever state it is in, newest first.
+
+        For ``transcriber forget``, which is asked about a person rather than about a stage:
+        somebody who has asked to be forgotten does not care which of their recordings
+        happened to fail, and a selection that quietly skipped the quarantined ones would
+        leave behind exactly the recordings a person had already been told about.
+        """
+        records = self._conn().execute(
+            "SELECT * FROM items WHERE route=? ORDER BY COALESCE(discovered_at, '') DESC",
+            (route,),
+        ).fetchall()
+        return [Row.from_db(r) for r in records]
 
     def rows_in_state(self, state: str, route: str | None = None) -> list[Row]:
         clause, params = self._route_filter(route)

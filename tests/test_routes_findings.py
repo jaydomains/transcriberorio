@@ -40,7 +40,7 @@ from transcriber import routes_cmd
 from transcriber import sweep as sweep_module
 from transcriber.__main__ import BACKFILL_CURSOR, backfill_cursor_name, _route_status
 from transcriber.config import nested_folder_problems
-from transcriber.ledger import Ledger
+from transcriber.ledger import SCHEMA_VERSION, Ledger
 from transcriber.models import DriveItem, Route, State
 from transcriber.setup_wizard import _Folders, route_problems
 
@@ -570,14 +570,28 @@ class TheBackfillLaneCannotShareARoutesCursor(unittest.TestCase):
                 "half-way-through", cursor_name=BACKFILL_CURSOR,
             )
             conn = ledger._conn()
-            conn.execute("DELETE FROM schema_version WHERE version=3")
+            # Wind the database back to v2 properly, rather than relabelling a current one.
+            #
+            # Deleting only the v3 row worked while v3 was the newest migration, and stopped
+            # working the moment a v4 existed: migrate() compares against MAX(version), so a
+            # gap in the middle leaves the maximum untouched and the migration under test
+            # never re-runs. Deleting the rows from 3 up fixes that half — and then the
+            # columns v4 added are still there, so re-running it fails on a duplicate column.
+            # A v2 database does not have them, so neither does this one.
+            conn.execute("DELETE FROM schema_version WHERE version>=3")
+            conn.execute("DROP INDEX IF EXISTS idx_items_erased")
+            for column in ("erased_at", "erased_by", "erased_because"):
+                conn.execute(f"ALTER TABLE items DROP COLUMN {column}")
             conn.execute(
                 "UPDATE OR REPLACE cursors SET name=? WHERE name=?",
                 (BACKFILL_CURSOR, f"{BACKFILL_CURSOR}:default"),
             )
 
         with Ledger(path) as upgraded:
-            self.assertEqual(upgraded.schema_version(), 3)
+            # The constant, not a literal: this test is about a half-finished backfill
+            # surviving the upgrade, and pinning the number here made it fail every
+            # time a later migration was added, for a reason it does not care about.
+            self.assertEqual(upgraded.schema_version(), SCHEMA_VERSION)
             self.assertEqual(
                 upgraded.cursor_get(backfill_cursor_name("default")), "half-way-through"
             )

@@ -253,9 +253,24 @@ class State:
     DONE = "DONE"
     QUARANTINED = "QUARANTINED"
     SKIPPED_EMPTY = "SKIPPED_EMPTY"
+    #: Somebody asked us to forget this recording and a person carried it out. The row is
+    #: kept and everything on it that described the recording is gone: the name, the three
+    #: output names, the hashes, the error text, the metadata. What remains is that a
+    #: recording existed, when it arrived, that it was erased, by whom, and on what request.
+    #:
+    #: A tombstone rather than a deleted row, and both halves of that are deliberate. The
+    #: content is gone because that is what was asked for. The row stays because a record
+    #: with a hole in it where a thing used to be is worse than one that says "there was
+    #: something here and it was removed on this date at this person's request" — and
+    #: because a deleted row would be rediscovered as new the next time anything enumerated
+    #: the folder.
+    #:
+    #: NOT reachable through ``advance()``. Only ``Ledger.erase()`` sets it, and that
+    #: requires a person's name and a reason, the same way a released hold does.
+    ERASED = "ERASED"
 
     PIPELINE = (DISCOVERED, CLAIMED, FETCHED, TRANSCRIBED, ANALYSED, DONE)
-    TERMINAL = frozenset((DONE, QUARANTINED, SKIPPED_EMPTY))
+    TERMINAL = frozenset((DONE, QUARANTINED, SKIPPED_EMPTY, ERASED))
     ALL = frozenset(PIPELINE) | TERMINAL
     ACTIVE = frozenset(PIPELINE) - frozenset((DONE,))
 
@@ -430,6 +445,11 @@ class Row:
     actions_name: str | None = None
     output_item_ids: dict[str, str] = field(default_factory=dict)
     quarantine_reason: str | None = None
+    #: Set only by ``Ledger.erase``. ``erased_by`` is a PERSON's name, never a hostname and
+    #: never a process: the whole point of an erasure is that somebody decided it.
+    erased_at: str | None = None
+    erased_by: str | None = None
+    erased_because: str | None = None
     quarantined_at: str | None = None
     skipped_reason: str | None = None
     done_at: str | None = None

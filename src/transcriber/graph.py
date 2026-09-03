@@ -979,6 +979,34 @@ class GraphClient:
 
     # -- upload ------------------------------------------------------------
 
+    def delete(self, item_id: str) -> bool:
+        """Delete one item. True if it went, False if it was already gone.
+
+        **THIS MOVES THE FILE TO THE RECYCLE BIN. IT DOES NOT DESTROY IT.** Graph's DELETE
+        on a driveItem is what the web interface's delete button does: the file leaves the
+        folder and sits in the recycle bin, where OneDrive keeps it for around 30 days for a
+        personal account and up to 93 for a business one, and where an administrator can
+        restore it the whole time.
+
+        That is stated here, loudly, because the caller is the erasure path and the person
+        who asked to be forgotten deserves an accurate answer. "We deleted it" and "we put
+        it in a bin that empties itself in three months" are different sentences, and only
+        the second one is true until the bin is emptied. :mod:`transcriber.erase` prints
+        that in its report rather than letting the word "deleted" carry a meaning it has not
+        earned.
+
+        A 404 is success, not failure. Somebody asked for this to be gone; a file that was
+        already gone is the requested state, and treating it as an error would stop an
+        erasure part-way through on the one recording that needed no work.
+        """
+        try:
+            self._request("DELETE", self._item_base(item_id))
+        except GraphHTTPError as exc:
+            if exc.is_not_found:
+                return False
+            raise
+        return True
+
     def read_small(self, item_id: str, *, limit: int = SIMPLE_READ_LIMIT) -> bytes:
         """A small file's whole content, in memory. For status files and nothing bigger.
 

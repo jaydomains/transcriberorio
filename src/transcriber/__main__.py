@@ -219,6 +219,32 @@ def _parser() -> argparse.ArgumentParser:
                          help="why, recorded in the recording's history")
     requeue.set_defaults(handler=cmd_requeue)
 
+    forget = sub.add_parser(
+        "forget",
+        help="remove what is held about somebody, at their request — SHOWS first, asks second",
+    )
+    forget.add_argument("--name", default="", metavar="TEXT",
+                        help="recordings whose name contains this (a client, a job, a person)")
+    forget.add_argument("--route", default="", metavar="NAME",
+                        help="recordings that arrived on this route")
+    forget.add_argument("--id", dest="item_id", default="", metavar="ID",
+                        help="one recording, by its id")
+    forget.add_argument("--from", dest="since", default="", metavar="YYYY-MM-DD",
+                        help="recordings from this date onwards")
+    forget.add_argument("--to", dest="until", default="", metavar="YYYY-MM-DD",
+                        help="recordings up to and including this date")
+    forget.add_argument("--by", default="", metavar="NAME",
+                        help="the PERSON who decided this. Required to remove anything.")
+    forget.add_argument("--because", default="", metavar="TEXT",
+                        help="what was asked for, in a sentence. Required to remove anything.")
+    forget.add_argument(
+        "--really", action="store_true",
+        help="actually remove them. Without this the command only shows what it would do, "
+             "which is the default because this is the one thing here that re-running "
+             "cannot undo.",
+    )
+    forget.set_defaults(handler=cmd_forget)
+
     status = sub.add_parser("status", help="what is known, done, failed, and when it last worked")
     status.add_argument("--json", dest="as_json", action="store_true")
     status.add_argument("--day", default=None, help="the day to count (YYYY-MM-DD, default today)")
@@ -1179,6 +1205,158 @@ def _gate_readiness(mode: str, measured: Mapping[str, Any]) -> list[str]:
 
 
 # --------------------------------------------------------------------------- status
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    """Show what would be forgotten; remove it only when told to, twice.
+
+    Dry by default, and that is not politeness. Everything else in this service is safe to
+    re-run — a requeue, a sweep, an archive pass all converge on the same answer however
+    many times they happen. This one does not. So the default prints and the removal needs
+    ``--really`` plus a person's name plus a reason, and the three are checked separately so
+    a half-typed command cannot half-work.
+    """
+    from . import erase as erase_module
+
+    config, ledger, graph_factory = _service(args)
+    with ledger:
+        try:
+            rows = _forget_selection(ledger, args)
+        except ValueError as exc:
+            print(f"REFUSED: {exc}")
+            return 2
+        if not rows:
+            print("Nothing matches. Nothing has been removed.")
+            print()
+            print("  Try `transcriber status --item <id>` or widen the search. A `forget`")
+            print("  that matched nothing is not the same as one that removed nothing:")
+            print("  check the search before deciding it is done.")
+            return 0
+
+        asked = _forget_asked(args)
+        plan = erase_module.plan(ledger, rows=rows, asked=asked)
+        _print_forget_plan(plan)
+
+        if not args.really:
+            print("NOTHING HAS BEEN REMOVED. This was a look.")
+            print()
+            print("  To carry it out, run the same command again with:")
+            print("    --really --by \"<your name>\" --because \"<what was asked>\"")
+            return 0
+
+        who, why = (args.by or "").strip(), (args.because or "").strip()
+        if not who or not why:
+            print("REFUSED, and nothing has been removed.")
+            print()
+            print("  --really needs both --by and --because. A recording removed at nobody's")
+            print("  request cannot be told apart from one lost to a bug, and in a year the")
+            print("  difference is the only thing that will matter.")
+            return 2
+
+        client = graph_factory
+        store = _held_store(config)
+        result = erase_module.erase(ledger, plan, by=who, because=why,
+                                    client=client, held_store=store)
+        _print_forget_result(result)
+        return 0 if result.ok else 1
+
+
+def _forget_selection(ledger: Any, args: argparse.Namespace) -> list:
+    """The rows a `forget` matched. Every filter narrows; none of them widens.
+
+    Unlimited on purpose. A capped search here would remove the newest twenty of somebody's
+    two hundred recordings and report that they had been forgotten.
+    """
+    if args.item_id:
+        row = ledger.get(args.item_id)
+        return [row] if row else []
+    if not args.name and not args.route:
+        # A bare `forget` does not mean "everything". Dates alone do not narrow either: a
+        # --from in 2020 is every recording there has ever been, typed in a way that does
+        # not look like it. One of --id, --name or --route, always.
+        raise ValueError(
+            "say WHICH recordings: --id, --name or --route. Dates on their own are not a "
+            "selection, and there is deliberately no way to spell 'forget everything'."
+        )
+    rows = ledger.find_by_name(args.name, limit=None) if args.name else ledger.rows_in_route(args.route)
+    if args.route:
+        rows = [r for r in rows if getattr(r, "route", "") == args.route]
+    if args.since:
+        rows = [r for r in rows if str(getattr(r, "created_at", "") or
+                                       getattr(r, "discovered_at", "") or "") >= args.since]
+    if args.until:
+        rows = [r for r in rows if str(getattr(r, "created_at", "") or
+                                       getattr(r, "discovered_at", "") or "")[:10] <= args.until]
+    return list(rows)
+
+
+def _forget_asked(args: argparse.Namespace) -> str:
+    parts = []
+    if args.item_id:
+        parts.append(f"the recording {args.item_id}")
+    if args.name:
+        parts.append(f"recordings named like {args.name!r}")
+    if args.route:
+        parts.append(f"on the {args.route} route")
+    if args.since:
+        parts.append(f"from {args.since}")
+    if args.until:
+        parts.append(f"to {args.until}")
+    return ", ".join(parts) or "everything"
+
+
+def _print_forget_plan(plan: Any) -> None:
+    print(f"WHAT WOULD BE FORGOTTEN — {plan.asked}")
+    print("-" * 66)
+    print(f"  recordings                 {plan.recordings}")
+    print(f"  files in OneDrive          {plan.files}")
+    print()
+    for candidate in plan.candidates[:20]:
+        print(f"  {candidate.recorded_at[:10]:<12} {candidate.name[:44]:<44} "
+              f"{candidate.reach} file(s)")
+    if plan.recordings > 20:
+        print(f"  ... and {plan.recordings - 20} more")
+    print()
+    missing = plan.unreachable_outputs
+    if missing:
+        print("  THESE PUBLISHED FILES CANNOT BE REMOVED BY THIS COMMAND")
+        print("  (their ids were never recorded, so there is nothing to delete them by):")
+        for name in missing[:10]:
+            print(f"    {name}")
+        print()
+
+
+def _print_forget_result(result: Any) -> None:
+    print()
+    print(f"FORGOTTEN — at {result.by}'s decision, {result.at[:10]}")
+    print("-" * 66)
+    print(f"  recordings                 {result.recordings}")
+    print(f"  files deleted              {result.files_deleted}")
+    print(f"  files already gone         {result.files_already_gone}")
+    print(f"  held passages emptied      {result.held_forgotten}")
+    if result.files_refused:
+        print()
+        print("  SOME FILES WOULD NOT DELETE, so those recordings were left alone and can")
+        print("  be re-run. Nothing was half-removed:")
+        for line in result.files_refused[:10]:
+            print(f"    {line}")
+    print()
+    print("  WHAT THIS DID NOT REACH — somebody still has to deal with these:")
+    print()
+    print("    The OneDrive recycle bin. Deleting a file puts it there, where it stays")
+    print("    for up to 93 days and can be restored by an administrator the whole time.")
+    print("    Until that bin is emptied, the recording is not gone.")
+    print()
+    if result.still_in_the_record:
+        print("    The site record. It ingested these and derived documents from them,")
+        print("    and this service is only allowed to read it:")
+        for name in result.still_in_the_record[:10]:
+            print(f"      {name}")
+        if len(result.still_in_the_record) > 10:
+            print(f"      ... and {len(result.still_in_the_record) - 10} more")
+        print()
+    print("    Anything already sent. A morning email, a transcript somebody saved.")
+    print()
 
 
 def cmd_requeue(args: argparse.Namespace) -> int:
