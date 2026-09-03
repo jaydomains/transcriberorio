@@ -904,6 +904,91 @@ def route_precheck(
 
 
 @dataclass(frozen=True)
+class Spend:
+    """What one model call used, as the provider reported it.
+
+    TOKENS, NOT MONEY, and that is the whole point of this class. A token count is a fact
+    the API told us about a request that happened. A rand or dollar figure is that fact
+    multiplied by a price list which changes without telling us, and which nothing here can
+    verify. Storing the money would mean a number in the record that quietly stops being
+    true; storing the tokens means the arithmetic can be redone whenever the prices move.
+    The morning email does that multiplication and names the price list it used.
+
+    ``cache_write`` costs more than ordinary input and ``cache_read`` costs much less, so
+    they are kept apart rather than folded into ``input``: a summary that added them
+    together would report the same number whether the cache was working or not.
+    """
+
+    model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "input": self.input_tokens,
+            "output": self.output_tokens,
+            "cache_read": self.cache_read_tokens,
+            "cache_write": self.cache_write_tokens,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "Spend":
+        return cls(
+            model=str(raw.get("model") or ""),
+            input_tokens=_whole(raw.get("input")),
+            output_tokens=_whole(raw.get("output")),
+            cache_read_tokens=_whole(raw.get("cache_read")),
+            cache_write_tokens=_whole(raw.get("cache_write")),
+        )
+
+
+def _whole(value: Any) -> int:
+    """A token count, or zero. Never raises: a usage block is telemetry, and a provider
+    that starts sending a float or a string there must not fail a recording."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def spend_of(model: str, usage: Mapping[str, Any] | None) -> Spend:
+    """One provider's usage block, read into the same shape.
+
+    Anthropic reports ``input_tokens`` / ``output_tokens`` with cache counts beside them;
+    OpenAI reports ``prompt_tokens`` / ``completion_tokens`` and hides the cached share
+    inside ``prompt_tokens_details``. Both are accepted, and anything unrecognised reads as
+    zero rather than as an error - a meter that could stop a transcription would be worse
+    than no meter.
+
+    OpenAI's ``prompt_tokens`` INCLUDES its cached tokens, where Anthropic's does not, so
+    the cached share is subtracted out here. Without that the same recording would look
+    more expensive on one provider than the other for no reason but the reporting.
+    """
+    raw = dict(usage or {})
+    if "input_tokens" in raw or "output_tokens" in raw:
+        return Spend(
+            model=model,
+            input_tokens=_whole(raw.get("input_tokens")),
+            output_tokens=_whole(raw.get("output_tokens")),
+            cache_read_tokens=_whole(raw.get("cache_read_input_tokens")),
+            cache_write_tokens=_whole(raw.get("cache_creation_input_tokens")),
+        )
+    prompt = _whole(raw.get("prompt_tokens"))
+    cached = _whole((raw.get("prompt_tokens_details") or {}).get("cached_tokens")
+                    if isinstance(raw.get("prompt_tokens_details"), Mapping) else 0)
+    return Spend(
+        model=model,
+        input_tokens=max(prompt - cached, 0),
+        output_tokens=_whole(raw.get("completion_tokens")),
+        cache_read_tokens=cached,
+    )
+
+
+@dataclass(frozen=True)
 class Routing:
     """Where a recording was sent, why, and who said so."""
 
@@ -917,6 +1002,9 @@ class Routing:
     escalated: bool = False                      # the model said trivial and was overridden
     model: str = ""
     notes: tuple[str, ...] = ()
+    #: What the router call used. ``None`` when the router was never reached, which is a
+    #: different fact from "used nothing" and is why this is not a zeroed Spend.
+    spend: "Spend | None" = None
 
     @property
     def substantive(self) -> bool:
@@ -1069,6 +1157,9 @@ class Extraction:
     notes: tuple[str, ...] = ()
     models_used: tuple[str, ...] = ()
     usage: dict[str, Any] = field(default_factory=dict)
+    #: One entry per model call this recording actually made - the router and, when it was
+    #: read in full, the reader. A trivial recording has one entry, not none.
+    spend: tuple[Spend, ...] = ()
     elapsed_s: float = 0.0
     analysed_at: str = ""
     trivial: bool = False
@@ -1281,9 +1372,15 @@ class Extractor:
                 escalated=True,
                 model=self.settings.model_cheap,
                 notes=tuple(notes),
+                spend=None,   # nothing was spent: the call did not land
             )
 
         body = payload.get("data") or {}
+        # The router's usage used to be dropped on the floor here. It is the cheaper of the
+        # two calls but it runs on EVERY recording, including the trivial ones the reader
+        # never sees, so a meter without it undercounts exactly the recordings that cost
+        # least to analyse and are most numerous.
+        router_spend = spend_of(self.settings.model_cheap, payload.get("usage"))
         model_label = str(body.get("label") or "").strip().lower()
         model_reason = strip_emails(str(body.get("reason") or "").strip())
         one_line = strip_emails(str(body.get("one_line") or "").strip())
@@ -1320,6 +1417,7 @@ class Extractor:
             escalated=escalated,
             model=self.settings.model_cheap,
             notes=tuple(notes),
+            spend=router_spend,
         )
 
     def extract(
@@ -1359,6 +1457,8 @@ class Extractor:
                 elapsed_s=time.monotonic() - started,
                 analysed_at=utc_now_iso(),
                 trivial=True,
+                # A trivial recording still cost a router call. One entry, not none.
+                spend=(routing.spend,) if routing.spend else (),
             )
 
         routing_note = _join(f"{t.category}" for t in routing.triggers)
@@ -1384,6 +1484,8 @@ class Extractor:
         extraction.notes = tuple(notes) + extraction.notes
         extraction.models_used = tuple(models_used)
         extraction.usage = usage
+        reader_spend = spend_of(self.settings.model_strong, usage)
+        extraction.spend = tuple(x for x in (routing.spend, reader_spend) if x)
         extraction.elapsed_s = time.monotonic() - started
         extraction.analysed_at = utc_now_iso()
         if extraction.review:

@@ -59,6 +59,8 @@ from . import release as release_module
 from . import sitebook
 from .heartbeat import Heartbeat, PingResult
 from .ledger import Ledger
+from . import prices
+from .extract import Spend
 from .models import (
     DEFAULT_ROUTE,
     DigestCounts,
@@ -1494,6 +1496,10 @@ class Digest:
     #: The held-passage queue and, while the gate ships dark, the measurement. Counts, sites
     #: and ages — never a word of what anybody said.
     held: HeldReport = field(default_factory=HeldReport)
+    #: What the analysis pass cost. Carried on the digest rather than only rendered into the
+    #: body, because the group email needs the figure and must not parse it back out of
+    #: somebody's prose.
+    spend: "SpendReport" = field(default_factory=lambda: SpendReport())
 
     @property
     def needs_a_person(self) -> bool:
@@ -1553,6 +1559,111 @@ class DigestResult:
 # --------------------------------------------------------------------------- building
 
 
+@dataclass
+class SpendReport:
+    """What the analysis pass cost, for the day and for the month it sits in.
+
+    A METER, NOT A BRAKE. Nothing here stops anything: it was asked for as a number to
+    look at, and a ceiling that paused the reading was considered and not chosen. So this
+    reports and returns, and there is no code path from this dataclass to a decision.
+
+    Both a day and a month, because either alone misleads. One day says nothing about the
+    trend and every day looks small; a month-to-date figure on the 2nd looks like nothing
+    and on the 28th looks alarming with no way to tell which. Together they answer "is
+    today normal" and "where will the month land".
+    """
+
+    day: str = ""
+    day_usd: float = 0.0
+    day_recordings: int = 0
+    month: str = ""
+    month_usd: float = 0.0
+    month_recordings: int = 0
+    month_calls: int = 0
+    #: Tokens for the month, split the way they are billed. The reader's output is normally
+    #: three quarters of the bill, and that is only visible if output is kept apart.
+    month_input: int = 0
+    month_output: int = 0
+    month_cache_read: int = 0
+    month_cache_write: int = 0
+    #: Models this deployment used that the price list has no entry for. Their tokens are
+    #: counted and their money is NOT, so a non-empty list means every figure above is an
+    #: undercount, and the section says so rather than printing a total that looks whole.
+    unpriced: tuple[str, ...] = ()
+    priced_on: str = ""
+
+    @property
+    def projected_month_usd(self) -> float:
+        """Where the month lands if the rest of it looks like the part measured.
+
+        Straight-line from the days elapsed. Crude on purpose and labelled as such in the
+        email - a builder's month is not uniform, and a cleverer projection would be a
+        guess with better presentation.
+        """
+        try:
+            elapsed = int(self.day.split("-")[2])
+        except (IndexError, ValueError):
+            return 0.0
+        if elapsed < 1:
+            return 0.0
+        return self.month_usd / elapsed * 30.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "day": self.day,
+            "day_usd": round(self.day_usd, 4),
+            "day_recordings": self.day_recordings,
+            "month": self.month,
+            "month_usd": round(self.month_usd, 4),
+            "month_recordings": self.month_recordings,
+            "month_calls": self.month_calls,
+            "month_tokens": {
+                "input": self.month_input,
+                "output": self.month_output,
+                "cache_read": self.month_cache_read,
+                "cache_write": self.month_cache_write,
+            },
+            "projected_month_usd": round(self.projected_month_usd, 2),
+            "unpriced": list(self.unpriced),
+            "priced_on": self.priced_on,
+        }
+
+
+def spend_report(config: Any, ledger: Ledger, *, day: str) -> SpendReport:
+    """Read the recorded token counts and price them. Reads only."""
+    month = day[:7] if len(day) >= 7 else ""
+    since = f"{month}-01" if month else day
+    try:
+        rows = ledger.spend_since(since)
+    except Exception:  # noqa: BLE001 - a meter must never be the reason an email fails
+        log.warning("the spend meter could not read the ledger; the email omits it")
+        return SpendReport(day=day, month=month, priced_on=prices.CHECKED_ON)
+
+    report = SpendReport(day=day, month=month, priced_on=prices.CHECKED_ON)
+    unpriced: list[str] = []
+    for row in rows:
+        calls = [Spend.from_dict(c) for c in row.get("calls") or ()]
+        if not calls:
+            continue
+        amount, missing = prices.cost_of_all(calls)
+        for name in missing:
+            if name not in unpriced:
+                unpriced.append(name)
+        report.month_usd += amount
+        report.month_recordings += 1
+        report.month_calls += len(calls)
+        for call in calls:
+            report.month_input += call.input_tokens
+            report.month_output += call.output_tokens
+            report.month_cache_read += call.cache_read_tokens
+            report.month_cache_write += call.cache_write_tokens
+        if str(row.get("at") or "").startswith(day):
+            report.day_usd += amount
+            report.day_recordings += 1
+    report.unpriced = tuple(unpriced)
+    return report
+
+
 def build(
     config: Any,
     ledger: Ledger,
@@ -1587,6 +1698,7 @@ def build(
     held = held_report(config, ledger, day=target, now=utc_now_iso(clock))
     disagreements = route_disagreements(ledger, target)
     naming = naming_report(config, ledger, day=target)
+    spend = spend_report(config, ledger, day=target)
     if sweep_report is None:
         sweep_report = _stored_report(ledger, "sweep")
     if archive_report is None:
@@ -1597,6 +1709,7 @@ def build(
     body = _render(
         config,
         counts,
+        spend=spend,
         subject=subject,
         moment=moment,
         today_failures=today_failures,
@@ -1661,6 +1774,7 @@ def build(
         route_disagreements=disagreements,
         queue=queue,
         held=held,
+        spend=spend,
     )
 
 
@@ -1913,6 +2027,7 @@ def _render(
     service_error: str = "",
     attention: Mapping[str, Any] | None = None,
     expiries: Sequence[tuple[int, str]] = (),
+    spend: "SpendReport | None" = None,
 ) -> str:
     lines: list[str] = [subject, ""]
 
@@ -2018,6 +2133,11 @@ def _render(
         f"  finished yesterday (whenever they arrived): {counts.done_on_day}",
         "",
     ]
+
+    # Directly under the counts, because it is the same cohort measured in money. Nothing
+    # in this section stops anything - it is a meter, and it was asked for as one.
+    if spend is not None and (spend.month_calls or spend.unpriced):
+        lines += _spend_section(spend)
 
     # Directly under the counts, because it is the sentence that stops "still in progress"
     # above from being read as "lost". A queue is work in hand; the failures are above and
@@ -2133,6 +2253,82 @@ def _render(
         "commitments and questions as proposals for you to confirm.",
     ]
     return "\n".join(lines)
+
+
+def _spend_section(spend: "SpendReport") -> list[str]:
+    """What the AI pass cost. Reports; decides nothing; stops nothing.
+
+    The provenance line is not decoration. The setup guide told him this cost "a few
+    dollars a month" when it was nearer eighty, and the reason nobody caught it is that the
+    figure carried no date and no workings. Every figure here says which price list it came
+    from and when that list was read, so a stale number is visible rather than trusted.
+    """
+    lines = ["WHAT THE AI PASS COST", _RULE]
+    lines.append(f"  yesterday                {_usd(spend.day_usd)}   "
+                 f"({spend.day_recordings} recording{'' if spend.day_recordings == 1 else 's'})")
+    lines.append(f"  this month so far        {_usd(spend.month_usd)}   "
+                 f"({spend.month_recordings} recording{'' if spend.month_recordings == 1 else 's'}, "
+                 f"{spend.month_calls} model call{'' if spend.month_calls == 1 else 's'})")
+    projected = spend.projected_month_usd
+    if projected:
+        lines.append(f"  the month at this rate   {_usd(projected)}   "
+                     "(straight-line, and a month of building is not straight)")
+    lines.append("")
+
+    total_tokens = (spend.month_input + spend.month_output
+                    + spend.month_cache_read + spend.month_cache_write)
+    if total_tokens:
+        # Tokens, and named as such. Calling them words would overstate the reading by
+        # about a third, and it is exactly the sort of figure that gets repeated.
+        lines.append("  what was read and written this month, in tokens")
+        lines.append("  (a token is roughly three quarters of a word)")
+        lines.append(f"    sent to the model            {spend.month_input:>12,}")
+        lines.append(f"    it wrote back                {spend.month_output:>12,}")
+        if spend.month_cache_read or spend.month_cache_write:
+            lines.append(f"    re-read from cache, cheaply  {spend.month_cache_read:>12,}")
+            if spend.month_cache_write:
+                lines.append(f"    put into the cache           {spend.month_cache_write:>12,}")
+        # The reader's answers are normally most of the bill, and that is the one line here
+        # that suggests what to change if the figure ever matters.
+        if spend.month_output:
+            lines.append("")
+            for chunk in _wrap(
+                "What it writes back costs five times what it reads, so the middle line is "
+                "usually most of the bill. If this ever needs to come down, that is the "
+                "number to aim at - not the number of recordings."
+            ):
+                lines.append(f"  {chunk}")
+        lines.append("")
+
+    if spend.unpriced:
+        # Said loudly, because every figure above is an undercount when this fires and a
+        # total that quietly omits a model reads exactly like a total that includes it.
+        for chunk in _wrap(
+            "EVERY FIGURE ABOVE IS AN UNDERCOUNT. This deployment used "
+            + ", ".join(spend.unpriced)
+            + ", which the price list has no entry for, so those calls are counted and not "
+              "costed. Tell me and I will add them; until then the real figure is higher "
+              "than the one above by however much they came to."
+        ):
+            lines.append(f"  {chunk}")
+        lines.append("")
+
+    for chunk in _wrap(
+        f"What is recorded against each recording is the tokens it used; the money is "
+        f"worked out when this email is written, from the published rates as they stood on "
+        f"{spend.priced_on}. If those rates have moved, this figure has moved with them and "
+        f"the token counts are still right. Nothing here stops anything: it is a meter."
+    ):
+        lines.append(f"  {chunk}")
+    lines.append("")
+    return lines
+
+
+def _usd(amount: float) -> str:
+    """Money, at a precision that does not pretend to more than it knows."""
+    if amount and amount < 0.01:
+        return "under $0.01"
+    return f"${amount:,.2f}"
 
 
 def _held_section(held: "HeldReport") -> list[str]:
@@ -2267,6 +2463,164 @@ def _personalised(body: str, base_url: str, link: str) -> str:
     return body.replace(marker, f"Answer them here: {link}")
 
 
+def _deliver(
+    config: Any,
+    outgoing: Sequence[EmailMessage],
+    *,
+    host: str,
+    port: int,
+    smtp_factory: Callable[..., Any] | None,
+    primary_count: int,
+    log_subject: str,
+    what: str = "the morning digest",
+) -> SendResult:
+    """Open one connection, send each message on its own, and report honestly.
+
+    Shared by the personal digest and the group email so the lessons in here are learned
+    once. They were expensive: see the long comment below about the morning this loop sent
+    seventy-two copies of the same email.
+
+    ``primary_count`` is how many of ``outgoing`` are the main recipients; anything after
+    that index is counted as a reviewer in the result. ``what`` names the mail in the log
+    lines, because "the morning digest could not be sent" about the group email would send
+    somebody looking at the wrong thing.
+    """
+    scrub = getattr(config, "scrub", None)
+
+    def _said(exc: Exception) -> str:
+        detail = f"{type(exc).__name__}: {exc}"
+        return scrub(detail) if callable(scrub) else detail
+
+    def _temporary(exc: Exception) -> bool:
+        """Whether the relay said "not now" rather than "not ever".
+
+        A 4xx is greylisting or a full mailbox: the address is fine and tomorrow will
+        probably work. A 5xx is a mailbox that is gone. Both are reported; they are worth
+        telling apart because one is somebody's job to fix and the other is the mail system
+        doing what it does.
+        """
+        codes: list[int] = []
+        answers = getattr(exc, "recipients", None)
+        if isinstance(answers, dict):
+            for answer in answers.values():
+                try:
+                    codes.append(int(answer[0]))
+                except (TypeError, ValueError, IndexError):
+                    pass
+        code = getattr(exc, "smtp_code", None)
+        if isinstance(code, int):
+            codes.append(code)
+        return bool(codes) and all(400 <= c < 500 for c in codes)
+
+    # One address the relay will not take must not stop the others. It used to: every
+    # message went inside one try, so a mailbox deleted when somebody left aborted the loop
+    # at that address. Everyone earlier in the list had already received the email, everyone
+    # later got nothing, and the whole send reported ok=False — which leaves DIGEST_DAY_MARK
+    # unwritten, so `should_run` fires again fifteen minutes later and sends the same email
+    # to the same people. Roughly seventy-two copies before midnight, every day, while the
+    # log and the monitor both said it could not be sent. That is the mail loop RETRY_AFTER_S
+    # was written to prevent, arriving as delivered mail rather than as retries.
+    #
+    # With the gate armed it also silently skipped every reviewer sorted after the bad
+    # address, so people never got the link to passages waiting on them, and nothing recorded
+    # who was missed.
+    refused: list[str] = []
+    delivered_recipients = 0
+    delivered_reviewers = 0
+    try:
+        with _connect(config, host, port, smtp_factory) as server:
+            for index, message in enumerate(outgoing):
+                try:
+                    server.send_message(message)
+                except Exception as exc:  # noqa: BLE001 - one address, not the whole morning
+                    when = "temporarily" if _temporary(exc) else "permanently"
+                    refused.append(f"{message['To']} ({when} — {_said(exc)})")
+                    continue
+                if index < primary_count:
+                    delivered_recipients += 1
+                else:
+                    delivered_reviewers += 1
+    except Exception as exc:  # noqa: BLE001 - the connection itself; nothing went out
+        detail = _said(exc)
+        # ERROR, not WARNING: an unsendable digest is the failure mode this service exists
+        # to remove, and it must be loud even though nothing raises.
+        log.error("%s could NOT be sent via %s:%s — %s", what, host, port, detail)
+        return SendResult(ok=False, detail=detail, recipients=primary_count, host=host)
+
+    if refused:
+        # Loud, and named — but NOT a failed send, because the people who were reachable have
+        # the email in their hands and must not be sent it again every quarter of an hour.
+        #
+        # The cost of that choice, stated rather than hidden: an address refused TEMPORARILY
+        # — greylisting, a full mailbox — misses this one morning rather than being retried,
+        # because retrying means re-sending to everyone who already has it. The alternative
+        # was the mail loop this replaced, which sent Jay seventy-two copies. The word
+        # "temporarily" in the line below is what tells a person which of the two happened,
+        # and tomorrow's send is the retry.
+        log.error(
+            "%s was refused for %d address(es) via %s:%s — %s",
+            what, len(refused), host, port, "; ".join(refused),
+        )
+    if not delivered_recipients and not delivered_reviewers:
+        # Nobody at all got it. That is a failed morning however the relay phrased it.
+        return SendResult(
+            ok=False, detail="; ".join(refused) or "no message was accepted",
+            recipients=primary_count, host=host,
+        )
+
+    log.info(
+        "%s sent to %d recipient(s) and %d reviewer(s) via %s:%s — %s",
+        what, delivered_recipients, delivered_reviewers, host, port, log_subject,
+    )
+    return SendResult(
+        ok=True,
+        detail="; ".join(refused),
+        recipients=delivered_recipients,
+        host=host,
+        reviewers=delivered_reviewers,
+    )
+
+
+def send_group(
+    config: Any,
+    subject: str,
+    body: str,
+    *,
+    smtp_factory: Callable[..., Any] | None = None,
+) -> SendResult:
+    """Send the one consolidated email to whoever is configured as the admin.
+
+    Separate from :func:`send` and not a mode of it, because the two have different
+    recipients and a different rule about what may be in the body. The personal digest
+    carries a review link, which is a capability belonging to one person; the group email
+    carries counts about everybody and so must never carry a link at all. Sharing one
+    function would mean one edit away from mailing everyone's capability to the admin.
+    """
+    recipients = tuple(getattr(config, "group_admin_to", ()) or ())
+    host = str(getattr(config, "smtp_host", "") or "")
+    port = int(getattr(config, "smtp_port", 587) or 587)
+    if not recipients or not host:
+        return SendResult(ok=False, detail="no group admin recipient is configured",
+                          recipients=0, host=host)
+
+    sender = str(getattr(config, "smtp_from", "") or "")
+    outgoing = []
+    for who in recipients:
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = sender
+        message["To"] = who
+        message["Date"] = formatdate(localtime=True)
+        message["Message-ID"] = make_msgid()
+        message["Auto-Submitted"] = "auto-generated"
+        message.set_content(body, subtype="plain", charset="utf-8")
+        outgoing.append(message)
+    return _deliver(
+        config, outgoing, host=host, port=port, smtp_factory=smtp_factory,
+        primary_count=len(recipients), log_subject=subject, what="the group email",
+    )
+
+
 def send(
     config: Any,
     digest: Digest,
@@ -2319,99 +2673,9 @@ def send(
                   _own_queue_subject(digest, who))
         )
 
-    scrub = getattr(config, "scrub", None)
-
-    def _said(exc: Exception) -> str:
-        detail = f"{type(exc).__name__}: {exc}"
-        return scrub(detail) if callable(scrub) else detail
-
-    def _temporary(exc: Exception) -> bool:
-        """Whether the relay said "not now" rather than "not ever".
-
-        A 4xx is greylisting or a full mailbox: the address is fine and tomorrow will
-        probably work. A 5xx is a mailbox that is gone. Both are reported; they are worth
-        telling apart because one is somebody's job to fix and the other is the mail system
-        doing what it does.
-        """
-        codes: list[int] = []
-        recipients = getattr(exc, "recipients", None)
-        if isinstance(recipients, dict):
-            for answer in recipients.values():
-                try:
-                    codes.append(int(answer[0]))
-                except (TypeError, ValueError, IndexError):
-                    pass
-        code = getattr(exc, "smtp_code", None)
-        if isinstance(code, int):
-            codes.append(code)
-        return bool(codes) and all(400 <= c < 500 for c in codes)
-
-    # One address the relay will not take must not stop the others. It used to: every
-    # message went inside one try, so a mailbox deleted when somebody left aborted the loop
-    # at that address. Everyone earlier in the list had already received the email, everyone
-    # later got nothing, and the whole send reported ok=False — which leaves DIGEST_DAY_MARK
-    # unwritten, so `should_run` fires again fifteen minutes later and sends the same email
-    # to the same people. Roughly seventy-two copies before midnight, every day, while the
-    # log and the monitor both said it could not be sent. That is the mail loop RETRY_AFTER_S
-    # was written to prevent, arriving as delivered mail rather than as retries.
-    #
-    # With the gate armed it also silently skipped every reviewer sorted after the bad
-    # address, so people never got the link to passages waiting on them, and nothing recorded
-    # who was missed.
-    refused: list[str] = []
-    delivered_recipients = 0
-    delivered_reviewers = 0
-    try:
-        with _connect(config, host, port, smtp_factory) as server:
-            for index, message in enumerate(outgoing):
-                try:
-                    server.send_message(message)
-                except Exception as exc:  # noqa: BLE001 - one address, not the whole morning
-                    when = "temporarily" if _temporary(exc) else "permanently"
-                    refused.append(f"{message['To']} ({when} — {_said(exc)})")
-                    continue
-                if index < len(recipients):
-                    delivered_recipients += 1
-                else:
-                    delivered_reviewers += 1
-    except Exception as exc:  # noqa: BLE001 - the connection itself; nothing went out
-        detail = _said(exc)
-        # ERROR, not WARNING: an unsendable digest is the failure mode this service exists
-        # to remove, and it must be loud even though nothing raises.
-        log.error("the morning digest could NOT be sent via %s:%s — %s", host, port, detail)
-        return SendResult(ok=False, detail=detail, recipients=len(recipients), host=host)
-
-    if refused:
-        # Loud, and named — but NOT a failed send, because the people who were reachable have
-        # the email in their hands and must not be sent it again every quarter of an hour.
-        #
-        # The cost of that choice, stated rather than hidden: an address refused TEMPORARILY
-        # — greylisting, a full mailbox — misses this one morning rather than being retried,
-        # because retrying means re-sending to everyone who already has it. The alternative
-        # was the mail loop this replaced, which sent Jay seventy-two copies. The word
-        # "temporarily" in the line below is what tells a person which of the two happened,
-        # and tomorrow's send is the retry.
-        log.error(
-            "the morning digest was refused for %d address(es) via %s:%s — %s",
-            len(refused), host, port, "; ".join(refused),
-        )
-    if not delivered_recipients and not delivered_reviewers:
-        # Nobody at all got it. That is a failed morning however the relay phrased it.
-        return SendResult(
-            ok=False, detail="; ".join(refused) or "no message was accepted",
-            recipients=len(recipients), host=host,
-        )
-
-    log.info(
-        "morning digest sent to %d recipient(s) and %d reviewer(s) via %s:%s — %s",
-        delivered_recipients, delivered_reviewers, host, port, digest.subject,
-    )
-    return SendResult(
-        ok=True,
-        detail="; ".join(refused),
-        recipients=delivered_recipients,
-        host=host,
-        reviewers=delivered_reviewers,
+    return _deliver(
+        config, outgoing, host=host, port=port, smtp_factory=smtp_factory,
+        primary_count=len(recipients), log_subject=digest.subject,
     )
 
 
@@ -2532,7 +2796,78 @@ def run(
         # thing worse than a broken morning is a broken morning nobody hears about.
         ping = monitor.fail(f"the morning digest could not be sent: {sent.detail}")
 
+    # --- the group view, strictly last ---------------------------------------------
+    # Everything above has happened: the email is sent, the day is marked, the monitor is
+    # told. Nothing below may change any of that. One person running this alone does none
+    # of it, because INSTANCE_NAME and GROUP_FOLDER_ID are unset and `_group_step` returns
+    # on the first line.
+    _group_step(config, digest, smtp_factory=smtp_factory, now=clock)
+
     return DigestResult(digest=digest, sent=sent, ping=ping)
+
+
+def _group_step(
+    config: Any,
+    digest: Digest,
+    *,
+    smtp_factory: Callable[..., Any] | None = None,
+    now: float | None = None,
+    client: Any = None,
+) -> None:
+    """Write this copy's status, and send the group email if this copy is the admin's.
+
+    Swallows everything. The one thing this function must never do is turn a morning where
+    somebody got their email into a morning where they did not, and it is called after that
+    email has already gone out precisely so that it cannot.
+    """
+    if not str(getattr(config, "group_folder_id", "") or "").strip():
+        return
+    try:
+        from . import group as group_module
+
+        drive = client
+        if drive is None:
+            # A second client, because the shared folder is normally in somebody else's
+            # drive: this copy's own client is pinned to this person's drive, which is the
+            # whole reason a shared folder is needed.
+            owner = str(getattr(config, "group_drive_user_id", "") or "").strip()
+            drive = _graph_for(config, user_id=owner) if owner else _graph_for(config)
+
+        status = group_module.status_of(
+            config, counts=digest.counts, spend=getattr(digest, "spend", None),
+            held=getattr(digest, "held", None),
+        )
+        group_module.write_status(config, status, client=drive)
+
+        if not group_module.is_admin(config):
+            return
+        peers = group_module.read_statuses(config, client=drive, now=now)
+        report = group_module.GroupReport(
+            day=digest.day,
+            peers=tuple(peers),
+            silent_after_hours=int(getattr(config, "group_silent_after_hours", 36) or 36),
+        )
+        body = group_module.render_group_email(report, priced_on=prices.CHECKED_ON)
+        result = send_group(config, group_module.subject_for_group(report), body,
+                            smtp_factory=smtp_factory)
+        if not result.ok:
+            log.warning("the group email could not be sent: %s", result.detail)
+    except Exception:  # noqa: BLE001 - see the docstring; this may never break a morning
+        log.warning("the group view could not be updated this morning", exc_info=True)
+
+
+def _graph_for(config: Any, *, user_id: str = "") -> Any:
+    """A Graph client for the shared folder's drive, or this copy's own.
+
+    Imported here rather than at module scope: the digest is built and rendered in tests
+    that have no credentials, and a module-level import of the Graph client would make
+    reading an email require a tenant.
+    """
+    from .graph import GraphClient
+
+    if user_id:
+        return GraphClient.from_config(config, user_id=user_id)
+    return GraphClient.from_config(config)
 
 
 def should_run(config: Any, ledger: Ledger, *, now: float | None = None) -> bool:

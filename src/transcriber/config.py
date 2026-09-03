@@ -185,6 +185,17 @@ _SPEC: tuple[_Var, ...] = (
     _Var("smtp_from", "SMTP_FROM", "str", _REQUIRED, "digest envelope sender"),
     _Var("smtp_to", "SMTP_TO", "csv", _REQUIRED, "digest recipients, comma separated"),
     _Var("smtp_starttls", "SMTP_STARTTLS", "bool", True, "issue STARTTLS before authenticating"),
+    # --- the group view --------------------------------------------------------------
+    # Each person runs their own copy against their own drive, so each copy sees one
+    # person's recordings and nothing else. That is the right shape and it leaves one hole:
+    # when somebody's copy stops working, only that person is told, and it is not their
+    # record that suffers. These four settings close it, and all four are optional — one
+    # person running this alone gets no group section at all, rather than a group of one.
+    _Var("instance_name", "INSTANCE_NAME", "str", "", "whose copy this is, in the group view — a person's name, not a hostname (optional; without it this copy stays out of the group view)"),
+    _Var("group_folder_id", "GROUP_FOLDER_ID", "str", "", "OneDrive folder every copy drops its daily status into, so one of them can report on all of them (optional)"),
+    _Var("group_drive_user_id", "GROUP_DRIVE_USER_ID", "str", "", "id or principal name of whoever owns GROUP_FOLDER_ID; empty means it is in this copy's own drive (optional)"),
+    _Var("group_admin_to", "GROUP_ADMIN_TO", "csv", "", "who receives the one consolidated email about the whole group. Set on the ADMIN's copy only: whichever copy has this reads every status file and sends the group email, and the copies that do not have it simply write their status and stay quiet (optional)"),
+    _Var("group_silent_after_hours", "GROUP_SILENT_AFTER_HOURS", "int", 36, "how long a copy may go without dropping a status file before the group email calls it silent rather than quiet"),
     _Var("heartbeat_url", "HEARTBEAT_URL", "str", _REQUIRED, "external URL pinged after a successful digest, so something outside notices silence"),
     # --- durable state ---------------------------------------------------------------
     _Var("ledger_path", "LEDGER_PATH", "str", _REQUIRED, "path to the SQLite ledger — no default, because two ledgers is the same as none"),
@@ -295,6 +306,11 @@ class Config:
     smtp_from: str = ""
     smtp_to: tuple[str, ...] = ()
     smtp_starttls: bool = True
+    instance_name: str = ""
+    group_folder_id: str = ""
+    group_drive_user_id: str = ""
+    group_admin_to: tuple[str, ...] = ()
+    group_silent_after_hours: int = 36
     heartbeat_url: str = ""
     # state
     ledger_path: str = ""

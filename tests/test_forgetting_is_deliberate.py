@@ -1,0 +1,471 @@
+"""Forgetting a recording: dry by default, named always, honest about its own reach.
+
+Everywhere else this service never deletes — ``archive.py`` says so in its first rule and
+there is no delete call in that file. This is the deliberate exception, and the tests below
+are the ones that keep it from becoming a hazard.
+
+The dangerous shapes, all four tested:
+
+  * a `forget` that quietly matches everything;
+  * a `forget` that removes some of what was asked and reports that it removed all of it;
+  * a `forget` that empties the row before the files, losing the only thing that knew what
+    was still out there;
+  * a `forget` that leaves a person's words somewhere nobody thought to look.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+
+from transcriber import erase as erase_module
+from transcriber.ledger import Ledger, LedgerError
+from transcriber.models import DriveItem, Row, State
+
+
+class _Drive:
+    """A drive that deletes, and can be told to refuse one particular id."""
+
+    def __init__(self, refuse: str = "", missing: tuple = ()):
+        self.deleted: list[str] = []
+        self.refuse = refuse
+        self.missing = set(missing)
+
+    def delete(self, item_id: str) -> bool:
+        if item_id == self.refuse:
+            raise RuntimeError("the drive said no")
+        if item_id in self.missing:
+            return False
+        self.deleted.append(item_id)
+        return True
+
+
+class _Holds:
+    def __init__(self):
+        self.forgotten: list[str] = []
+
+    def forget(self, item_id: str) -> int:
+        self.forgotten.append(item_id)
+        return 2
+
+
+def _ledger(tmp: str) -> Ledger:
+    led = Ledger(os.path.join(tmp, "ledger.sqlite"))
+    led.migrate()
+    return led
+
+
+def _finished(led: Ledger, item_id: str, name: str, route: str = "james") -> None:
+    led.upsert_discovered(DriveItem(item_id=item_id, name=name, size=10,
+                                    created_at="2026-08-27T09:00:00Z"), route=route)
+    for state in (State.CLAIMED, State.FETCHED, State.TRANSCRIBED, State.ANALYSED):
+        led.advance(item_id, state)
+    led.advance(item_id, State.DONE,
+                transcript_name=f"{name}.transcript.md",
+                summary_name=f"_{name}.summary.md",
+                actions_name=f"_{name}.actions.md",
+                # A dict, the way the pipeline passes it: the ledger JSON-encodes this
+                # column itself, so handing it a pre-encoded string stores nothing.
+                output_item_ids={"transcript": f"{item_id}-t",
+                                 "summary": f"{item_id}-s",
+                                 "actions": f"{item_id}-a"})
+
+
+class AnErasureNeedsAPersonAndAReason(unittest.TestCase):
+    def test_the_ledger_refuses_an_erasure_with_no_name_on_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Beach Court.m4a")
+                for by, because in (("", "they asked"), ("  ", "they asked"),
+                                    ("James", ""), ("James", "   ")):
+                    with self.assertRaises(LedgerError):
+                        led.erase("a", by=by, because=because)
+                self.assertEqual(led.get("a").state, State.DONE)
+
+    def test_the_module_refuses_the_same(self) -> None:
+        plan = erase_module.ErasePlan(candidates=())
+        with self.assertRaises(ValueError):
+            erase_module.erase(None, plan, by="", because="they asked")
+
+
+class TheRowBecomesATombstone(unittest.TestCase):
+    def test_what_described_the_recording_is_gone_and_the_fact_of_it_remains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a")
+                led.erase("a", by="James Janeke", because="Carel asked us to remove it")
+                row = led.get("a")
+
+        self.assertEqual(row.state, State.ERASED)
+        # Gone.
+        self.assertFalse(row.name)
+        self.assertFalse(row.transcript_name)
+        self.assertFalse(row.summary_name)
+        self.assertFalse(row.actions_name)
+        self.assertIn(row.output_item_ids, ({}, "{}", None))
+        # Kept — the record of the thing, not the thing.
+        self.assertEqual(row.item_id, "a")
+        self.assertEqual(row.route, "james")
+        self.assertEqual(row.erased_by, "James Janeke")
+        self.assertIn("Carel asked", row.erased_because)
+        self.assertTrue(row.erased_at)
+        self.assertTrue(row.created_at)
+
+    def test_the_history_says_who_and_why_and_not_what(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a")
+                led.erase("a", by="James", because="Carel asked")
+                blob = json.dumps(led.history("a"))
+        self.assertIn("James", blob)
+        self.assertNotIn("dismissal", blob)
+        self.assertNotIn("Carel dismissal call.m4a", blob)
+
+    def test_erasing_twice_is_a_re_run_and_not_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Beach Court.m4a")
+                led.erase("a", by="James", because="asked")
+                led.erase("a", by="Somebody Else", because="asked again")
+                # The first erasure's attribution stands: the second changed nothing.
+                self.assertEqual(led.get("a").erased_by, "James")
+
+    def test_a_done_row_can_be_erased_even_though_advance_refuses_to_move_it(self) -> None:
+        """The one deliberate way backwards, and only through erase()."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Beach Court.m4a")
+                with self.assertRaises(Exception):
+                    led.advance("a", State.DISCOVERED)
+                led.erase("a", by="James", because="asked")
+                self.assertEqual(led.get("a").state, State.ERASED)
+
+
+class NoColumnEscapesTheErasure(unittest.TestCase):
+    def test_every_column_is_either_cleared_or_deliberately_kept(self) -> None:
+        """The test that makes a column added next year get thought about at the time."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                missed = erase_module.columns_not_covered(led)
+        self.assertEqual(missed, (), f"these columns hold content nothing clears: {missed}")
+
+
+class TheFilesGoBeforeTheRow(unittest.TestCase):
+    def test_a_refused_delete_leaves_the_row_alone_so_it_can_be_re_run(self) -> None:
+        """The row is the only thing that knows which files to delete."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Beach Court.m4a")
+                plan = erase_module.plan(led, rows=[led.get("a")])
+                result = erase_module.erase(led, plan, by="James", because="asked",
+                                            client=_Drive(refuse="a-s"))
+                row = led.get("a")
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.files_refused)
+        self.assertEqual(result.recordings, 0)
+        # Still DONE, still naming its files. Nothing is half-removed.
+        self.assertEqual(row.state, State.DONE)
+        self.assertTrue(row.transcript_name)
+
+    def test_a_file_already_gone_is_the_requested_state_not_a_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Beach Court.m4a")
+                plan = erase_module.plan(led, rows=[led.get("a")])
+                result = erase_module.erase(led, plan, by="James", because="asked",
+                                            client=_Drive(missing=("a-a",)))
+                self.assertTrue(result.ok)
+                self.assertEqual(result.files_already_gone, 1)
+                self.assertEqual(led.get("a").state, State.ERASED)
+
+    def test_the_source_and_all_three_outputs_are_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Beach Court.m4a")
+                drive = _Drive()
+                plan = erase_module.plan(led, rows=[led.get("a")])
+                erase_module.erase(led, plan, by="James", because="asked", client=drive)
+        self.assertEqual(sorted(drive.deleted), ["a", "a-a", "a-s", "a-t"])
+
+    def test_held_passages_are_forgotten_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Beach Court.m4a")
+                holds = _Holds()
+                plan = erase_module.plan(led, rows=[led.get("a")])
+                result = erase_module.erase(led, plan, by="James", because="asked",
+                                            client=_Drive(), held_store=holds)
+        self.assertEqual(holds.forgotten, ["a"])
+        self.assertEqual(result.held_forgotten, 2)
+
+
+class ThePlanTouchesNothing(unittest.TestCase):
+    def test_building_a_plan_changes_no_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Beach Court.m4a")
+                before = led.get("a")
+                erase_module.plan(led, rows=[before])
+                after = led.get("a")
+        self.assertEqual(after.state, before.state)
+        self.assertEqual(after.name, before.name)
+
+    def test_an_already_erased_recording_is_not_a_candidate_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Beach Court.m4a")
+                led.erase("a", by="James", because="asked")
+                plan = erase_module.plan(led, rows=[led.get("a")])
+        self.assertEqual(plan.recordings, 0)
+
+    def test_an_output_with_no_id_is_named_rather_than_counted_as_erased(self) -> None:
+        """A published file this service cannot delete must not read as deleted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                led.upsert_discovered(DriveItem(item_id="a", name="Beach.m4a", size=1))
+                for state in (State.CLAIMED, State.FETCHED, State.TRANSCRIBED, State.ANALYSED):
+                    led.advance("a", state)
+                led.advance("a", State.DONE, transcript_name="Beach.transcript.md",
+                            summary_name="_Beach.summary.md",
+                            output_item_ids={"transcript": "a-t"})
+                plan = erase_module.plan(led, rows=[led.get("a")])
+        self.assertIn("_Beach.summary.md", plan.unreachable_outputs)
+
+
+class ThePreviewNamesTheMostSensitiveThingItRemoves(unittest.TestCase):
+    """The whole premise of `forget` is that it shows first.
+
+    A preview that lists twelve files and says nothing about five held passages understates
+    exactly the part somebody should be asked about twice — a staff matter, somebody's
+    health, an admission of liability.
+    """
+
+    class _Store:
+        def __init__(self, per_item: int = 0, broken: bool = False):
+            self.per_item, self.broken = per_item, broken
+
+        def for_recording(self, item_id, **kw):
+            if self.broken:
+                raise RuntimeError("the store is locked")
+            return tuple(range(self.per_item))
+
+    def test_held_passages_are_counted_into_the_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a")
+                plan = erase_module.plan(led, rows=[led.get("a")],
+                                         held_store=self._Store(per_item=5))
+        self.assertEqual(plan.held, 5)
+        self.assertTrue(plan.held_counted)
+
+    def test_without_a_store_the_plan_admits_it_did_not_look(self) -> None:
+        """A confident zero about the most sensitive thing is worse than "I don't know"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a")
+                plan = erase_module.plan(led, rows=[led.get("a")])
+        self.assertEqual(plan.held, 0)
+        self.assertFalse(plan.held_counted)
+
+    def test_a_store_that_cannot_be_read_does_not_stop_the_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a")
+                plan = erase_module.plan(led, rows=[led.get("a")],
+                                         held_store=self._Store(broken=True))
+        self.assertEqual(plan.recordings, 1)
+
+
+class ErasedIsFinal(unittest.TestCase):
+    """Emptying the row is not enough on its own.
+
+    Half a dozen paths write to a ledger row and every one of them would happily fill it
+    back in. The one that matters is the LAST: nobody types it. A file deleted from OneDrive
+    sits in the recycle bin, an administrator restores it three weeks later, the next poll
+    finds it — and without a guard the tombstone of a recording somebody asked to be rid of
+    quietly becomes a recording again, with its name on it, and nobody ever knows.
+    """
+
+    def _erased(self, tmp: str) -> Ledger:
+        led = _ledger(tmp)
+        _finished(led, "a", "Carel dismissal call.m4a")
+        led.erase("a", by="James", because="Carel asked")
+        return led
+
+    def _still_erased(self, led: Ledger) -> None:
+        row = led.get("a")
+        self.assertEqual(row.state, State.ERASED)
+        self.assertFalse(row.name)
+        self.assertNotIn("Carel", (row.name or "") + (row.last_error or ""))
+
+    def test_advance_will_not_move_it_back_into_the_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                with self.assertRaises(Exception):
+                    led.advance("a", State.TRANSCRIBED, language="en-ZA")
+                self._still_erased(led)
+
+    def test_set_fields_will_not_write_the_name_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                led.set_fields("a", name="Carel dismissal call.m4a")
+                self._still_erased(led)
+
+    def test_requeue_will_not_give_it_a_live_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                led.requeue("a", reason="somebody tried")
+                self._still_erased(led)
+
+    def test_quarantine_will_not_either(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                led.quarantine("a", "three engine failures")
+                self._still_erased(led)
+
+    def test_a_failed_attempt_does_not_write_the_recording_back_into_an_error(self) -> None:
+        """Error text quotes the recording: "the engine failed on Carel's call"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                led.record_attempt("a", "the engine failed on Carel dismissal call.m4a")
+                self._still_erased(led)
+
+    def test_a_file_restored_from_the_recycle_bin_is_not_re_ingested(self) -> None:
+        """The automatic one. Nobody types this, which is why it is the dangerous one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                new = led.upsert_discovered(
+                    DriveItem(item_id="a", name="Carel dismissal call.m4a", size=10))
+                self.assertFalse(new)
+                self._still_erased(led)
+
+    def test_a_worker_mid_flight_cannot_finish_onto_a_tombstone(self) -> None:
+        """Erasing clears the claim, so the worker that held it comes back to a dead row."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a")
+                led.advance("a", State.DONE)
+                led.erase("a", by="James", because="asked")
+                with self.assertRaises(Exception):
+                    led.advance("a", State.DONE, transcript_name="Carel.transcript.md")
+                self.assertFalse(led.get("a").transcript_name)
+
+
+class EveryWritePathIsAccountedFor(unittest.TestCase):
+    """Found by reading the source, not by remembering.
+
+    The first version of this file listed six write paths and tested those six. A reviewer
+    found a seventh — `reassign_route` — which my list simply did not contain, and the file
+    happily claimed to cover "every write path" while missing one. Enumerating by hand is
+    the thing that failed, so this test enumerates by reading.
+
+    It greps the ledger's own source for statements that write to `items`, maps each back to
+    the method it sits in, and requires that every one is either guarded or on the list
+    below with a reason. A write added next year lands here whether or not anybody thought
+    about erasure at the time.
+    """
+
+    #: Writes that do not need the guard, each with why. Anything not here and not calling
+    #: ``_refuse_if_erased`` fails this test.
+    SAFE = {
+        "_upsert": "guarded at the top: an ERASED row returns before any write",
+        "erase": "the exception itself, and idempotent",
+        "claim": "filters on State.ACTIVE, and ERASED is terminal",
+        "renew": "matches on claimed_by, which an erasure sets to NULL",
+        "release": "clears a claim an erased row does not have; writes no content",
+    }
+
+    def _methods_that_write(self) -> dict:
+        import inspect
+        import re
+        from transcriber import ledger as ledger_module
+
+        source = inspect.getsource(ledger_module)
+        lines = source.splitlines()
+        current, out = "", {}
+        for line in lines:
+            found = re.match(r"    def (\w+)\(", line)
+            if found:
+                current = found.group(1)
+            if re.search(r"(UPDATE items|INSERT INTO items)", line) and current:
+                out.setdefault(current, 0)
+                out[current] += 1
+        return out
+
+    def test_every_method_that_writes_to_items_is_guarded_or_excused(self) -> None:
+        import inspect
+        from transcriber import ledger as ledger_module
+
+        writers = self._methods_that_write()
+        self.assertGreater(len(writers), 5, "the source scan found suspiciously little")
+
+        unaccounted = []
+        for name in writers:
+            if name in self.SAFE:
+                continue
+            method = getattr(ledger_module.Ledger, name, None)
+            body = inspect.getsource(method) if method else ""
+            # Either form counts. Most paths call the helper and return quietly; `advance`
+            # names State.ERASED and raises instead, because moving an erased row is a
+            # programming error rather than a race, and the caller should hear about it.
+            if "_refuse_if_erased" not in body and "State.ERASED" not in body:
+                unaccounted.append(name)
+
+        self.assertEqual(
+            unaccounted, [],
+            "these write to items without refusing an erased row, and are not on the "
+            f"documented-safe list: {unaccounted}. Add the guard, or add it to SAFE with "
+            "the reason it does not need one.",
+        )
+
+    def test_the_safe_list_does_not_name_methods_that_have_gone(self) -> None:
+        """A stale excuse is how a guard quietly stops being required."""
+        from transcriber import ledger as ledger_module
+
+        for name in self.SAFE:
+            self.assertTrue(hasattr(ledger_module.Ledger, name),
+                            f"{name} is excused from the erasure guard and no longer exists")
+
+    def test_reassign_route_will_not_touch_a_tombstone(self) -> None:
+        """The seventh path, which the hand-written list missed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a", route="james")
+                led.erase("a", by="James", because="asked")
+                led.reassign_route("a", "nomsa", reason="somebody tried")
+                row = led.get("a")
+        self.assertEqual(row.state, State.ERASED)
+        self.assertEqual(row.route, "james")
+
+
+class TheSearchIsNotCapped(unittest.TestCase):
+    def test_a_name_search_for_forgetting_returns_every_match(self) -> None:
+        """Removing the newest twenty of somebody's two hundred and reporting success is
+        the way this feature would lie."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                for i in range(45):
+                    led.upsert_discovered(
+                        DriveItem(item_id=f"i{i}", name=f"Beach Court {i}.m4a", size=1))
+                self.assertEqual(len(led.find_by_name("Beach")), 20)
+                self.assertEqual(len(led.find_by_name("Beach", limit=None)), 45)
+
+    def test_a_route_selection_includes_the_failed_ones(self) -> None:
+        """Somebody who asked to be forgotten does not care which of theirs failed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "done", "Beach Court.m4a", route="james")
+                led.upsert_discovered(DriveItem(item_id="bad", name="Broken.m4a", size=1),
+                                      route="james")
+                led.quarantine("bad", "three engine failures")
+                led.upsert_discovered(DriveItem(item_id="other", name="Someone else.m4a",
+                                                size=1), route="nomsa")
+                rows = led.rows_in_route("james")
+        self.assertEqual(sorted(r.item_id for r in rows), ["bad", "done"])
+
+
+if __name__ == "__main__":
+    unittest.main()

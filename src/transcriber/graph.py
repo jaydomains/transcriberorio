@@ -45,6 +45,10 @@ USER_AGENT = "kbc-transcriber/1.0 (+stdlib-urllib)"
 UPLOAD_CHUNK_UNIT = 320 * 1024
 #: Above this, a simple PUT is not allowed and an upload session is required.
 SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024
+#: What :meth:`GraphClient.read_small` will hold in memory. A status file is a few
+#: hundred bytes, so this is generous by three orders of magnitude and still refuses
+#: anything that could be audio.
+SIMPLE_READ_LIMIT = 256 * 1024
 DEFAULT_UPLOAD_CHUNK = 10 * UPLOAD_CHUNK_UNIT  # 3.2 MiB
 DOWNLOAD_CHUNK = 1024 * 1024
 #: Refresh this long before the token actually expires, so a long upload cannot straddle it.
@@ -974,6 +978,72 @@ class GraphClient:
         )
 
     # -- upload ------------------------------------------------------------
+
+    def delete(self, item_id: str) -> bool:
+        """Delete one item. True if it went, False if it was already gone.
+
+        **THIS MOVES THE FILE TO THE RECYCLE BIN. IT DOES NOT DESTROY IT.** Graph's DELETE
+        on a driveItem is what the web interface's delete button does: the file leaves the
+        folder and sits in the recycle bin, where OneDrive keeps it for around 30 days for a
+        personal account and up to 93 for a business one, and where an administrator can
+        restore it the whole time.
+
+        That is stated here, loudly, because the caller is the erasure path and the person
+        who asked to be forgotten deserves an accurate answer. "We deleted it" and "we put
+        it in a bin that empties itself in three months" are different sentences, and only
+        the second one is true until the bin is emptied. :mod:`transcriber.erase` prints
+        that in its report rather than letting the word "deleted" carry a meaning it has not
+        earned.
+
+        A 404 is success, not failure. Somebody asked for this to be gone; a file that was
+        already gone is the requested state, and treating it as an error would stop an
+        erasure part-way through on the one recording that needed no work.
+        """
+        try:
+            self._request("DELETE", self._item_base(item_id))
+        except GraphHTTPError as exc:
+            if exc.is_not_found:
+                return False
+            raise
+        return True
+
+    def read_small(self, item_id: str, *, limit: int = SIMPLE_READ_LIMIT) -> bytes:
+        """A small file's whole content, in memory. For status files and nothing bigger.
+
+        Deliberately NOT a general-purpose read. :meth:`download` exists precisely so a
+        90 MB recording never sits in memory, and this does the opposite thing on purpose —
+        so it refuses anything that is not small, and a caller who reaches for it with an
+        audio file gets an error rather than a machine that swaps.
+
+        The size is checked BEFORE the fetch, against what the item says it is, because
+        ``_request`` reads a whole body into memory before returning it: a check afterwards
+        would be a check made after the damage. It is checked again after, because the
+        length a remote service reports is a claim and the bytes are the fact.
+
+        The content URL is pre-authenticated and points at storage rather than at Graph, so
+        it is fetched with ``auth=False``. Sending our bearer token to it would hand a
+        credential to a host that has no business holding one.
+        """
+        item = self.get_item(item_id)
+        if item.size and item.size > limit:
+            raise GraphError(
+                f"read_small refuses {item.name!r} at {item.size} bytes: the limit is "
+                f"{limit}. Use download() for anything that is not a small text file."
+            )
+        url, reported = self._resolve_download_url(item_id)
+        if reported and reported > limit:
+            raise GraphError(
+                f"read_small refuses {item.name!r}: /content reports {reported} bytes, "
+                f"over the {limit} limit."
+            )
+        resp = self._request("GET", url, auth=False)
+        body = resp.body or b""
+        if len(body) > limit:
+            raise GraphError(
+                f"read_small refuses {item.name!r}: it sent {len(body)} bytes, whatever "
+                "its metadata said."
+            )
+        return body
 
     def upload_small(
         self, parent_id: str, name: str, data: bytes, *, conflict: str = "replace"

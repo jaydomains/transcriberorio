@@ -600,6 +600,58 @@ transcriber status        # per folder: known, done, failed, queued, and how lon
 
 ---
 
+## When somebody asks to be forgotten
+
+Everywhere else, this service never deletes anything. The monthly pass moves old recordings
+into an archive folder and that is all it will ever do — `archive.py` says so in its own
+first rule and there is no delete call in that file.
+
+This is the one deliberate exception, because "we keep everything forever and there is no
+way to take it out" is a fine answer for an archive and not one you can give a client or a
+member of staff who asks.
+
+```
+transcriber forget --name "Beach Court"                  # shows. Removes nothing.
+transcriber forget --name "Beach Court" --really \
+    --by "James Janeke" --because "the client asked us to remove this job"
+```
+
+**It shows first, always.** Without `--really` it prints what it would remove and stops.
+Everything else here is safe to re-run; this is the one thing that is not, so the default is
+a look.
+
+**It will not move without a name and a reason.** `--really` on its own is refused. A
+recording removed at nobody's request cannot be told apart from one lost to a bug, and in a
+year that difference is the only thing that will matter.
+
+**There is no way to spell "forget everything".** One of `--id`, `--name` or `--route` is
+required. Dates narrow a selection; they are not one on their own, because `--from 2020`
+is every recording there has ever been typed in a way that does not look like it.
+
+### What it removes, and what it leaves
+
+Removed: the original recording, all three published files, and the words of any held
+passages.
+
+Left behind, on purpose: **a tombstone.** The ledger keeps a row saying a recording arrived
+on this date, finished on that one, and was erased on this one at this person's request. The
+name is gone, the output filenames are gone, the metadata is gone. You keep the track of
+what happened; you do not keep what it was. The recording's *name* is cleared from its
+history too — a recording called `Carel dismissal call.m4a` says most of what the erasure
+was meant to remove.
+
+### Three things it cannot reach, and tells you so every time
+
+1. **The OneDrive recycle bin.** Deleting a file puts it there, where it stays for up to 93
+   days and an administrator can restore it the whole time. **Until that bin is emptied the
+   recording is not gone.** The command says this rather than letting the word "deleted"
+   carry more than it earned.
+2. **The site record.** It ingested the transcripts and derived its own documents from them,
+   and this service may only read it. The command names the files so somebody can go and
+   deal with them there.
+3. **Anything already sent.** A morning email, a transcript somebody downloaded.
+
+
 ## Running it
 
 Python 3.11 or newer. **There is nothing to install** — every import is from Python's own
@@ -625,6 +677,7 @@ python3 -m transcriber run
 | `transcriber archive` | Runs the monthly archive pass now. `--dry-run` is safe. |
 | `transcriber backfill` | Walks the whole folder from the beginning, for a first run against an existing pile of recordings. |
 | `transcriber requeue <id>` | Puts one recording back in the queue. |
+| `transcriber forget` | Removes what is held about somebody, at their request. **Shows first and removes only when told to twice.** See **When somebody asks to be forgotten** below. |
 | `transcriber routes` | Lists your routes, adds one, changes one, pauses one. See **Routes** above. |
 | `transcriber config` | Reads and changes one setting at a time — `config set ANALYSIS_MODEL_STRONG claude-opus-5` — checking it before it writes. |
 | `transcriber gate` | What the sensitivity gate is doing, and the measurement it is building. `--status` for the summary. |

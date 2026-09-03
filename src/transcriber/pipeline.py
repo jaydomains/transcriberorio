@@ -187,6 +187,10 @@ _META_NAMING = "naming"
 #: build happens to be running.
 _META_RECORDED_AT = "recorded_at"
 _META_RECORDED_NOTE = "recorded_at_note"
+#: What the analysis pass used, one entry per model call. TOKENS, not money -
+#: ``transcriber.prices`` does the multiplication at reporting time so a price
+#: change does not make the record retrospectively wrong.
+_META_SPEND = "spend"
 
 _UNSAFE_PATH = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -771,6 +775,22 @@ class Pipeline:
             _META_RECORDED_AT: pinned_at.isoformat(),
             _META_RECORDED_NOTE: pinned_note,
         }
+        spent = tuple(getattr(gate.extraction, "spend", ()) or ())
+        if spent:
+            # Written even for a recording the reader never saw: the router ran, and a meter
+            # that only counted the expensive half would undercount the cheap recordings,
+            # which are the numerous ones.
+            #
+            # Stamped with its own date. The alternative is inferring the month from one of
+            # the row's timestamp columns, and every one of them is wrong in some case a
+            # month boundary makes visible: ``discovered_at`` puts a recording found on the
+            # 31st and analysed on the 1st in the wrong month, ``updated_at`` moves whenever
+            # anything touches the row, and ``done_at`` is unset until it finishes. The
+            # spend happened at a moment; the record says which.
+            changes[_META_SPEND] = {
+                "at": utc_now_iso(),
+                "calls": [x.to_dict() for x in spent],
+            }
         if gate.note:
             # Only when the gate actually read the recording. An empty entry on every row in
             # ``off`` would read like a gate that ran and found nothing, which is a different

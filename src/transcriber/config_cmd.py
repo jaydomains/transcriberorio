@@ -162,6 +162,13 @@ GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         # of the value: a queue read as failure is the confusion this service removes.
         "QUEUE_STALE_HOURS", "STUCK_AFTER_HOURS",
     )),
+    ("the group view", (
+        # Each person runs their own copy, so each copy knows about one person. These are
+        # what let one of them report on all of them. Every one is optional: unset, a copy
+        # writes nothing and says nothing about a group.
+        "INSTANCE_NAME", "GROUP_FOLDER_ID", "GROUP_DRIVE_USER_ID", "GROUP_ADMIN_TO",
+        "GROUP_SILENT_AFTER_HOURS",
+    )),
     ("where it keeps its notes", (
         "LEDGER_PATH", "WORK_DIR", "WORK_DIR_MAX_BYTES", "WORK_DIR_KEEP_FINISHED_HOURS",
     )),

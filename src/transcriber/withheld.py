@@ -1439,6 +1439,42 @@ class WithheldStore:
             group["records"].append(record)
         return tuple(groups.values())
 
+    def forget(self, item_id: str) -> int:
+        """Erase the held passages of one recording. Returns how many were forgotten.
+
+        Called only by :mod:`transcriber.erase`, and it is the most consequential thing that
+        module does. A held passage is the most sensitive text this service holds — a staff
+        matter, somebody's health, an admission of liability — and it is exactly what a
+        person asking to be forgotten is asking about.
+
+        The row is kept and EMPTIED, the same way the ledger's is. What goes: the text, the
+        context either side, the reason, the subject, the site, the speaker, the source
+        name, the metadata. What stays: that a passage of some category was held on some
+        date and was erased on this one. So a count of what the gate held over a period does
+        not silently change when somebody exercises their rights — the measurement stays
+        honest, and no words remain.
+
+        The decision is NOT cleared, and that is deliberate: a passage a person refused is a
+        decision that person made, and erasing the fact of it would rewrite their answer.
+        """
+        now = utc_now_iso()
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT hold_id FROM holds WHERE item_id=? AND text<>''", (item_id,)
+            ).fetchall()
+            if not rows:
+                return 0
+            conn.execute(
+                "UPDATE holds SET text='', context_before='', context_after='', reason='',"
+                " subject='', site='', speaker=NULL, source_name='', recorded_by='',"
+                " decision_note='', meta='{}' WHERE item_id=?",
+                (item_id,),
+            )
+            for row in rows:
+                self._event(conn, row["hold_id"], item_id, "erased", now,
+                            detail="the recording was erased at a person's request")
+        return len(rows)
+
     def overview(
         self,
         *,
