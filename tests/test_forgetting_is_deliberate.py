@@ -354,6 +354,93 @@ class ErasedIsFinal(unittest.TestCase):
                 self.assertFalse(led.get("a").transcript_name)
 
 
+class EveryWritePathIsAccountedFor(unittest.TestCase):
+    """Found by reading the source, not by remembering.
+
+    The first version of this file listed six write paths and tested those six. A reviewer
+    found a seventh — `reassign_route` — which my list simply did not contain, and the file
+    happily claimed to cover "every write path" while missing one. Enumerating by hand is
+    the thing that failed, so this test enumerates by reading.
+
+    It greps the ledger's own source for statements that write to `items`, maps each back to
+    the method it sits in, and requires that every one is either guarded or on the list
+    below with a reason. A write added next year lands here whether or not anybody thought
+    about erasure at the time.
+    """
+
+    #: Writes that do not need the guard, each with why. Anything not here and not calling
+    #: ``_refuse_if_erased`` fails this test.
+    SAFE = {
+        "_upsert": "guarded at the top: an ERASED row returns before any write",
+        "erase": "the exception itself, and idempotent",
+        "claim": "filters on State.ACTIVE, and ERASED is terminal",
+        "renew": "matches on claimed_by, which an erasure sets to NULL",
+        "release": "clears a claim an erased row does not have; writes no content",
+    }
+
+    def _methods_that_write(self) -> dict:
+        import inspect
+        import re
+        from transcriber import ledger as ledger_module
+
+        source = inspect.getsource(ledger_module)
+        lines = source.splitlines()
+        current, out = "", {}
+        for line in lines:
+            found = re.match(r"    def (\w+)\(", line)
+            if found:
+                current = found.group(1)
+            if re.search(r"(UPDATE items|INSERT INTO items)", line) and current:
+                out.setdefault(current, 0)
+                out[current] += 1
+        return out
+
+    def test_every_method_that_writes_to_items_is_guarded_or_excused(self) -> None:
+        import inspect
+        from transcriber import ledger as ledger_module
+
+        writers = self._methods_that_write()
+        self.assertGreater(len(writers), 5, "the source scan found suspiciously little")
+
+        unaccounted = []
+        for name in writers:
+            if name in self.SAFE:
+                continue
+            method = getattr(ledger_module.Ledger, name, None)
+            body = inspect.getsource(method) if method else ""
+            # Either form counts. Most paths call the helper and return quietly; `advance`
+            # names State.ERASED and raises instead, because moving an erased row is a
+            # programming error rather than a race, and the caller should hear about it.
+            if "_refuse_if_erased" not in body and "State.ERASED" not in body:
+                unaccounted.append(name)
+
+        self.assertEqual(
+            unaccounted, [],
+            "these write to items without refusing an erased row, and are not on the "
+            f"documented-safe list: {unaccounted}. Add the guard, or add it to SAFE with "
+            "the reason it does not need one.",
+        )
+
+    def test_the_safe_list_does_not_name_methods_that_have_gone(self) -> None:
+        """A stale excuse is how a guard quietly stops being required."""
+        from transcriber import ledger as ledger_module
+
+        for name in self.SAFE:
+            self.assertTrue(hasattr(ledger_module.Ledger, name),
+                            f"{name} is excused from the erasure guard and no longer exists")
+
+    def test_reassign_route_will_not_touch_a_tombstone(self) -> None:
+        """The seventh path, which the hand-written list missed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a", route="james")
+                led.erase("a", by="James", because="asked")
+                led.reassign_route("a", "nomsa", reason="somebody tried")
+                row = led.get("a")
+        self.assertEqual(row.state, State.ERASED)
+        self.assertEqual(row.route, "james")
+
+
 class TheSearchIsNotCapped(unittest.TestCase):
     def test_a_name_search_for_forgetting_returns_every_match(self) -> None:
         """Removing the newest twenty of somebody's two hundred and reporting success is

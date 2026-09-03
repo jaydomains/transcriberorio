@@ -1041,6 +1041,8 @@ class Ledger:
             ).fetchone()
             if current is None:
                 raise LedgerError(f"no ledger row for {item_id!r}")
+            if self._refuse_if_erased(conn, item_id, "reassign the route of"):
+                return
             conn.execute(
                 "UPDATE items SET route=?, updated_at=? WHERE item_id=?", (target, now, item_id)
             )
