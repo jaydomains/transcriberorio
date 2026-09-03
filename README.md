@@ -668,6 +668,7 @@ python3 -m transcriber run
 
 | Command | What it does |
 | --- | --- |
+| `transcriber try <file>` | **Start here.** One recording on disk, transcribed and read, with two keys and nothing else — no Microsoft credential, no mail server, no ledger. Prints the three files it would have published and what the reading cost. Publishes nothing; writes nothing except with `--out DIR`. See **Trying it on one recording** below. |
 | `transcriber run` | The service. Polls every two minutes, processes what it finds, runs the nightly and morning jobs. This is what the systemd unit runs. |
 | `transcriber once` | One poll and one pass, then exit. Good for a first try. |
 | `transcriber status` | Counts, failures with reasons, and when each job last worked. |
@@ -686,6 +687,46 @@ python3 -m transcriber run
 
 `once`, `sweep`, `archive`, `backfill` and `status` all take `--route <short name>` to act
 on one route only. Left off, they act on every route that is switched on.
+
+### Trying it on one recording
+
+The service needs thirteen settings before it will start, and every one of them is about
+running unattended for months. None of them are needed to answer the question anybody asks
+first, which is *what does it do to one of my recordings?*
+
+```
+export OPENAI_API_KEY=...        # or ELEVENLABS_API_KEY / AZURE_SPEECH_KEY
+export ANALYSIS_API_KEY=...
+export PYTHONPATH=src
+
+python3 -m transcriber try "~/OneDrive/calls/Call Carel_260827_143005.m4a" --out ./try-output
+```
+
+Both keys are read from the environment and never taken as arguments: a key typed into a
+command is kept in your shell history and visible in the process list.
+
+| Option | What it does |
+| --- | --- |
+| `--engine` | `openai`, `elevenlabs` or `azure`. Run the same file through two of them and compare — that is the whole point of this command. |
+| `--out DIR` | Write the three rendered files there. The only thing this command ever writes. |
+| `--full` | Print the whole transcript rather than its first forty lines. |
+| `--vocabulary` | Site and person names to hint the engine with, comma-separated. Worth doing: it is the difference between `Blsa` and `Bulsa`. |
+| `--languages` | Language tags, best first. Defaults to `en-ZA,af-ZA`. |
+
+**What it does not do.** It publishes nothing, files nothing, emails nothing and records
+nothing. It does not touch OneDrive and never builds a Graph client. It does not run the
+sensitivity gate, so nothing is held back here that the running service would hold back —
+and the report says so on every run rather than leaving silence to be read as "there was
+nothing sensitive in it".
+
+**What survives a failure.** By the time the reading runs, the transcription has been paid
+for. A refused analysis key, or a filename the output contract will not allow, leaves the
+transcript in your hands and says what went wrong — it does not take the run down with it.
+
+The three files it prints are rendered by exactly the same code that publishes them, so
+what you are looking at is what would have been published. Their names carry a fixed
+`try-run-local-file` tag rather than a real OneDrive item id, which is the honest answer:
+these are not the names a published recording would get.
 
 ### Checking a change
 

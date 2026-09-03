@@ -1,6 +1,7 @@
-"""The command line: ``once``, ``run``, ``sweep``, ``digest``, ``archive``, ``backfill``,
-``selftest``, ``status``, ``routes``, ``config``, ``review``, ``held``, ``gate``.
+"""The command line: ``try``, ``once``, ``run``, ``sweep``, ``digest``, ``archive``,
+``backfill``, ``selftest``, ``status``, ``routes``, ``config``, ``review``, ``held``, ``gate``.
 
+    python3 -m transcriber try FILE     one local recording, with nothing set up
     python3 -m transcriber run          the service
     python3 -m transcriber once         one poll and one drain, then exit
     python3 -m transcriber status       what a person actually wants to know
@@ -36,6 +37,16 @@ mechanical secret redaction **with no credential and no network**, the same way
 ``graph_pull.py --selftest`` does downstream. It exits non-zero and names what failed. Run it
 on the box, after deploying, before believing anything.
 
+``try`` is the first command anybody should run, and the only one that works before the
+service is configured at all. It takes an audio file on disk, transcribes it, reads it and
+prints the three files it would have published — with two keys, no Microsoft credential, no
+mail server and no ledger. It publishes nothing and writes nothing except the three files,
+and only into a directory you name with ``--out``. It exists because the app registration is
+the one setup step that can be held up by somebody else's IT department, and there is no
+reason to wait on that to find out whether the transcription is any good on your own speech.
+Both keys are read from the environment rather than from arguments, so neither is kept in
+your shell history.
+
 ``backfill`` walks history newest first in its own lane: it only touches recordings older
 than a cutoff, so today's calls are always the live loop's and never queue behind April's.
 It is resumable because the ledger is the progress: re-running it picks up exactly what is
@@ -59,10 +70,12 @@ from . import archive as archive_module
 from . import audio as audio_module
 from . import config_cmd, diskbudget, digest as digest_module, naming, outputs, plausibility
 from . import ratelimit, redact, routes_cmd
+from . import tryout
+from .engines import EngineAuthError, EngineConfigError
 from . import release as release_module
 from . import review_server
 from . import sweep as sweep_module
-from .config import Config, ConfigError
+from .config import ENGINE_KEY_VARS, Config, ConfigError
 from .ledger import DELTA_CURSOR, Ledger, delta_cursor_name, sweep_cursor_name
 from .logging_setup import configure as configure_logging
 from .models import (
@@ -368,6 +381,45 @@ def _parser() -> argparse.ArgumentParser:
     gate.add_argument("--json", dest="as_json", action="store_true")
     gate.set_defaults(handler=cmd_gate)
 
+    tryout_cmd = sub.add_parser(
+        "try",
+        help="transcribe and read ONE local audio file — no OneDrive, no email, no ledger",
+        description=(
+            "Point this at a recording on disk and see what the service would make of it. "
+            "It needs two keys and no Microsoft anything, and it publishes nothing. Put "
+            "the keys in the environment, not on this command line, where they would be "
+            "kept in your shell history."
+        ),
+    )
+    tryout_cmd.add_argument("file", help="path to an audio file (.m4a, .mp3, .wav)")
+    tryout_cmd.add_argument(
+        "--engine", default=None,
+        help="transcription engine: " + ", ".join(sorted(ENGINE_KEY_VARS))
+        + " (default: TRANSCRIBE_ENGINE, or openai)",
+    )
+    tryout_cmd.add_argument(
+        "--out", default=None, metavar="DIR",
+        help="write the three rendered files here. The only thing this command ever writes.",
+    )
+    tryout_cmd.add_argument(
+        "--full", action="store_true",
+        help="print the whole transcript rather than its first lines",
+    )
+    tryout_cmd.add_argument(
+        "--vocabulary", default=None, metavar="WORDS",
+        help="comma-separated site and person names to hint the engine with "
+             "(default: VOCABULARY, or none)",
+    )
+    tryout_cmd.add_argument(
+        "--languages", default=None, metavar="TAGS",
+        help="comma-separated language tags, best first (default: LANGUAGES, or en-ZA,af-ZA)",
+    )
+    tryout_cmd.add_argument(
+        "--no-ffprobe", action="store_true",
+        help="do not use ffprobe even when it is installed",
+    )
+    tryout_cmd.set_defaults(handler=cmd_try)
+
     setup = sub.add_parser(
         "setup", help="interactive wizard — asks for everything, checks it, writes .env"
     )
@@ -410,6 +462,57 @@ def cmd_setup(args: argparse.Namespace) -> int:
     from .setup_wizard import run_setup
 
     return run_setup(env_path=args.env, verify=not args.no_verify, assume_yes=args.yes)
+
+
+def cmd_try(args: argparse.Namespace) -> int:
+    """One recording, from a local file, with nothing set up.
+
+    Like ``setup`` and ``routes`` this must NOT go through ``_config()``: the whole point is
+    that it runs before there is a configuration, and a command that refuses to start until
+    the thirteen settings are in place is no use to somebody deciding whether to bother
+    assembling them.
+    """
+    engine_name = (args.engine or os.environ.get("TRANSCRIBE_ENGINE") or "openai").strip()
+    try:
+        engine_key, analysis_key = tryout.keys_from_environment(engine_name)
+    except tryout.TryError as exc:
+        raise CommandProblem(str(exc)) from exc
+
+    started = time.monotonic()
+    try:
+        result = tryout.run_one(
+            args.file,
+            engine_name=engine_name,
+            engine_key=engine_key,
+            analysis_key=analysis_key,
+            languages=_csv(args.languages) or _csv(os.environ.get("LANGUAGES")),
+            vocabulary=_csv(args.vocabulary) or _csv(os.environ.get("VOCABULARY")),
+            region=(os.environ.get("AZURE_SPEECH_REGION") or "").strip(),
+            use_ffprobe=not args.no_ffprobe,
+        )
+    except tryout.TryError as exc:
+        raise CommandProblem(str(exc)) from exc
+    except EngineConfigError as exc:
+        raise CommandProblem(f"the {engine_name} engine could not be built: {exc}") from exc
+    except EngineAuthError as exc:
+        # The likeliest failure of a first run, and the one that must not come back as a
+        # stack trace: it names the variable holding the key that was refused, because
+        # "401" tells a person nothing about which of the two keys is wrong.
+        raise CommandProblem(
+            f"the {engine_name} transcription key was refused: {exc}\n"
+            f"That key is read from {ENGINE_KEY_VARS.get(engine_name, '?')}. Nothing else "
+            "was tried and nothing was spent."
+        ) from exc
+
+    written = tryout.write_files(result, args.out) if args.out else ()
+    print(tryout.render_report(result, full_transcript=args.full, written=written))
+    print(f"\nthe whole run took {time.monotonic() - started:.1f}s")
+    return EXIT_OK
+
+
+def _csv(value: str | None) -> tuple[str, ...]:
+    """A comma-separated option to a tuple, empties dropped."""
+    return tuple(part.strip() for part in (value or "").split(",") if part.strip())
 
 
 def cmd_routes(args: argparse.Namespace) -> int:
