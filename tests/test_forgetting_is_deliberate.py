@@ -235,6 +235,81 @@ class ThePlanTouchesNothing(unittest.TestCase):
         self.assertIn("_Beach.summary.md", plan.unreachable_outputs)
 
 
+class ErasedIsFinal(unittest.TestCase):
+    """Emptying the row is not enough on its own.
+
+    Half a dozen paths write to a ledger row and every one of them would happily fill it
+    back in. The one that matters is the LAST: nobody types it. A file deleted from OneDrive
+    sits in the recycle bin, an administrator restores it three weeks later, the next poll
+    finds it — and without a guard the tombstone of a recording somebody asked to be rid of
+    quietly becomes a recording again, with its name on it, and nobody ever knows.
+    """
+
+    def _erased(self, tmp: str) -> Ledger:
+        led = _ledger(tmp)
+        _finished(led, "a", "Carel dismissal call.m4a")
+        led.erase("a", by="James", because="Carel asked")
+        return led
+
+    def _still_erased(self, led: Ledger) -> None:
+        row = led.get("a")
+        self.assertEqual(row.state, State.ERASED)
+        self.assertFalse(row.name)
+        self.assertNotIn("Carel", (row.name or "") + (row.last_error or ""))
+
+    def test_advance_will_not_move_it_back_into_the_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                with self.assertRaises(Exception):
+                    led.advance("a", State.TRANSCRIBED, language="en-ZA")
+                self._still_erased(led)
+
+    def test_set_fields_will_not_write_the_name_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                led.set_fields("a", name="Carel dismissal call.m4a")
+                self._still_erased(led)
+
+    def test_requeue_will_not_give_it_a_live_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                led.requeue("a", reason="somebody tried")
+                self._still_erased(led)
+
+    def test_quarantine_will_not_either(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                led.quarantine("a", "three engine failures")
+                self._still_erased(led)
+
+    def test_a_failed_attempt_does_not_write_the_recording_back_into_an_error(self) -> None:
+        """Error text quotes the recording: "the engine failed on Carel's call"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                led.record_attempt("a", "the engine failed on Carel dismissal call.m4a")
+                self._still_erased(led)
+
+    def test_a_file_restored_from_the_recycle_bin_is_not_re_ingested(self) -> None:
+        """The automatic one. Nobody types this, which is why it is the dangerous one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._erased(tmp) as led:
+                new = led.upsert_discovered(
+                    DriveItem(item_id="a", name="Carel dismissal call.m4a", size=10))
+                self.assertFalse(new)
+                self._still_erased(led)
+
+    def test_a_worker_mid_flight_cannot_finish_onto_a_tombstone(self) -> None:
+        """Erasing clears the claim, so the worker that held it comes back to a dead row."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a")
+                led.advance("a", State.DONE)
+                led.erase("a", by="James", because="asked")
+                with self.assertRaises(Exception):
+                    led.advance("a", State.DONE, transcript_name="Carel.transcript.md")
+                self.assertFalse(led.get("a").transcript_name)
+
+
 class TheSearchIsNotCapped(unittest.TestCase):
     def test_a_name_search_for_forgetting_returns_every_match(self) -> None:
         """Removing the newest twenty of somebody's two hundred and reporting success is

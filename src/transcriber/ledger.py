@@ -538,6 +538,23 @@ class Ledger:
             "SELECT state, name, size, etag, route FROM items WHERE item_id=?", (item.item_id,)
         ).fetchone()
 
+        if existing is not None and existing["state"] == State.ERASED:
+            # THE AUTOMATIC PATH, and the one that made this guard necessary. Deleting a
+            # file in OneDrive moves it to the recycle bin; an administrator restores it
+            # three weeks later; the next poll finds it and — without this — writes its name
+            # straight back onto the tombstone of a recording somebody asked to be rid of.
+            # Nobody types that. The person who asked would never know it had happened.
+            #
+            # So a file that comes back is a file to delete THERE, not a row to fill in
+            # here. It is logged every time it is seen, because a recording that keeps
+            # reappearing is something a person has to go and deal with.
+            log.warning(
+                f"{item.item_id} was erased at somebody's request and has turned up in the "
+                "source folder again — probably restored from the recycle bin. It has NOT "
+                "been re-ingested. Delete it where it is."
+            )
+            return False
+
         if item.deleted:
             # Deletion at the source is recorded, never mirrored. Our row is the only proof
             # the recording ever existed.
@@ -741,6 +758,39 @@ class Ledger:
 
     # -- state ---------------------------------------------------------------------
 
+    def _refuse_if_erased(self, conn: sqlite3.Connection, item_id: str, what: str) -> bool:
+        """True when this row has been erased, and therefore may not be written to.
+
+        ERASED IS FINAL, and this is the guard that makes that true rather than aspirational.
+        Emptying the row is not enough on its own, because half a dozen paths write to a row
+        and every one of them would happily fill it back in:
+
+          * ``advance`` moved it back into the pipeline;
+          * ``set_fields`` and ``upsert_discovered`` wrote the NAME straight back;
+          * ``record_attempt`` wrote an error message that quoted the recording;
+          * ``requeue`` and ``quarantine`` gave it a live state again.
+
+        The worst is ``upsert_discovered``, because nobody types it. A file deleted from
+        OneDrive goes to the recycle bin, an administrator restores it three weeks later,
+        the next poll finds it, and the tombstone of a recording somebody asked to be rid of
+        quietly becomes a recording again with its name on it. The person who asked would
+        never know, and neither would anybody here.
+
+        So the answer is no, at the boundary, for everything except :meth:`erase` itself —
+        which is idempotent and whose whole job this is.
+        """
+        row = conn.execute("SELECT state FROM items WHERE item_id=?", (item_id,)).fetchone()
+        if row is None or row["state"] != State.ERASED:
+            return False
+        # Pre-formatted: this module's ``log`` is an EventLogger, not the stdlib logger, and
+        # does not take %-style arguments.
+        log.warning(
+            f"refusing to {what} {item_id}: it was erased at somebody's request, and ERASED "
+            "is final. If this is a file that came back from the recycle bin, it needs "
+            "deleting there rather than re-ingesting here."
+        )
+        return True
+
     def advance(self, item_id: str, state: str, **fields: Any) -> None:
         """Move a row to ``state``, writing any accompanying fields in the same statement.
 
@@ -757,6 +807,12 @@ class Ledger:
             if current is None:
                 raise LedgerError(f"no ledger row for {item_id!r}: it must be discovered before it can advance")
             was = current["state"]
+            if was == State.ERASED:
+                raise LedgerStateError(
+                    f"{item_id} was erased at somebody's request; ERASED is final. Nothing "
+                    "moves it back into the pipeline, because a recording that came back is "
+                    "a file to delete rather than a row to fill in."
+                )
             if was == State.DONE and state != State.DONE:
                 raise LedgerStateError(
                     f"{item_id} is DONE; moving it back to {state} would erase a finished "
@@ -872,6 +928,8 @@ class Ledger:
         now = utc_now_iso()
         assignments, values = self._assignments(fields)
         with self._tx() as conn:
+            if self._refuse_if_erased(conn, item_id, "write fields to"):
+                return
             cur = conn.execute(
                 f"UPDATE items SET updated_at=?, {', '.join(assignments)} WHERE item_id=?",
                 (now, *values, item_id),
@@ -895,6 +953,8 @@ class Ledger:
             current = conn.execute("SELECT state FROM items WHERE item_id=?", (item_id,)).fetchone()
             if current is None:
                 raise LedgerError(f"no ledger row for {item_id!r}")
+            if self._refuse_if_erased(conn, item_id, "quarantine"):
+                return
             conn.execute(
                 "UPDATE items SET state=?, quarantine_reason=?, quarantined_at=?, updated_at=?,"
                 + self._CLAIM_RELEASE + " WHERE item_id=?",
@@ -938,6 +998,8 @@ class Ledger:
             ).fetchone()
             if current is None:
                 raise LedgerError(f"no ledger row for {item_id!r}")
+            if self._refuse_if_erased(conn, item_id, "requeue"):
+                return
             # A requeue is an explicit decision that this should be tried *now*. Leaving the
             # previous attempt's backoff in place made the sweep's "re-queued from the start"
             # a half-truth — the row sat out up to another hour — and made a person's manual
@@ -997,6 +1059,10 @@ class Ledger:
         clean = self._clean(error)
         now = utc_now_iso()
         with self._tx() as conn:
+            # The error text quotes the recording — "the engine failed on Carel's call" —
+            # so this path puts a name back on a tombstone as surely as set_fields does.
+            if self._refuse_if_erased(conn, item_id, "record a failed attempt against"):
+                return 0
             cur = conn.execute(
                 "UPDATE items SET attempts=attempts+1, last_error=?, updated_at=?,"
                 + self._CLAIM_RELEASE + " WHERE item_id=?",
