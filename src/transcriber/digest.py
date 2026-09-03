@@ -59,6 +59,8 @@ from . import release as release_module
 from . import sitebook
 from .heartbeat import Heartbeat, PingResult
 from .ledger import Ledger
+from . import prices
+from .extract import Spend
 from .models import (
     DEFAULT_ROUTE,
     DigestCounts,
@@ -1553,6 +1555,111 @@ class DigestResult:
 # --------------------------------------------------------------------------- building
 
 
+@dataclass
+class SpendReport:
+    """What the analysis pass cost, for the day and for the month it sits in.
+
+    A METER, NOT A BRAKE. Nothing here stops anything: it was asked for as a number to
+    look at, and a ceiling that paused the reading was considered and not chosen. So this
+    reports and returns, and there is no code path from this dataclass to a decision.
+
+    Both a day and a month, because either alone misleads. One day says nothing about the
+    trend and every day looks small; a month-to-date figure on the 2nd looks like nothing
+    and on the 28th looks alarming with no way to tell which. Together they answer "is
+    today normal" and "where will the month land".
+    """
+
+    day: str = ""
+    day_usd: float = 0.0
+    day_recordings: int = 0
+    month: str = ""
+    month_usd: float = 0.0
+    month_recordings: int = 0
+    month_calls: int = 0
+    #: Tokens for the month, split the way they are billed. The reader's output is normally
+    #: three quarters of the bill, and that is only visible if output is kept apart.
+    month_input: int = 0
+    month_output: int = 0
+    month_cache_read: int = 0
+    month_cache_write: int = 0
+    #: Models this deployment used that the price list has no entry for. Their tokens are
+    #: counted and their money is NOT, so a non-empty list means every figure above is an
+    #: undercount, and the section says so rather than printing a total that looks whole.
+    unpriced: tuple[str, ...] = ()
+    priced_on: str = ""
+
+    @property
+    def projected_month_usd(self) -> float:
+        """Where the month lands if the rest of it looks like the part measured.
+
+        Straight-line from the days elapsed. Crude on purpose and labelled as such in the
+        email - a builder's month is not uniform, and a cleverer projection would be a
+        guess with better presentation.
+        """
+        try:
+            elapsed = int(self.day.split("-")[2])
+        except (IndexError, ValueError):
+            return 0.0
+        if elapsed < 1:
+            return 0.0
+        return self.month_usd / elapsed * 30.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "day": self.day,
+            "day_usd": round(self.day_usd, 4),
+            "day_recordings": self.day_recordings,
+            "month": self.month,
+            "month_usd": round(self.month_usd, 4),
+            "month_recordings": self.month_recordings,
+            "month_calls": self.month_calls,
+            "month_tokens": {
+                "input": self.month_input,
+                "output": self.month_output,
+                "cache_read": self.month_cache_read,
+                "cache_write": self.month_cache_write,
+            },
+            "projected_month_usd": round(self.projected_month_usd, 2),
+            "unpriced": list(self.unpriced),
+            "priced_on": self.priced_on,
+        }
+
+
+def spend_report(config: Any, ledger: Ledger, *, day: str) -> SpendReport:
+    """Read the recorded token counts and price them. Reads only."""
+    month = day[:7] if len(day) >= 7 else ""
+    since = f"{month}-01" if month else day
+    try:
+        rows = ledger.spend_since(since)
+    except Exception:  # noqa: BLE001 - a meter must never be the reason an email fails
+        log.warning("the spend meter could not read the ledger; the email omits it")
+        return SpendReport(day=day, month=month, priced_on=prices.CHECKED_ON)
+
+    report = SpendReport(day=day, month=month, priced_on=prices.CHECKED_ON)
+    unpriced: list[str] = []
+    for row in rows:
+        calls = [Spend.from_dict(c) for c in row.get("calls") or ()]
+        if not calls:
+            continue
+        amount, missing = prices.cost_of_all(calls)
+        for name in missing:
+            if name not in unpriced:
+                unpriced.append(name)
+        report.month_usd += amount
+        report.month_recordings += 1
+        report.month_calls += len(calls)
+        for call in calls:
+            report.month_input += call.input_tokens
+            report.month_output += call.output_tokens
+            report.month_cache_read += call.cache_read_tokens
+            report.month_cache_write += call.cache_write_tokens
+        if str(row.get("at") or "").startswith(day):
+            report.day_usd += amount
+            report.day_recordings += 1
+    report.unpriced = tuple(unpriced)
+    return report
+
+
 def build(
     config: Any,
     ledger: Ledger,
@@ -1587,6 +1694,7 @@ def build(
     held = held_report(config, ledger, day=target, now=utc_now_iso(clock))
     disagreements = route_disagreements(ledger, target)
     naming = naming_report(config, ledger, day=target)
+    spend = spend_report(config, ledger, day=target)
     if sweep_report is None:
         sweep_report = _stored_report(ledger, "sweep")
     if archive_report is None:
@@ -1597,6 +1705,7 @@ def build(
     body = _render(
         config,
         counts,
+        spend=spend,
         subject=subject,
         moment=moment,
         today_failures=today_failures,
@@ -1913,6 +2022,7 @@ def _render(
     service_error: str = "",
     attention: Mapping[str, Any] | None = None,
     expiries: Sequence[tuple[int, str]] = (),
+    spend: "SpendReport | None" = None,
 ) -> str:
     lines: list[str] = [subject, ""]
 
@@ -2018,6 +2128,11 @@ def _render(
         f"  finished yesterday (whenever they arrived): {counts.done_on_day}",
         "",
     ]
+
+    # Directly under the counts, because it is the same cohort measured in money. Nothing
+    # in this section stops anything - it is a meter, and it was asked for as one.
+    if spend is not None and (spend.month_calls or spend.unpriced):
+        lines += _spend_section(spend)
 
     # Directly under the counts, because it is the sentence that stops "still in progress"
     # above from being read as "lost". A queue is work in hand; the failures are above and
@@ -2133,6 +2248,82 @@ def _render(
         "commitments and questions as proposals for you to confirm.",
     ]
     return "\n".join(lines)
+
+
+def _spend_section(spend: "SpendReport") -> list[str]:
+    """What the AI pass cost. Reports; decides nothing; stops nothing.
+
+    The provenance line is not decoration. The setup guide told him this cost "a few
+    dollars a month" when it was nearer eighty, and the reason nobody caught it is that the
+    figure carried no date and no workings. Every figure here says which price list it came
+    from and when that list was read, so a stale number is visible rather than trusted.
+    """
+    lines = ["WHAT THE AI PASS COST", _RULE]
+    lines.append(f"  yesterday                {_usd(spend.day_usd)}   "
+                 f"({spend.day_recordings} recording{'' if spend.day_recordings == 1 else 's'})")
+    lines.append(f"  this month so far        {_usd(spend.month_usd)}   "
+                 f"({spend.month_recordings} recording{'' if spend.month_recordings == 1 else 's'}, "
+                 f"{spend.month_calls} model call{'' if spend.month_calls == 1 else 's'})")
+    projected = spend.projected_month_usd
+    if projected:
+        lines.append(f"  the month at this rate   {_usd(projected)}   "
+                     "(straight-line, and a month of building is not straight)")
+    lines.append("")
+
+    total_tokens = (spend.month_input + spend.month_output
+                    + spend.month_cache_read + spend.month_cache_write)
+    if total_tokens:
+        # Tokens, and named as such. Calling them words would overstate the reading by
+        # about a third, and it is exactly the sort of figure that gets repeated.
+        lines.append("  what was read and written this month, in tokens")
+        lines.append("  (a token is roughly three quarters of a word)")
+        lines.append(f"    sent to the model            {spend.month_input:>12,}")
+        lines.append(f"    it wrote back                {spend.month_output:>12,}")
+        if spend.month_cache_read or spend.month_cache_write:
+            lines.append(f"    re-read from cache, cheaply  {spend.month_cache_read:>12,}")
+            if spend.month_cache_write:
+                lines.append(f"    put into the cache           {spend.month_cache_write:>12,}")
+        # The reader's answers are normally most of the bill, and that is the one line here
+        # that suggests what to change if the figure ever matters.
+        if spend.month_output:
+            lines.append("")
+            for chunk in _wrap(
+                "What it writes back costs five times what it reads, so the middle line is "
+                "usually most of the bill. If this ever needs to come down, that is the "
+                "number to aim at - not the number of recordings."
+            ):
+                lines.append(f"  {chunk}")
+        lines.append("")
+
+    if spend.unpriced:
+        # Said loudly, because every figure above is an undercount when this fires and a
+        # total that quietly omits a model reads exactly like a total that includes it.
+        for chunk in _wrap(
+            "EVERY FIGURE ABOVE IS AN UNDERCOUNT. This deployment used "
+            + ", ".join(spend.unpriced)
+            + ", which the price list has no entry for, so those calls are counted and not "
+              "costed. Tell me and I will add them; until then the real figure is higher "
+              "than the one above by however much they came to."
+        ):
+            lines.append(f"  {chunk}")
+        lines.append("")
+
+    for chunk in _wrap(
+        f"What is recorded against each recording is the tokens it used; the money is "
+        f"worked out when this email is written, from the published rates as they stood on "
+        f"{spend.priced_on}. If those rates have moved, this figure has moved with them and "
+        f"the token counts are still right. Nothing here stops anything: it is a meter."
+    ):
+        lines.append(f"  {chunk}")
+    lines.append("")
+    return lines
+
+
+def _usd(amount: float) -> str:
+    """Money, at a precision that does not pretend to more than it knows."""
+    if amount and amount < 0.01:
+        return "under $0.01"
+    return f"${amount:,.2f}"
 
 
 def _held_section(held: "HeldReport") -> list[str]:

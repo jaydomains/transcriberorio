@@ -1084,6 +1084,46 @@ class Ledger:
             out.append(entry)
         return out
 
+    def spend_since(self, since: str, route: str | None = None) -> list[dict]:
+        """Every recorded analysis spend stamped on or after ``since`` (an ISO date).
+
+        Narrowed in SQL and decided in Python, on purpose. The date that matters is the one
+        stamped inside the spend record, and reaching into JSON from SQL would tie this
+        query to whether the SQLite the deployment happens to have was built with the JSON
+        extension. The SQL clause is a cheap over-fetch on the columns that do exist; the
+        filter that counts is the stamp.
+
+        Rows are small and there are hundreds a month, not millions.
+        """
+        conn = self._conn()
+        clause, params = self._route_filter(route)
+        out: list[dict] = []
+        for record in conn.execute(
+            "SELECT meta, route FROM items"
+            " WHERE COALESCE(done_at, updated_at, discovered_at) >= ?"
+            f"{clause}",
+            (since, *params),
+        ).fetchall():
+            try:
+                meta = json.loads(record["meta"] or "{}")
+            except ValueError:
+                continue
+            entry = meta.get("spend")
+            if not isinstance(entry, Mapping):
+                continue
+            at = str(entry.get("at") or "")
+            if at < since:
+                continue
+            calls = entry.get("calls")
+            if not isinstance(calls, (list, tuple)):
+                continue
+            out.append({
+                "at": at,
+                "route": record["route"],
+                "calls": [dict(c) for c in calls if isinstance(c, Mapping)],
+            })
+        return out
+
     def counts_for_day(self, day: str, route: str | None = None) -> dict:
         """What the digest reports: the cohort discovered on ``day`` and how it ended up.
 

@@ -167,7 +167,23 @@ transcription.
 
 Go to **console.anthropic.com** → **API keys** → **Create key**. Name it `kbc-transcriber`.
 
-Cost is small — a few dollars a month at your volume.
+**About $80 a month at your volume** — call it R1,500. The range is $45 to $140 depending on
+how much gets said on your recordings, and it is the largest running cost in the whole
+project, bigger than transcription and the server put together.
+
+> This line used to say "a few dollars a month". That was wrong by about twenty times, and
+> it stayed wrong because the figure had no workings and no date next to it. The number
+> above is worked out from the actual settings this service ships with, at published rates
+> as at 24 June 2026. **Do not trust it either** — from the first morning the email tells
+> you what it really cost, yesterday and month to date, priced from a list that says when it
+> was last checked.
+
+Nothing caps it. That was your call and it is written down as one: you get the number, and
+the service never stops reading on your behalf. If you change your mind it is a small job.
+
+Most of the bill is the model *writing*, not reading — its answers cost five times what the
+transcript does. So if it ever needs to come down, the thing to change is how much it is
+asked to write, not how many recordings you make.
 
 ---
 
