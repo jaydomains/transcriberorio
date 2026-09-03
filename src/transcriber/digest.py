@@ -1496,6 +1496,10 @@ class Digest:
     #: The held-passage queue and, while the gate ships dark, the measurement. Counts, sites
     #: and ages — never a word of what anybody said.
     held: HeldReport = field(default_factory=HeldReport)
+    #: What the analysis pass cost. Carried on the digest rather than only rendered into the
+    #: body, because the group email needs the figure and must not parse it back out of
+    #: somebody's prose.
+    spend: "SpendReport" = field(default_factory=lambda: SpendReport())
 
     @property
     def needs_a_person(self) -> bool:
@@ -1770,6 +1774,7 @@ def build(
         route_disagreements=disagreements,
         queue=queue,
         held=held,
+        spend=spend,
     )
 
 
@@ -2458,6 +2463,164 @@ def _personalised(body: str, base_url: str, link: str) -> str:
     return body.replace(marker, f"Answer them here: {link}")
 
 
+def _deliver(
+    config: Any,
+    outgoing: Sequence[EmailMessage],
+    *,
+    host: str,
+    port: int,
+    smtp_factory: Callable[..., Any] | None,
+    primary_count: int,
+    log_subject: str,
+    what: str = "the morning digest",
+) -> SendResult:
+    """Open one connection, send each message on its own, and report honestly.
+
+    Shared by the personal digest and the group email so the lessons in here are learned
+    once. They were expensive: see the long comment below about the morning this loop sent
+    seventy-two copies of the same email.
+
+    ``primary_count`` is how many of ``outgoing`` are the main recipients; anything after
+    that index is counted as a reviewer in the result. ``what`` names the mail in the log
+    lines, because "the morning digest could not be sent" about the group email would send
+    somebody looking at the wrong thing.
+    """
+    scrub = getattr(config, "scrub", None)
+
+    def _said(exc: Exception) -> str:
+        detail = f"{type(exc).__name__}: {exc}"
+        return scrub(detail) if callable(scrub) else detail
+
+    def _temporary(exc: Exception) -> bool:
+        """Whether the relay said "not now" rather than "not ever".
+
+        A 4xx is greylisting or a full mailbox: the address is fine and tomorrow will
+        probably work. A 5xx is a mailbox that is gone. Both are reported; they are worth
+        telling apart because one is somebody's job to fix and the other is the mail system
+        doing what it does.
+        """
+        codes: list[int] = []
+        answers = getattr(exc, "recipients", None)
+        if isinstance(answers, dict):
+            for answer in answers.values():
+                try:
+                    codes.append(int(answer[0]))
+                except (TypeError, ValueError, IndexError):
+                    pass
+        code = getattr(exc, "smtp_code", None)
+        if isinstance(code, int):
+            codes.append(code)
+        return bool(codes) and all(400 <= c < 500 for c in codes)
+
+    # One address the relay will not take must not stop the others. It used to: every
+    # message went inside one try, so a mailbox deleted when somebody left aborted the loop
+    # at that address. Everyone earlier in the list had already received the email, everyone
+    # later got nothing, and the whole send reported ok=False — which leaves DIGEST_DAY_MARK
+    # unwritten, so `should_run` fires again fifteen minutes later and sends the same email
+    # to the same people. Roughly seventy-two copies before midnight, every day, while the
+    # log and the monitor both said it could not be sent. That is the mail loop RETRY_AFTER_S
+    # was written to prevent, arriving as delivered mail rather than as retries.
+    #
+    # With the gate armed it also silently skipped every reviewer sorted after the bad
+    # address, so people never got the link to passages waiting on them, and nothing recorded
+    # who was missed.
+    refused: list[str] = []
+    delivered_recipients = 0
+    delivered_reviewers = 0
+    try:
+        with _connect(config, host, port, smtp_factory) as server:
+            for index, message in enumerate(outgoing):
+                try:
+                    server.send_message(message)
+                except Exception as exc:  # noqa: BLE001 - one address, not the whole morning
+                    when = "temporarily" if _temporary(exc) else "permanently"
+                    refused.append(f"{message['To']} ({when} — {_said(exc)})")
+                    continue
+                if index < primary_count:
+                    delivered_recipients += 1
+                else:
+                    delivered_reviewers += 1
+    except Exception as exc:  # noqa: BLE001 - the connection itself; nothing went out
+        detail = _said(exc)
+        # ERROR, not WARNING: an unsendable digest is the failure mode this service exists
+        # to remove, and it must be loud even though nothing raises.
+        log.error("%s could NOT be sent via %s:%s — %s", what, host, port, detail)
+        return SendResult(ok=False, detail=detail, recipients=primary_count, host=host)
+
+    if refused:
+        # Loud, and named — but NOT a failed send, because the people who were reachable have
+        # the email in their hands and must not be sent it again every quarter of an hour.
+        #
+        # The cost of that choice, stated rather than hidden: an address refused TEMPORARILY
+        # — greylisting, a full mailbox — misses this one morning rather than being retried,
+        # because retrying means re-sending to everyone who already has it. The alternative
+        # was the mail loop this replaced, which sent Jay seventy-two copies. The word
+        # "temporarily" in the line below is what tells a person which of the two happened,
+        # and tomorrow's send is the retry.
+        log.error(
+            "%s was refused for %d address(es) via %s:%s — %s",
+            what, len(refused), host, port, "; ".join(refused),
+        )
+    if not delivered_recipients and not delivered_reviewers:
+        # Nobody at all got it. That is a failed morning however the relay phrased it.
+        return SendResult(
+            ok=False, detail="; ".join(refused) or "no message was accepted",
+            recipients=primary_count, host=host,
+        )
+
+    log.info(
+        "%s sent to %d recipient(s) and %d reviewer(s) via %s:%s — %s",
+        what, delivered_recipients, delivered_reviewers, host, port, log_subject,
+    )
+    return SendResult(
+        ok=True,
+        detail="; ".join(refused),
+        recipients=delivered_recipients,
+        host=host,
+        reviewers=delivered_reviewers,
+    )
+
+
+def send_group(
+    config: Any,
+    subject: str,
+    body: str,
+    *,
+    smtp_factory: Callable[..., Any] | None = None,
+) -> SendResult:
+    """Send the one consolidated email to whoever is configured as the admin.
+
+    Separate from :func:`send` and not a mode of it, because the two have different
+    recipients and a different rule about what may be in the body. The personal digest
+    carries a review link, which is a capability belonging to one person; the group email
+    carries counts about everybody and so must never carry a link at all. Sharing one
+    function would mean one edit away from mailing everyone's capability to the admin.
+    """
+    recipients = tuple(getattr(config, "group_admin_to", ()) or ())
+    host = str(getattr(config, "smtp_host", "") or "")
+    port = int(getattr(config, "smtp_port", 587) or 587)
+    if not recipients or not host:
+        return SendResult(ok=False, detail="no group admin recipient is configured",
+                          recipients=0, host=host)
+
+    sender = str(getattr(config, "smtp_from", "") or "")
+    outgoing = []
+    for who in recipients:
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = sender
+        message["To"] = who
+        message["Date"] = formatdate(localtime=True)
+        message["Message-ID"] = make_msgid()
+        message["Auto-Submitted"] = "auto-generated"
+        message.set_content(body, subtype="plain", charset="utf-8")
+        outgoing.append(message)
+    return _deliver(
+        config, outgoing, host=host, port=port, smtp_factory=smtp_factory,
+        primary_count=len(recipients), log_subject=subject, what="the group email",
+    )
+
+
 def send(
     config: Any,
     digest: Digest,
@@ -2510,93 +2673,12 @@ def send(
                   _own_queue_subject(digest, who))
         )
 
-    scrub = getattr(config, "scrub", None)
-
-    def _said(exc: Exception) -> str:
-        detail = f"{type(exc).__name__}: {exc}"
-        return scrub(detail) if callable(scrub) else detail
-
-    def _temporary(exc: Exception) -> bool:
-        """Whether the relay said "not now" rather than "not ever".
-
-        A 4xx is greylisting or a full mailbox: the address is fine and tomorrow will
-        probably work. A 5xx is a mailbox that is gone. Both are reported; they are worth
-        telling apart because one is somebody's job to fix and the other is the mail system
-        doing what it does.
-        """
-        codes: list[int] = []
-        recipients = getattr(exc, "recipients", None)
-        if isinstance(recipients, dict):
-            for answer in recipients.values():
-                try:
-                    codes.append(int(answer[0]))
-                except (TypeError, ValueError, IndexError):
-                    pass
-        code = getattr(exc, "smtp_code", None)
-        if isinstance(code, int):
-            codes.append(code)
-        return bool(codes) and all(400 <= c < 500 for c in codes)
-
-    # One address the relay will not take must not stop the others. It used to: every
-    # message went inside one try, so a mailbox deleted when somebody left aborted the loop
-    # at that address. Everyone earlier in the list had already received the email, everyone
-    # later got nothing, and the whole send reported ok=False — which leaves DIGEST_DAY_MARK
-    # unwritten, so `should_run` fires again fifteen minutes later and sends the same email
-    # to the same people. Roughly seventy-two copies before midnight, every day, while the
-    # log and the monitor both said it could not be sent. That is the mail loop RETRY_AFTER_S
-    # was written to prevent, arriving as delivered mail rather than as retries.
-    #
-    # With the gate armed it also silently skipped every reviewer sorted after the bad
-    # address, so people never got the link to passages waiting on them, and nothing recorded
-    # who was missed.
-    refused: list[str] = []
-    delivered_recipients = 0
-    delivered_reviewers = 0
-    try:
-        with _connect(config, host, port, smtp_factory) as server:
-            for index, message in enumerate(outgoing):
-                try:
-                    server.send_message(message)
-                except Exception as exc:  # noqa: BLE001 - one address, not the whole morning
-                    when = "temporarily" if _temporary(exc) else "permanently"
-                    refused.append(f"{message['To']} ({when} — {_said(exc)})")
-                    continue
-                if index < len(recipients):
-                    delivered_recipients += 1
-                else:
-                    delivered_reviewers += 1
-    except Exception as exc:  # noqa: BLE001 - the connection itself; nothing went out
-        detail = _said(exc)
-        # ERROR, not WARNING: an unsendable digest is the failure mode this service exists
-        # to remove, and it must be loud even though nothing raises.
-        log.error("the morning digest could NOT be sent via %s:%s — %s", host, port, detail)
-        return SendResult(ok=False, detail=detail, recipients=len(recipients), host=host)
-
-    if refused:
-        # Loud, and named — but NOT a failed send, because the people who were reachable have
-        # the email in their hands and must not be sent it again every quarter of an hour.
-        #
-        # The cost of that choice, stated rather than hidden: an address refused TEMPORARILY
-        # — greylisting, a full mailbox — misses this one morning rather than being retried,
-        # because retrying means re-sending to everyone who already has it. The alternative
-        # was the mail loop this replaced, which sent Jay seventy-two copies. The word
-        # "temporarily" in the line below is what tells a person which of the two happened,
-        # and tomorrow's send is the retry.
-        log.error(
-            "the morning digest was refused for %d address(es) via %s:%s — %s",
-            len(refused), host, port, "; ".join(refused),
-        )
-    if not delivered_recipients and not delivered_reviewers:
-        # Nobody at all got it. That is a failed morning however the relay phrased it.
-        return SendResult(
-            ok=False, detail="; ".join(refused) or "no message was accepted",
-            recipients=len(recipients), host=host,
-        )
-
-    log.info(
-        "morning digest sent to %d recipient(s) and %d reviewer(s) via %s:%s — %s",
-        delivered_recipients, delivered_reviewers, host, port, digest.subject,
+    return _deliver(
+        config, outgoing, host=host, port=port, smtp_factory=smtp_factory,
+        primary_count=len(recipients), log_subject=digest.subject,
     )
+
+
     return SendResult(
         ok=True,
         detail="; ".join(refused),
@@ -2723,7 +2805,78 @@ def run(
         # thing worse than a broken morning is a broken morning nobody hears about.
         ping = monitor.fail(f"the morning digest could not be sent: {sent.detail}")
 
+    # --- the group view, strictly last ---------------------------------------------
+    # Everything above has happened: the email is sent, the day is marked, the monitor is
+    # told. Nothing below may change any of that. One person running this alone does none
+    # of it, because INSTANCE_NAME and GROUP_FOLDER_ID are unset and `_group_step` returns
+    # on the first line.
+    _group_step(config, digest, smtp_factory=smtp_factory, now=clock)
+
     return DigestResult(digest=digest, sent=sent, ping=ping)
+
+
+def _group_step(
+    config: Any,
+    digest: Digest,
+    *,
+    smtp_factory: Callable[..., Any] | None = None,
+    now: float | None = None,
+    client: Any = None,
+) -> None:
+    """Write this copy's status, and send the group email if this copy is the admin's.
+
+    Swallows everything. The one thing this function must never do is turn a morning where
+    somebody got their email into a morning where they did not, and it is called after that
+    email has already gone out precisely so that it cannot.
+    """
+    if not str(getattr(config, "group_folder_id", "") or "").strip():
+        return
+    try:
+        from . import group as group_module
+
+        drive = client
+        if drive is None:
+            # A second client, because the shared folder is normally in somebody else's
+            # drive: this copy's own client is pinned to this person's drive, which is the
+            # whole reason a shared folder is needed.
+            owner = str(getattr(config, "group_drive_user_id", "") or "").strip()
+            drive = _graph_for(config, user_id=owner) if owner else _graph_for(config)
+
+        status = group_module.status_of(
+            config, counts=digest.counts, spend=getattr(digest, "spend", None),
+            held=getattr(digest, "held", None),
+        )
+        group_module.write_status(config, status, client=drive)
+
+        if not group_module.is_admin(config):
+            return
+        peers = group_module.read_statuses(config, client=drive, now=now)
+        report = group_module.GroupReport(
+            day=digest.day,
+            peers=tuple(peers),
+            silent_after_hours=int(getattr(config, "group_silent_after_hours", 36) or 36),
+        )
+        body = group_module.render_group_email(report, priced_on=prices.CHECKED_ON)
+        result = send_group(config, group_module.subject_for_group(report), body,
+                            smtp_factory=smtp_factory)
+        if not result.ok:
+            log.warning("the group email could not be sent: %s", result.detail)
+    except Exception:  # noqa: BLE001 - see the docstring; this may never break a morning
+        log.warning("the group view could not be updated this morning", exc_info=True)
+
+
+def _graph_for(config: Any, *, user_id: str = "") -> Any:
+    """A Graph client for the shared folder's drive, or this copy's own.
+
+    Imported here rather than at module scope: the digest is built and rendered in tests
+    that have no credentials, and a module-level import of the Graph client would make
+    reading an email require a tenant.
+    """
+    from .graph import GraphClient
+
+    if user_id:
+        return GraphClient.from_config(config, user_id=user_id)
+    return GraphClient.from_config(config)
 
 
 def should_run(config: Any, ledger: Ledger, *, now: float | None = None) -> bool:

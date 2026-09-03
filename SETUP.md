@@ -210,6 +210,63 @@ Then decide **which address receives it**. Your own, presumably.
 
 ---
 
+## Step 5b — One email about everybody (only if more than one person is recording)
+
+**Skip this entirely if it is just you.** Nothing below applies, and nothing about it turns
+itself on.
+
+Each person runs their own copy of this against their own OneDrive. That is the right shape
+— a recording never leaves the drive of whoever made it — and it leaves one gap:
+
+> When somebody's copy stops working, the only person who gets told is the one person whose
+> record does not suffer for it. Sipho's transcriber dying is Sipho's email, and Sipho is
+> on site.
+
+So each copy drops one small file into a shared folder every morning, and whichever copy
+you nominate reads all of them and sends **one** email about everybody. Its subject line
+leads with the thing nobody else can see:
+
+```
+⚠ Recordings, everyone: NO WORD FROM Sipho
+```
+
+Everyone still gets their own email about their own recordings. This is in addition, and
+it goes to whoever you name.
+
+### What to do
+
+1. **Make one folder** anywhere in your own OneDrive — call it `/TRANSCRIBER STATUS`. It
+   holds a handful of tiny files and nothing else.
+2. **On every copy**, set two things: `INSTANCE_NAME` to that person's name as you want it
+   to read in the email (`James`, `Sipho`), and `GROUP_FOLDER_ID` to that folder.
+   `GROUP_DRIVE_USER_ID` is your own account, since the folder is in your drive.
+3. **On one copy only** — whoever should get the group email — also set `GROUP_ADMIN_TO` to
+   their address. That single setting is what makes a copy the one that reports. Move it to
+   a different copy and the job moves with it; put it on two and you get two group emails,
+   which is the visible mistake rather than the silent one.
+
+### What is in those files, and what is not
+
+**Counts, a name, and a timestamp. Nothing else.** Here is a whole one:
+
+```json
+{ "instance": "James", "day": "2026-09-02", "arrived": 23, "done": 20,
+  "failed": 3, "held_pending": 2, "spend_day_usd": 2.37, "written_at": "..." }
+```
+
+No recording names. No words from any recording. Not one line of what anybody said.
+
+That is deliberate and it is the same rule as the approval page: **nobody reads anybody
+else's held passages, including you.** A staff member who finds out the boss can read
+their held words stops keeping a folder — and then the recordings are gone, which is the
+whole loss this project exists to cure. A shared file listing *"Sipho, 3 stopped:
+DISCIPLINARY HEARING NOTES.m4a"* would get round that sideways, so the code refuses to
+write anything but numbers, in three separate places, and there is a test that reads the
+file back and fails if a recording name appears in it.
+
+The group email tells you Sipho has three stopped and hasn't checked in since Monday. What
+they are is in Sipho's own email, and that is where it stays.
+
 ## Step 6 — Set up the "is it still alive" alarm
 
 This is the one alarm that still works when everything else is dead — including when the whole
