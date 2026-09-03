@@ -89,6 +89,11 @@ class ErasePlan:
     candidates: tuple[EraseCandidate, ...] = ()
     #: What was asked for, echoed back so a report says what it was answering.
     asked: str = ""
+    #: Whether the held store was actually consulted. False means the held count below is
+    #: not a measurement and must be printed as "could not tell" rather than as "none" —
+    #: a preview that shows a confident zero about the most sensitive thing it removes is
+    #: worse than one that admits it does not know.
+    held_counted: bool = False
 
     @property
     def recordings(self) -> int:
@@ -140,8 +145,17 @@ class EraseResult:
         return not self.files_refused
 
 
-def plan(ledger: Any, *, rows: Sequence[Row], asked: str = "") -> ErasePlan:
-    """What erasing these rows would reach. Reads only; writes nothing; deletes nothing."""
+def plan(ledger: Any, *, rows: Sequence[Row], asked: str = "",
+         held_store: Any = None) -> ErasePlan:
+    """What erasing these rows would reach. Reads only; writes nothing; deletes nothing.
+
+    ``held_store`` is optional and should almost always be given. Without it the plan can
+    still count recordings and files, but it cannot count HELD PASSAGES — and those are the
+    most sensitive thing an erasure removes. A preview that lists twelve files and says
+    nothing about five held passages understates exactly the part somebody would want to be
+    asked about twice. When it cannot be read, the plan says so rather than showing a zero:
+    "none" and "could not tell" are different answers.
+    """
     candidates: list[EraseCandidate] = []
     for row in rows:
         if getattr(row, "state", "") == State.ERASED:
@@ -162,9 +176,21 @@ def plan(ledger: Any, *, rows: Sequence[Row], asked: str = "") -> ErasePlan:
             source_present=not getattr(row, "source_deleted_at", None),
             output_names=names,
             output_ids=ids,
-            held_passages=0,
+            held_passages=_held_count(held_store, row.item_id),
         ))
-    return ErasePlan(candidates=tuple(candidates), asked=asked)
+    return ErasePlan(candidates=tuple(candidates), asked=asked,
+                     held_counted=held_store is not None)
+
+
+def _held_count(held_store: Any, item_id: str) -> int:
+    """How many held passages this recording has. Zero when there is nothing to ask."""
+    if held_store is None:
+        return 0
+    try:
+        return len(held_store.for_recording(item_id))
+    except Exception:  # noqa: BLE001 - a plan that cannot count must not fail to print
+        log.warning("could not count held passages for %s", item_id, exc_info=True)
+        return 0
 
 
 def _output_ids(row: Any) -> tuple[str, ...]:

@@ -2679,15 +2679,6 @@ def send(
     )
 
 
-    return SendResult(
-        ok=True,
-        detail="; ".join(refused),
-        recipients=delivered_recipients,
-        host=host,
-        reviewers=delivered_reviewers,
-    )
-
-
 def _own_queue_subject(digest: Digest, who: str) -> str:
     return f"Your held passages — {digest.day}"
 

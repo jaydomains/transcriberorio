@@ -235,6 +235,50 @@ class ThePlanTouchesNothing(unittest.TestCase):
         self.assertIn("_Beach.summary.md", plan.unreachable_outputs)
 
 
+class ThePreviewNamesTheMostSensitiveThingItRemoves(unittest.TestCase):
+    """The whole premise of `forget` is that it shows first.
+
+    A preview that lists twelve files and says nothing about five held passages understates
+    exactly the part somebody should be asked about twice — a staff matter, somebody's
+    health, an admission of liability.
+    """
+
+    class _Store:
+        def __init__(self, per_item: int = 0, broken: bool = False):
+            self.per_item, self.broken = per_item, broken
+
+        def for_recording(self, item_id, **kw):
+            if self.broken:
+                raise RuntimeError("the store is locked")
+            return tuple(range(self.per_item))
+
+    def test_held_passages_are_counted_into_the_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a")
+                plan = erase_module.plan(led, rows=[led.get("a")],
+                                         held_store=self._Store(per_item=5))
+        self.assertEqual(plan.held, 5)
+        self.assertTrue(plan.held_counted)
+
+    def test_without_a_store_the_plan_admits_it_did_not_look(self) -> None:
+        """A confident zero about the most sensitive thing is worse than "I don't know"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a")
+                plan = erase_module.plan(led, rows=[led.get("a")])
+        self.assertEqual(plan.held, 0)
+        self.assertFalse(plan.held_counted)
+
+    def test_a_store_that_cannot_be_read_does_not_stop_the_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with _ledger(tmp) as led:
+                _finished(led, "a", "Carel dismissal call.m4a")
+                plan = erase_module.plan(led, rows=[led.get("a")],
+                                         held_store=self._Store(broken=True))
+        self.assertEqual(plan.recordings, 1)
+
+
 class ErasedIsFinal(unittest.TestCase):
     """Emptying the row is not enough on its own.
 

@@ -1234,7 +1234,8 @@ def cmd_forget(args: argparse.Namespace) -> int:
             return 0
 
         asked = _forget_asked(args)
-        plan = erase_module.plan(ledger, rows=rows, asked=asked)
+        store = _held_store(config)
+        plan = erase_module.plan(ledger, rows=rows, asked=asked, held_store=store)
         _print_forget_plan(plan)
 
         if not args.really:
@@ -1253,10 +1254,8 @@ def cmd_forget(args: argparse.Namespace) -> int:
             print("  difference is the only thing that will matter.")
             return 2
 
-        client = graph_factory
-        store = _held_store(config)
         result = erase_module.erase(ledger, plan, by=who, because=why,
-                                    client=client, held_store=store)
+                                    client=graph_factory, held_store=store)
         _print_forget_result(result)
         return 0 if result.ok else 1
 
@@ -1310,6 +1309,16 @@ def _print_forget_plan(plan: Any) -> None:
     print("-" * 66)
     print(f"  recordings                 {plan.recordings}")
     print(f"  files in OneDrive          {plan.files}")
+    if not plan.held_counted:
+        print(f"  held passages              could not be counted — assume there are some")
+    elif plan.held:
+        # Said plainly and not as a bare number. These are staff matters, somebody's
+        # health, an admission of liability: the part of this a person should be asked
+        # about twice rather than told about once.
+        print(f"  HELD PASSAGES              {plan.held}   "
+              "— the words go, nothing survives them")
+    else:
+        print(f"  held passages              none")
     print()
     for candidate in plan.candidates[:20]:
         print(f"  {candidate.recorded_at[:10]:<12} {candidate.name[:44]:<44} "
