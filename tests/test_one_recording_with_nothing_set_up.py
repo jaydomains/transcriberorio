@@ -261,6 +261,72 @@ class ItWritesNothingItWasNotAskedTo(unittest.TestCase):
                     self.assertEqual(fh.read(), rendered.text)
 
 
+class AHomeRelativePathResolves(unittest.TestCase):
+    """`~` is expanded here, not by the shell.
+
+    The documented example is `try "~/OneDrive/calls/Call Chester_260903_085842.m4a"` —
+    quoted, because the filename has spaces in it — and the shell does NOT expand a tilde
+    inside double quotes. Following the README verbatim failed with "there is no file at
+    ~/OneDrive/...", on the very first command this feature exists to make frictionless.
+    """
+
+    def _with_home(self, home: str):
+        saved = os.environ.get("HOME")
+        os.environ["HOME"] = home
+        return saved
+
+    def test_a_quoted_tilde_path_is_found(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            path = _recording(home)
+            saved = self._with_home(home)
+            try:
+                with _Fakes():
+                    result = _run("~/" + os.path.basename(path))
+            finally:
+                if saved is not None:
+                    os.environ["HOME"] = saved
+        self.assertEqual(len(result.files), 3)
+
+    def test_a_tilde_out_directory_does_not_make_a_folder_called_tilde(self) -> None:
+        """Worse than an error: it silently creates a directory literally named `~` in
+        whatever folder the command happened to be run from."""
+        with tempfile.TemporaryDirectory() as home:
+            path = _recording(home)
+            here = os.path.join(home, "cwd")
+            os.makedirs(here)
+            saved = self._with_home(home)
+            cwd = os.getcwd()
+            os.chdir(here)
+            try:
+                with _Fakes():
+                    result = _run(path)
+                tryout.write_files(result, "~/out")
+            finally:
+                os.chdir(cwd)
+                if saved is not None:
+                    os.environ["HOME"] = saved
+            self.assertEqual(os.listdir(here), [], "a directory named ~ was created")
+            self.assertEqual(len(os.listdir(os.path.join(home, "out"))), 3)
+
+    def test_the_documented_examples_all_quote_a_path_with_spaces(self) -> None:
+        """The docs and the code have to agree about this, and the docs are where the
+        tilde came from. Both examples stay quoted; the expansion is the code's job."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        checked = 0
+        for doc in ("README.md", "SETUP.md"):
+            with open(os.path.join(root, doc), encoding="utf-8") as fh:
+                text = fh.read()
+            for line in text.splitlines():
+                if "transcriber try" in line and "~" in line:
+                    checked += 1
+                    self.assertIn('"~', line,
+                                  f"{doc}: an unquoted path breaks on a filename with "
+                                  f"spaces in it — {line}")
+        # A guard that matched nothing would pass forever and prove nothing, which is
+        # exactly what happens when the docs get reworded around it.
+        self.assertGreater(checked, 0, "no documented `try` example uses a ~ path any more")
+
+
 class NeitherKeyIsEverPrinted(unittest.TestCase):
     def test_no_key_reaches_the_report_or_any_rendered_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

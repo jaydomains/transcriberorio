@@ -145,6 +145,12 @@ def run_one(
     a ``.env`` to read — which is the point, since assembling one is most of what a person
     is trying to avoid at this stage.
     """
+    # `~` is expanded here rather than left to the shell. A recording is named something
+    # like "Call Chester_260903_085842.m4a", so the path has to be quoted — and the shell
+    # does NOT expand a tilde inside double quotes. Without this, following the documented
+    # example verbatim fails on the very first command this whole thing exists to make
+    # frictionless.
+    path = os.path.expanduser(path)
     if not os.path.isfile(path):
         raise TryError(f"there is no file at {path}")
 
@@ -303,7 +309,7 @@ def _config_for(engine_name: str, engine_key: str, analysis_key: str, *,
     if vocabulary:
         config.vocabulary = tuple(vocabulary)
     if work_dir:
-        config.work_dir = work_dir
+        config.work_dir = os.path.expanduser(work_dir)
     if region:
         config.azure_region = region
     return config
@@ -329,6 +335,10 @@ def write_files(result: TryResult, directory: str) -> tuple[str, ...]:
     overwritten, because a try run is repeated with a changed setting and a numbered pile
     of near-identical files helps nobody.
     """
+    # Same reason as the audio path, and here the cost of not doing it is worse than an
+    # error: an unexpanded `--out ~/try-output` silently creates a directory literally
+    # named `~` in whatever folder the command was run from.
+    directory = os.path.expanduser(directory)
     os.makedirs(directory, exist_ok=True)
     written: list[str] = []
     for rendered in result.files:
