@@ -26,6 +26,7 @@ The record still decides.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -209,6 +210,116 @@ class NothingHereCanCostARecording(unittest.TestCase):
     def test_no_evidence_at_all_renders_nothing_rather_than_an_empty_table(self) -> None:
         self.assertEqual(
             outputs._site_evidence_lines(type("C", (), {"site_evidence": None})()), [])
+
+
+class Proposal:
+    """The shape the actions file reads a proposal through: attributes, not keys."""
+
+    def __init__(self, text: str, quote: str, kind: str = "claim") -> None:
+        self.text, self.quote, self.kind = text, quote, kind
+
+
+class ExplodingVocab(dict):
+    """A book whose scoring blows up, so the one fault path with a real book is reachable."""
+
+    def items(self):  # noqa: D102 - the whole point is that it raises
+        raise RuntimeError("the spine moved under us")
+
+
+class TheOneWarningHereHasToSurviveBeingLogged(unittest.TestCase):
+    """A diagnostic that destroys itself on the way out is worse than no diagnostic.
+
+    This module's warning fires exactly once — when the job list is there but cannot be
+    scored — and it is the only thing that tells anybody why a recording came back with no
+    evidence block. It was bound to a bare stdlib logger and called with the service's own
+    ``(event, message)`` convention, so ``logging`` read the message as a %-format argument,
+    raised ``TypeError`` inside itself, swallowed it, and dropped the line. Silent, and
+    silent only on the failure it exists to explain.
+    """
+
+    def _warnings_from_one_failed_scoring(self) -> list[logging.LogRecord]:
+        book = sitebook.SiteBook(path="x", vocab=ExplodingVocab({"a-job": {"term"}}),
+                                 sites=dict(JOBS))
+        captured: list[logging.LogRecord] = []
+
+        class Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record)
+
+        # The suite mutes the service's logger on purpose (tests/__init__.py), so this one
+        # is turned back up for the length of the call and put back afterwards.
+        logger = logging.getLogger("transcriber.sitebook")
+        handler = Collect()
+        logger.addHandler(handler)
+        before = (logger.level, logger.propagate)
+        logger.setLevel(logging.WARNING)
+        logger.propagate = False
+        try:
+            evidence = sitebook.evidence_for(book, SPOKEN)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(before[0])
+            logger.propagate = before[1]
+        self.assertTrue(evidence.fault, "a book that cannot be scored is a fault")
+        return captured
+
+    def test_the_sentence_reaches_the_log_instead_of_a_formatting_error(self) -> None:
+        records = self._warnings_from_one_failed_scoring()
+        self.assertEqual(len(records), 1)
+        # getMessage() is what every handler calls to render the line. On the broken call
+        # it raised TypeError here and the line was thrown away.
+        self.assertIn("could not be scored", records[0].getMessage())
+
+    def test_the_line_is_named_so_it_can_be_found_in_a_day_of_output(self) -> None:
+        records = self._warnings_from_one_failed_scoring()
+        self.assertEqual(getattr(records[0], "event", ""), "site-evidence")
+
+
+class AJobNamedByOneLineIsStillNamedInEnglish(unittest.TestCase):
+    """``beach-court-mouille-point`` must never appear on a surface he reads.
+
+    Two independent matchers meet here. The candidate list comes from :meth:`SiteBook.bind`
+    over the whole recording; a line's own job comes from :meth:`SiteBook.sites_named_by`
+    over that one quote, which applies guards ``bind`` does not. They are not required to
+    agree, and where they disagree the per-line answer used to be printed as a raw slug —
+    reading a name off a list the job was never on.
+
+    In the pipeline the quotes come from the same words that were scored, so this seam has
+    not yet parted in the wild. It is a seam nonetheless, and the file it prints into is the
+    one he opens.
+    """
+
+    def setUp(self) -> None:
+        self.evidence = sitebook.evidence_for(
+            BOOK,
+            "a discussion with nothing in it that names any job whatsoever.",
+            quotes=["the Beach Court Mouille Point trustees want the roof done"],
+        )
+
+    def test_the_whole_recording_scored_nothing(self) -> None:
+        self.assertEqual(self.evidence.candidates, ())
+
+    def test_the_line_still_names_its_job(self) -> None:
+        self.assertEqual(
+            self.evidence.slugs_for("the Beach Court Mouille Point trustees want the roof done"),
+            ("beach-court-mouille-point",),
+        )
+
+    def test_and_names_it_the_way_a_person_says_it(self) -> None:
+        self.assertEqual(self.evidence.title_of("beach-court-mouille-point"),
+                         "Beach Court Mouille Point")
+
+    def test_no_slug_reaches_the_line_he_reads(self) -> None:
+        rendered = "\n".join(
+            outputs._proposal_block(
+                1,
+                Proposal("The trustees want the roof done.",
+                         "the Beach Court Mouille Point trustees want the roof done"),
+                evidence=self.evidence,
+            )
+        )
+        self.assertIn("Beach Court Mouille Point", rendered)
+        self.assertNotIn("beach-court-mouille-point", rendered)
 
 
 if __name__ == "__main__":

@@ -34,13 +34,17 @@ transcript being written would be worse than no naming feature at all.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-log = logging.getLogger(__name__)
+from .logging_setup import get_logger
+
+#: The service's own logger, not a bare stdlib one. Its calls are ``(event, message,
+#: **fields)`` — a stdlib logger would read the message as a %-format argument, raise
+#: inside logging, and drop the diagnostic at exactly the moment it fires.
+log = get_logger(__name__)
 
 __all__ = [
     "CONTRACT",
@@ -409,6 +413,11 @@ class SiteEvidence:
 
     candidates: tuple[SiteCandidate, ...] = ()
     by_quote: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    #: Every slug named anywhere here, with the job's name as a person says it. Carried
+    #: rather than looked up later because the two matchers are independent by design: a
+    #: line can name a job the whole-recording scoring did not, and a reader must still get
+    #: the name and never the slug.
+    titles: Mapping[str, str] = field(default_factory=dict)
     book_size: int = 0
     #: Empty when the book loaded cleanly. Carried so a reader can tell "no jobs matched"
     #: from "the job list could not be read", which are very different facts.
@@ -432,6 +441,17 @@ class SiteEvidence:
         return tuple(sorted(seen))
 
     def title_of(self, slug: str) -> str:
+        """The job's name as a person would say it. Never a slug he has to decode.
+
+        Resolved through the book's own titles, not only through the scored candidates.
+        ``by_quote`` is built by :meth:`SiteBook.sites_named_by` and ``candidates`` by
+        :meth:`SiteBook.bind` — deliberately different matchers, so a job named by one line
+        need not appear among the recording's scores, and reading the name off the scores
+        alone would print ``beach-court-mouille-point`` on a surface he reads.
+        """
+        known = str(self.titles.get(slug) or "").strip()
+        if known:
+            return known
         for candidate in self.candidates:
             if candidate.slug == slug:
                 return candidate.title
@@ -477,7 +497,14 @@ def evidence_for(book: "SiteBook", text: str, quotes: Sequence[str] = ()) -> Sit
             by_quote[key] = tuple(sorted(book.sites_named_by(quote or "")))
         except Exception:  # noqa: BLE001
             by_quote[key] = ()
-    return SiteEvidence(candidates=candidates, by_quote=by_quote,
+    # Every name a reader could be shown, resolved once, through the book.
+    titles = {candidate.slug: candidate.title for candidate in candidates}
+    for slugs in by_quote.values():
+        for slug in slugs:
+            if slug not in titles:
+                titles[slug] = book.title_of(slug)
+
+    return SiteEvidence(candidates=candidates, by_quote=by_quote, titles=titles,
                         book_size=book.size, fault=book.fault)
 
 
