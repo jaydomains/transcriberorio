@@ -57,6 +57,15 @@ than silently preferring one.
    claims on one recording.
 6. **Output folders MAY be shared.** He explicitly wants to be able to pool several inputs into one
    output. Do not "helpfully" forbid it.
+
+   **Still true, and now said out loud when the routes are people.** This rule was written when a
+   route meant a *kind* of recording — pooling calls and site meetings into one folder is his
+   filing, and forbidding it would be the code being clever about it. A route now also carries a
+   *person*, which is what `ROUTE_<NAME>_REVIEWER` names. Two routes with **different reviewers**
+   sharing one output folder means each person's transcripts, summaries and proposals land where
+   the others read them. That is still allowed — a shared team folder is a real thing somebody may
+   want — but it is no longer silent: it is a startup notice naming the routes. A route with no
+   reviewer is the service owner, who is a person too, so "one named, one not" counts as two.
 7. An archive folder must not be any route's source or output folder.
 
 ## What each module does differently

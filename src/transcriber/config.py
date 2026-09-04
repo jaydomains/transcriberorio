@@ -748,6 +748,42 @@ class Config:
                     "switching the gate on."
                 )
 
+        # Two routes pooling into one output folder is deliberately allowed — he asked for
+        # it, and _validate_routes says so in as many words. But that rule was written when
+        # a route was a KIND of recording: pooling calls and site meetings into one folder
+        # is tidiness, and forbidding it would be the code being clever about his filing.
+        #
+        # A route is now also how a PERSON is carried — that is what ROUTE_<NAME>_REVIEWER
+        # is for. Two routes with different reviewers sharing one output folder is not
+        # tidiness: it is one person's transcripts, summaries and proposals landing where
+        # another person reads them, and it starts perfectly clean with nothing said.
+        #
+        # Still not forbidden, because a shared team folder is a real thing somebody may
+        # want on purpose. But it is no longer SILENT: refusing would break a rule he set,
+        # and saying nothing would leave a disclosure looking like a working configuration.
+        # A route with no reviewer named is the service owner, who is a person too — so
+        # "one named, one not" is two people, not one.
+        pooled: dict[str, list[Route]] = {}
+        for route in routes:
+            if not route.enabled or not route.output_folder_id:
+                continue
+            pooled.setdefault(route.output_folder_id, []).append(route)
+        for sharing in pooled.values():
+            if len(sharing) < 2:
+                continue
+            whose = {reviewers.get(route.name, "") for route in sharing}
+            if len(whose) < 2:
+                continue
+            notices.append(
+                _join_phrases([_route_phrase(route) for route in sharing])
+                + " all write into the SAME output folder, and they do not have the same "
+                "reviewer — so they are carrying different people. Every transcript, "
+                "summary and list of proposals from each of them lands where the others "
+                "can read it. That is allowed, and it is right for a shared team folder; "
+                "it is the wrong thing entirely if these are meant to be one person each. "
+                "Give them separate output folders if so."
+            )
+
         # Naming. Never a problem — a missing site list means no recording is ever named,
         # which is exactly the behaviour before this existed. A notice, so that a list that
         # quietly stopped being written does not read as a quiet fortnight.

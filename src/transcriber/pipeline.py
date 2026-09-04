@@ -551,6 +551,7 @@ class Pipeline:
         lookup = getattr(self.config, "route", None)
         found = lookup(name) if callable(lookup) else None
         if isinstance(found, Route):
+            self._refuse_if_disputed(row, found)
             return found
         known = ", ".join(
             str(getattr(r, "name", "")) for r in (getattr(self.config, "routes", ()) or ())
@@ -562,6 +563,45 @@ class Pipeline:
             f"moved or deleted — the recording is where it was. Either put that route back "
             f"in ROUTES, or move this recording to one of the routes above, and it will be "
             f"picked up again."
+        )
+
+    def _refuse_if_disputed(self, row: Row, route: Route) -> None:
+        """Stop a recording two routes have both claimed, rather than filing it and saying so.
+
+        The disagreement was already being recorded, logged at error level, kept out of the
+        archive and reported in the morning email. What it was not doing was stopping the
+        publish: the row keeps the route it was **discovered** on, so the three files went
+        to that route's output folder and its held passages to that route's reviewer, and
+        the email said so afterwards.
+
+        Afterwards is too late. When routes are kinds of recording — calls, site meetings —
+        the wrong folder is untidy. When routes are people, the wrong folder is one person's
+        conversation in another person's folder, and no amount of reporting takes it back
+        out. So the recording waits for a person instead, which is what quarantine is for:
+        nothing is written, nothing is moved, the audio is untouched, and every other route
+        keeps running.
+
+        This runs on the way to publishing, not at discovery, because the disagreement is
+        only knowable on the *second* sighting. A recording already published before the
+        second route ever saw it is past saving — that one the digest still reports, and
+        that is now the only case where it has to.
+        """
+        try:
+            because = self.ledger.disagreement_about(row.item_id)
+        except Exception:  # noqa: BLE001 - a ledger that cannot answer must not stop a route
+            log.warning("route-dispute-check", "could not check whether this recording's route "
+                        "is disputed; continuing", item=row.item_id)
+            return
+        if not because:
+            return
+        raise _RouteFault(
+            f"two routes have both claimed this recording, so which one it belongs to is "
+            f"exactly what is in doubt: {because}. It stayed on {route.display}, and its "
+            f"transcript would be written into that route's output folder and its held "
+            f"passages sent to that route's reviewer — which is the wrong place if the "
+            f"other route is the right one. Nothing has been written, moved or deleted. "
+            f"Either the recording was moved between watched folders, or one route's "
+            f"folder sits inside another's; sort that out and requeue it."
         )
 
     # -- entry point ---------------------------------------------------------------

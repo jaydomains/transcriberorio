@@ -877,23 +877,13 @@ class _Folders:
             return ()
         if wanted in self._ancestors:
             return self._ancestors[wanted]
-        chain: list[str] = []
-        seen = {wanted}
-        current = wanted
-        # Bounded: a cycle cannot happen in a drive tree, but a walk that trusted the drive
-        # to say so would hang the wizard if one ever did.
-        for _ in range(32):
-            try:
-                item = self.client.get_item(current)
-            except Exception:  # noqa: BLE001 - an unanswerable question is not a problem
-                break
-            parent = str(getattr(item, "parent_id", "") or "").strip()
-            if not parent or parent in seen:
-                break
-            chain.append(parent)
-            seen.add(parent)
-            current = parent
-        self._ancestors[wanted] = tuple(chain)
+        # The walk itself lives on the client, because the running service now asks the
+        # same question at startup and two copies of a subtle walk are how the wizard and
+        # the service come to disagree about which folders overlap. The memo stays here:
+        # the wizard asks about the same handful of ids over and over as he picks them.
+        from .graph import ancestor_ids as walk_up   # lazy, as GraphClient is below
+
+        self._ancestors[wanted] = walk_up(self.client.get_item, wanted)
         return self._ancestors[wanted]
 
     def describe(self, folder_id: str) -> str:
