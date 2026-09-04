@@ -59,6 +59,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -69,6 +70,8 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from . import archive as archive_module
 from . import audio as audio_module
 from . import config_cmd, diskbudget, digest as digest_module, naming, outputs, plausibility
+from . import config as config_module
+from . import graph as graph_module
 from . import ratelimit, redact, routes_cmd
 from . import tryout
 from .engines import EngineAuthError, EngineConfigError
@@ -530,8 +533,55 @@ def cmd_config(args: argparse.Namespace) -> int:
     return config_cmd.run(args)
 
 
+def _refuse_nested_watched_folders(config: Config, graph: Any) -> None:
+    """Refuse to start processing when one watched folder sits inside another.
+
+    :func:`transcriber.config.nested_folder_problems` has always existed and has only ever
+    been called by the setup wizard, which can ask a live drive while the ids are being
+    picked. Nothing asked again afterwards — so a ``.env`` edited by hand, a folder dragged
+    in OneDrive, or a route added later could nest two watched folders and the service
+    would start perfectly clean.
+
+    That is not a tidiness problem. OneDrive reports a folder and everything under it, so
+    the outer route sees the inner route's recordings and can claim them first. When routes
+    are kinds of recording that is untidy; when routes are people it is one person's
+    conversation transcribed into another person's folder.
+
+    Called only by the commands that actually process recordings. The diagnostic commands —
+    ``status``, ``held``, ``gate``, ``review``, ``forget``, ``requeue`` — must keep working
+    when the configuration is wrong, because being able to look is how a person sorts it
+    out.
+
+    A drive that will not answer is never a refusal: the walk returns an empty chain when
+    it cannot be made, and not knowing reports no problem.
+
+    **What it costs.** One ``get_item`` per distinct folder on the way to the root, memoised
+    within the call, so eight routes is roughly twenty Graph calls — every ``once``, which
+    is the shape a cron runs. That is a few times the cost of the delta poll it precedes,
+    and it is worth paying: the thing it catches writes one person's transcript into
+    another person's folder and reports it the next morning, when nothing can be taken back
+    out. It is skipped outright below the only case where nesting is possible.
+    """
+    routes = tuple(getattr(config, "routes", ()) or ())
+    if len(routes) < 2:
+        return
+    try:
+        problems = config_module.nested_folder_problems(
+            routes, lambda folder_id: graph_module.ancestor_ids(graph.get_item, folder_id)
+        )
+    except Exception:  # noqa: BLE001 - a check that cannot run must not stop the service
+        logging.getLogger(__name__).warning(
+            "could not check whether any watched folders are nested; continuing",
+            exc_info=True,
+        )
+        return
+    if problems:
+        raise ConfigError(problems)
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     config, ledger, graph = _service(args)
+    _refuse_nested_watched_folders(config, graph)
     with ledger:
         worker = Worker(config, ledger, graph)
         report = worker.run_once(limit=args.limit, route=args.route)
@@ -553,6 +603,7 @@ RATE_LIMIT_RELEASE_AFTER_S = 30.0
 
 def cmd_run(args: argparse.Namespace) -> int:
     config, ledger, graph = _service(args)
+    _refuse_nested_watched_folders(config, graph)
     with ledger:
         worker = Worker(config, ledger, graph)
         _release_rate_limited_threads_on_shutdown(worker)
@@ -591,6 +642,7 @@ def _release_rate_limited_threads_on_shutdown(
 
 def cmd_sweep(args: argparse.Namespace) -> int:
     config, ledger, graph = _service(args)
+    _refuse_nested_watched_folders(config, graph)
     with ledger:
         report = sweep_module.sweep(
             config, ledger, graph, dry_run=args.dry_run, route=args.route
@@ -636,6 +688,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     still walked, and the run still exits non-zero so nobody reads it as a clean sweep.
     """
     config, ledger, graph = _service(args)
+    _refuse_nested_watched_folders(config, graph)
     with ledger:
         routes, problems = sweep_module.select_routes(config, args.route)
         for problem in problems:

@@ -387,6 +387,46 @@ class DownloadResult:
 # --------------------------------------------------------------------------- client
 
 
+def ancestor_ids(get_item: Any, folder_id: str, *, limit: int = 32) -> tuple[str, ...]:
+    """Every folder above this one on the drive, nearest first. Empty when unknown.
+
+    A folder id says nothing about what contains it, and containment is the whole
+    difference between two routes that merely sit near each other and two routes where one
+    is quietly reading the other's recordings — OneDrive reports a folder and everything
+    under it. So the chain has to be walked, and only a live drive can answer.
+
+    Written as a function over ``get_item`` rather than as a method so that the setup
+    wizard and the running service share ONE walk. They ask the same question for the same
+    reason, and two copies of it are how they come to disagree about which folders overlap.
+
+    **Never raises, and never reports a failed walk as an answer.** A chain that cannot be
+    walked comes back empty, which every caller reads as "not known" rather than as "no
+    overlap": a refusal invented from a Graph call that failed would be worse than the bug
+    it was looking for.
+
+    ``limit`` bounds the walk. A drive tree cannot contain a cycle, but a walk that trusted
+    the drive to say so would hang the service if one ever did.
+    """
+    wanted = (folder_id or "").strip()
+    if not wanted:
+        return ()
+    chain: list[str] = []
+    seen = {wanted}
+    current = wanted
+    for _ in range(max(1, int(limit))):
+        try:
+            item = get_item(current)
+        except Exception:  # noqa: BLE001 - an unanswerable question is not a problem
+            break
+        parent = str(getattr(item, "parent_id", "") or "").strip()
+        if not parent or parent in seen:
+            break
+        chain.append(parent)
+        seen.add(parent)
+        current = parent
+    return tuple(chain)
+
+
 class GraphClient:
     """Client-credentials Graph client for exactly one drive.
 
@@ -742,6 +782,14 @@ class GraphClient:
         ``file.hashes`` facet and quietly disable the completeness gate.
         """
         return DriveItem.from_api(self._get_json(self._item_base(item_id)))
+
+    def ancestor_ids(self, folder_id: str, *, limit: int = 32) -> tuple[str, ...]:
+        """Every folder above this one on the drive, nearest first. Empty when unknown.
+
+        The walk is :func:`ancestor_ids`; this is the method form for callers that already
+        hold a client.
+        """
+        return ancestor_ids(self.get_item, folder_id, limit=limit)
 
     def get_item_by_path(self, path: str) -> DriveItem:
         """Item addressed by drive-relative path, e.g. ``CALLS/2026-08``."""

@@ -516,6 +516,28 @@ anything.** A recording that cannot be started right now is still in OneDrive, s
 queue, and still gets transcribed — later, not never. There is no setting anywhere here
 that can make it throw work away.
 
+### One folder per person, and what keeps them apart
+
+A route is one watched folder and where its results go, so "a folder each" is exactly what
+routes are for: `ROUTE_CAREL_SOURCE` in, `ROUTE_CAREL_OUTPUT` out, and
+`ROUTE_CAREL_REVIEWER` naming who reviews anything the sensitivity gate holds back from
+that folder. Add a person, add a route.
+
+Three things keep one person's recordings out of another person's folder, and it is worth
+knowing which is which because they are not equally strong:
+
+| | What it does |
+| --- | --- |
+| **A held passage never crosses.** | If a route has no reviewer named, the service **refuses to start** with the gate on. Somebody's health or family circumstances reaching a colleague's review page is the one thing that is not left to configuration. |
+| **A recording two routes both claimed is not published at all.** | It waits for a person instead — nothing written, nothing moved, the audio untouched. It used to be published to whichever route saw it first and reported the next morning, which is too late: nothing takes a transcript back out of somebody's folder. |
+| **One watched folder inside another is refused at startup.** | OneDrive reports a folder and everything under it, so the outer route would see the inner route's recordings. This is checked against the live drive every time the service starts, not just when the wizard set it up. |
+
+**Two routes may still share one output folder.** That is deliberate and stays — pooling
+calls and site meetings into one folder is a filing choice, not a fault. But when the routes
+sharing a folder have *different* reviewers, they are carrying different people, and the
+service says so at startup. It does not refuse: a shared team folder is a real thing. It
+just stops being silent.
+
 ### The four things that hold it steady
 
 **How many recordings the machine works on at once — `CONCURRENCY`.** This is about the

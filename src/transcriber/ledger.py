@@ -1511,6 +1511,24 @@ class Ledger:
         ).fetchall()
         return [dict(r) for r in records]
 
+    def disagreement_about(self, item_id: str) -> str:
+        """Why this one recording's route is in doubt, or "" when it is not.
+
+        The per-item question, asked on the processing path. :meth:`route_disagreements`
+        answers the same thing for a whole day and is right for the status table and the
+        morning email; asking it per recording would scan every disagreement ever recorded
+        to answer a question about one row, on every recording, forever.
+
+        The answer is the newest disagreement's own words, because that is the sentence a
+        person needs: which two routes, and which one it stayed on.
+        """
+        row = self._conn().execute(
+            "SELECT detail FROM events WHERE item_id=? AND kind='route-disagreement'"
+            " ORDER BY id DESC LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        return str((row["detail"] if row else "") or "")
+
     def route_disagreement_counts(self, since: str | None = None) -> dict[str, int]:
         """How many disagreements each route is named in, for the ``status`` table.
 
