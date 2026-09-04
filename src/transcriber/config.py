@@ -172,6 +172,7 @@ _SPEC: tuple[_Var, ...] = (
     _Var("gate_review_base_url", "GATE_REVIEW_BASE_URL", "str", "", "https address of the page where held passages are approved, linked from the morning email; required before the gate can be switched on"),
     _Var("analysis_key_expires_on", "ANALYSIS_KEY_EXPIRES_ON", "str", "", "ISO date the analysis API key expires, if it has one (optional)"),
     # --- naming a recording that arrived without one ----------------------------------
+    _Var("engine_site_names", "ENGINE_SITE_NAMES", "bool", True, "tell the transcription engine the job names from the site list, so it writes 'Lonehill' instead of 'on loan' — a name it never transcribed cannot be matched afterwards by anything"),
     _Var("naming", "NAMING", "bool", True, "work out what to call a recording that arrived under the voice recorder's own default name, from the site spoken in it, and say so in the morning email"),
     _Var("naming_apply", "NAMING_APPLY", "bool", False, "write that name into the transcript's subject line and heading; off means it is only reported and nothing in the record changes"),
     _Var("naming_sites_file", "NAMING_SITES_FILE", "str", "", "path to the site list written by ops/build-site-book.py from the record's nightly build; without it no recording is ever named"),
@@ -281,6 +282,7 @@ class Config:
     # naming a recording that arrived without one
     #: Whether to work out a name at all. On by default because it only ever *reports*
     #: until :attr:`naming_apply` is set as well.
+    engine_site_names: bool = True
     naming: bool = True
     #: Whether the worked-out name reaches the transcript's subject line and heading.
     #: **Off by default, and deliberately two settings rather than one word.** The gate

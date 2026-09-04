@@ -202,6 +202,37 @@ class SiteBook:
             return None, {}
         return bind_site(text, self.vocab)
 
+    def spoken_names(self, limit: int = 80) -> tuple[str, ...]:
+        """The job names as a person says them, for the transcription engine's hint list.
+
+        This is the fix for the thing that makes everything downstream a guessing game: an
+        engine that has never heard of Lonehill writes down "on loan", and no amount of
+        matching afterwards recovers a word that was never transcribed. Two real examples
+        from one site walk — "wrong on loan" and "the same issue at lo" — both Lonehill,
+        both invisible to a matcher, both obvious to a person.
+
+        The record already knows every job's name. It was only ever read here to *name* a
+        recording, never to help transcribe one, so the book that could have prevented the
+        mishearing sat one function call away from the engine.
+
+        Titles only, deliberately. :func:`site_vocab`'s terms are tokens chosen to
+        *discriminate between* sites once the words exist — contractor fragments, monday
+        ids, half-words. As a spoken hint they are noise at best, and a monday id read out
+        as a phrase is worse. What helps an engine is the name somebody actually says.
+
+        Ordered longest first: a hint list is capped downstream by
+        :func:`transcriber.engines.base.safe_vocabulary`, and if something has to be
+        dropped it should be the one-word names, which are the ones an engine is least
+        likely to get wrong and most likely to hear anyway.
+        """
+        names = []
+        for entry in self.sites.values():
+            title = str((entry or {}).get("title") or "").strip()
+            if title:
+                names.append(title)
+        names.sort(key=lambda t: (-len(t), t.lower()))
+        return tuple(names[:max(0, int(limit))])
+
     def sites_named_by(self, span: str) -> frozenset[str]:
         """Every site this span actually names. Two conditions, both learned the hard way.
 
