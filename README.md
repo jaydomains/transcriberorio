@@ -379,6 +379,21 @@ categories look right, and the model read effectively all of the recordings, set
 
 ---
 
+## Telling the engine what your jobs are called
+
+A transcription engine that has never heard of your jobs guesses. On a real site walk of
+his, the firm's **Lonehill** job came back as *"wrong on loan"* and *"the same issue at
+lo"* — twice, in one recording. No amount of matching afterwards recovers a name that was
+never written down, so this happens *before* the transcription rather than after it.
+
+The site list you already point `NAMING_SITES_FILE` at knows every job's name. Those names
+are now handed to the engine as a hint list, longest first, behind anything you typed into
+`VOCABULARY` yourself — a hint list is capped by the provider, and a cap cuts the tail, so
+your own words go first.
+
+`ENGINE_SITE_NAMES=false` turns it off and the engine gets exactly what it got before.
+Without a site list it costs nothing and does nothing.
+
 ## Naming a recording that arrived without a name
 
 A site note recorded and uploaded before he got to naming it arrives as the voice recorder's

@@ -1413,7 +1413,7 @@ class Pipeline:
     def _hints(self, row: Row, parsed: naming.ParsedName, info: AudioInfo) -> Hints:
         languages = tuple(getattr(self.config, "languages", ()) or ())
         return Hints(
-            vocabulary=tuple(getattr(self.config, "vocabulary", ()) or ()),
+            vocabulary=self._vocabulary(),
             counterparty=parsed.party,
             language=languages[0] if languages else None,
             languages=languages,
@@ -1421,6 +1421,42 @@ class Pipeline:
             source_name=row.name,
             duration_s=float(info.duration_s or 0.0) or None,
         )
+
+    def _vocabulary(self) -> tuple[str, ...]:
+        """What to tell the engine it is likely to hear: VOCABULARY, then the job names.
+
+        The site book has always been loaded here — to *name* a recording after the fact.
+        It was never handed to the engine, so the engine had no idea the firm has a job
+        called Lonehill and wrote down "on loan"; and a name that was never transcribed
+        cannot be matched afterwards by anything, however clever. The book that would have
+        prevented the mishearing sat one call away from the request that needed it.
+
+        ``VOCABULARY`` comes first because it is the one an operator typed on purpose. The
+        list is capped downstream by :func:`transcriber.engines.base.safe_vocabulary`, and
+        a cap always cuts the tail, so the deliberate terms must not be behind fifty-six
+        job names to reach it.
+
+        A missing or broken book costs the site names and nothing else — the configured
+        vocabulary still goes, exactly as it does today.
+        """
+        configured = tuple(getattr(self.config, "vocabulary", ()) or ())
+        # Its own switch, not NAMING's. NAMING=0 is a rollback guarantee — the naming
+        # feature inert and the published bytes back to exactly what they were — and this
+        # changes the transcript, so hanging it off that switch would quietly break the
+        # promise. Two features that read one file still get one off-switch each.
+        if not bool(getattr(self.config, "engine_site_names", True)):
+            return configured
+        try:
+            book = self.site_book
+        except Exception:  # noqa: BLE001 - a hint is never worth losing a recording over
+            log.warning("vocabulary", "the site book could not be read for engine hints; "
+                        "sending the configured vocabulary only")
+            return configured
+        if not book:
+            return configured
+        seen = {t.strip().lower() for t in configured if t and t.strip()}
+        extra = [n for n in book.spoken_names() if n.lower() not in seen]
+        return configured + tuple(extra)
 
     # -- endings -------------------------------------------------------------------
 
