@@ -181,7 +181,7 @@ GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("the sensitivity gate", ("GATE_MODE", "GATE_HELD_STORE", "GATE_REVIEW_BASE_URL")),
     ("naming a recording that arrived without one", (
         "NAMING", "NAMING_APPLY", "NAMING_SITES_FILE", "NAMING_MIN_SECONDS",
-        "ENGINE_SITE_NAMES",
+        "ENGINE_SITE_NAMES", "SITE_EVIDENCE",
         "NAMING_OPENING_SECONDS")),
     ("http and logging", ("HTTP_TIMEOUT_S", "MAX_RETRIES", "LOG_LEVEL", "LOG_FORMAT")),
 )

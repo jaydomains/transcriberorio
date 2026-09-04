@@ -34,13 +34,19 @@ transcript being written would be worse than no naming feature at all.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "CONTRACT",
+    "SiteCandidate",
+    "SiteEvidence",
+    "evidence_for",
     "STOPWORDS",
     "ADDR_RE",
     "VOCAB_FIELDS",
@@ -361,6 +367,123 @@ class SiteBook:
 #: The book when there is no book. Every failure path returns this or a copy of it carrying
 #: a ``fault``, so no caller ever has to handle ``None``.
 EMPTY = SiteBook()
+
+
+@dataclass(frozen=True)
+class SiteCandidate:
+    """One job the recording might be about, and how strongly."""
+
+    slug: str
+    title: str
+    score: int
+
+
+@dataclass(frozen=True)
+class SiteEvidence:
+    """Which jobs a recording appears to concern — as EVIDENCE, never as a filing.
+
+    A site walk covers the job somebody is standing on and the two that are bothering
+    them. One real recording discussed HQ, Lonehill and Pick n Pay, and everything
+    downstream had to work that out again from raw text, every time, from scratch.
+
+    The work was already being done here. :meth:`SiteBook.bind` runs the record's own
+    scoring — vendored verbatim — over the exact bytes the record will be handed, and
+    returns a score for *every* site. Only the winner was ever used, to propose a title.
+    The rest was thrown away, and downstream started the same hunt over.
+
+    **This is evidence, and the distinction is the whole point.** The record binds a
+    document by scoring the document's own text, and this module's own docstring says why
+    that must not be pre-empted: a name asserted here that is wrong can *move* a filing
+    that was previously right. So what travels is candidates, scores, and the words they
+    were matched on — the workings, not the answer. The record still decides.
+
+    ``by_quote`` maps a proposal's verbatim quote to the slugs that quote itself names.
+    Keyed by the quote rather than by position because the actions file renders proposals
+    grouped by category, not in extraction order, and a lookup that depends on the caller
+    iterating in the right order is a lookup that will eventually be wrong. Two proposals
+    sharing a quote share an answer, which is correct rather than a collision.
+
+    Empty for most quotes, and that is not a failure: silence is the honest answer to
+    "which job is this line about" when the line does not say.
+    """
+
+    candidates: tuple[SiteCandidate, ...] = ()
+    by_quote: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    book_size: int = 0
+    #: Empty when the book loaded cleanly. Carried so a reader can tell "no jobs matched"
+    #: from "the job list could not be read", which are very different facts.
+    fault: str = ""
+
+    def __bool__(self) -> bool:
+        return bool(self.candidates) or any(self.by_quote.values())
+
+    def slugs_for(self, quote: str) -> tuple[str, ...]:
+        """The jobs this one line names. Empty when it names none — most lines."""
+        return tuple(self.by_quote.get(_quote_key(quote), ()))
+
+    @property
+    def named_by_items(self) -> tuple[str, ...]:
+        """Every slug some individual line names, in a stable order."""
+        seen: list[str] = []
+        for slugs in self.by_quote.values():
+            for slug in slugs:
+                if slug not in seen:
+                    seen.append(slug)
+        return tuple(sorted(seen))
+
+    def title_of(self, slug: str) -> str:
+        for candidate in self.candidates:
+            if candidate.slug == slug:
+                return candidate.title
+        return slug
+
+
+def evidence_for(book: "SiteBook", text: str, quotes: Sequence[str] = ()) -> SiteEvidence:
+    """Read the site book over one recording. Never raises; never files anything.
+
+    ``text`` is the bytes the record will score — hand it the same thing, or the candidate
+    scores describe a document nobody will ever ingest.
+
+    ``quotes`` are the proposals' verbatim quotes, in order. Each is matched with
+    :meth:`SiteBook.sites_named_by`, which carries the two guards learned the hard way —
+    a term must stand as a whole word, and must carry half of the site's own name — so a
+    line mentioning a Sharon does not name *277 Imam Haron Road*.
+    """
+    if not book:
+        return SiteEvidence(fault=book.fault or "no site list is configured")
+    try:
+        _winner, scores = book.bind(text or "")
+    except Exception:  # noqa: BLE001 - evidence is a nicety; a recording is not
+        log.warning("site-evidence", "the site list could not be scored for this recording")
+        return SiteEvidence(book_size=book.size, fault="the site list could not be scored")
+
+    ranked = sorted(
+        ((slug, int(n)) for slug, n in (scores or {}).items() if n),
+        key=lambda pair: (-pair[1], pair[0]),
+    )
+    candidates = tuple(
+        SiteCandidate(slug=slug,
+                      title=str((book.sites.get(slug) or {}).get("title") or slug),
+                      score=score)
+        for slug, score in ranked
+    )
+
+    by_quote: dict[str, tuple[str, ...]] = {}
+    for quote in quotes:
+        key = _quote_key(quote)
+        if not key or key in by_quote:
+            continue
+        try:
+            by_quote[key] = tuple(sorted(book.sites_named_by(quote or "")))
+        except Exception:  # noqa: BLE001
+            by_quote[key] = ()
+    return SiteEvidence(candidates=candidates, by_quote=by_quote,
+                        book_size=book.size, fault=book.fault)
+
+
+def _quote_key(quote: str) -> str:
+    """One spelling of a quote, so the lookup is not defeated by whitespace."""
+    return " ".join(str(quote or "").split()).lower()
 
 
 def load(path: str) -> SiteBook:

@@ -252,6 +252,17 @@ class OutputContext:
     #: by writing the same three names again, and a name that could change between attempts
     #: would leave three files nobody can delete and a second document in the record.
     display_name: str = ""
+    #: :class:`transcriber.sitebook.SiteEvidence` for this recording — which jobs the site
+    #: list says it names, with the scores and the words behind them. Computed in the
+    #: pipeline, which holds the book; this module stays pure and only renders it.
+    #:
+    #: It appears ONLY in the summary and actions files, never in the transcript. The
+    #: transcript is the one file the record ingests as a source and scores, and a name
+    #: written into it becomes evidence for the very question it was trying to answer — a
+    #: mis-transcription would then confirm itself and file the recording under the wrong
+    #: job, looking well supported. The other two carry a leading underscore, which is how
+    #: the record's intake knows to skip them, so nothing here can move a filing.
+    site_evidence: Any = None
 
     @property
     def names(self) -> OutputNames:
@@ -459,6 +470,7 @@ def render_summary(ctx: OutputContext) -> str:
 
     body += _participants_block(extraction)
     body += _site_block(extraction)
+    body += _site_evidence_lines(ctx)
     body += _unclear_block(extraction)
     body += _routing_block(extraction)
     body += _review_block(extraction, ctx)
@@ -524,7 +536,8 @@ def render_actions(ctx: OutputContext) -> str:
             body += ["", f"## {_CATEGORY_HEADINGS.get(category, _humanise(category))}", ""]
             for proposal in group:
                 number += 1
-                body += _proposal_block(number, proposal)
+                body += _proposal_block(number, proposal,
+                                        getattr(ctx, "site_evidence", None))
 
     body += _review_block(extraction, ctx)
     body += [
@@ -902,6 +915,54 @@ def _participants_block(extraction: Any) -> list[str]:
     return out
 
 
+def _site_evidence_lines(ctx: "OutputContext") -> list[str]:
+    """Which jobs this recording names, with the workings — for the record, not instead of it.
+
+    A site walk covers the job somebody is standing on and the two bothering them. One real
+    recording ran through HQ, Lonehill and Pick n Pay, and everything downstream had to
+    work that out again from raw text every time.
+
+    The scoring already happened: :meth:`transcriber.sitebook.SiteBook.bind` runs the
+    record's own rules, vendored verbatim, over the exact bytes the record is handed, and
+    scores every job. Only the winner was used, to propose a title; the rest was discarded
+    and the hunt started over downstream.
+
+    **Candidates and scores, never a filing.** The record binds by scoring the document, and
+    a name asserted here that is wrong can move a filing that was previously right. So this
+    hands over the workings and the record still decides — which is also why it is only ever
+    written into the two files the record's intake skips.
+    """
+    evidence = getattr(ctx, "site_evidence", None)
+    if evidence is None:
+        return []
+    candidates = tuple(getattr(evidence, "candidates", ()) or ())
+    fault = str(getattr(evidence, "fault", "") or "")
+    if not candidates and not fault:
+        return []
+
+    out = ["", "## Which jobs this recording names", ""]
+    if fault:
+        out += [f"- The job list could not be read ({_inline(fault)}), so nothing here was "
+                "matched against it. That is not the same as a recording naming no job."]
+        return out
+    out += [
+        "- Matched against the job list with the record's own rules, over the same words "
+        "the record is given.",
+        "- **This is evidence, not a filing.** Nothing has been filed against any of these.",
+        "",
+        "| Job | Score |",
+        "| --- | --- |",
+    ]
+    for candidate in candidates[:8]:
+        out.append(f"| {_inline(candidate.title)} | {int(candidate.score)} |")
+    if len(candidates) > 8:
+        out.append(f"| _and {len(candidates) - 8} more, scoring lower_ | |")
+    if len(candidates) > 1:
+        out += ["", "More than one job is named here. That is normal on a site walk and it "
+                "is the reason this list is a list."]
+    return out
+
+
 def _site_block(extraction: Any) -> list[str]:
     site = _text_of(extraction, "site")
     if not site:
@@ -987,7 +1048,7 @@ def _review_block(extraction: Any, ctx: OutputContext) -> list[str]:
     ]
 
 
-def _proposal_block(number: int, proposal: Any) -> list[str]:
+def _proposal_block(number: int, proposal: Any, evidence: Any = None) -> list[str]:
     item = getattr(proposal, "item", proposal)
     check = getattr(proposal, "quote_check", None)
     statement = _inline(getattr(item, "text", "") or "")
@@ -1002,6 +1063,24 @@ def _proposal_block(number: int, proposal: Any) -> list[str]:
     site = _inline(getattr(item, "site", "") or "")
     if site:
         lines.append(f"- Site it appears to concern: {site}")
+    # The line above is the model's free-text answer. This one is the job list's, reached by
+    # the record's own rules over the words of THIS line — so a walk covering three jobs says
+    # which line belongs to which, instead of the whole recording being flattened to one.
+    # Silent when the line names none, which is most of them: "this line does not say" is a
+    # real answer and a better one than a guess.
+    named: tuple[str, ...] = ()
+    if evidence is not None:
+        try:
+            named = tuple(evidence.slugs_for(getattr(item, "quote", "") or ""))
+        except Exception:  # noqa: BLE001 - a label is never worth losing a file over
+            named = ()
+    if named:
+        titles = ", ".join(_inline(evidence.title_of(slug)) for slug in named)
+        if len(named) == 1:
+            lines.append(f"- The job list matches these words to: {titles}")
+        else:
+            lines.append(f"- These words name more than one job — {titles} — so which one "
+                         "this belongs to is not settled here.")
     due = _inline(getattr(item, "due", "") or "")
     if due:
         lines.append(f"- Date heard: {due} — as spoken, not a date this service has set")

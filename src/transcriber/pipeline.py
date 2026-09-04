@@ -1255,7 +1255,8 @@ class Pipeline:
 
         try:
             probe = self._context(row, parsed, gate.transcript, gate.extraction, info,
-                                  notes=tuple(notes), held=tuple(gate.held))
+                                  notes=tuple(notes), held=tuple(gate.held),
+                                  with_site_evidence=False)
             return autoname.decide(
                 parsed=parsed,
                 extraction=gate.extraction,
@@ -1317,6 +1318,7 @@ class Pipeline:
         notes: tuple[str, ...] = (),
         held: Sequence[HeldSpan] = (),
         display_name: str = "",
+        with_site_evidence: bool = True,
     ) -> outputs.OutputContext:
         """Everything the three files are rendered from.
 
@@ -1345,7 +1347,44 @@ class Pipeline:
             # in every mode but ``on``: nothing was cut, so nothing can have leaked.
             held=tuple(held),
             display_name=display_name,
+            site_evidence=(self._site_evidence(transcript, extraction)
+                           if with_site_evidence else None),
         )
+
+    def _site_evidence(self, transcript: Transcript, extraction: Extraction) -> Any:
+        """Which jobs this recording names, scored by the record's own rules.
+
+        The work was already happening and being thrown away: :meth:`SiteBook.bind` scores
+        every job, and only the winner was kept to propose a title. So a walk that ran
+        through three sites was flattened to one, and everything downstream re-derived the
+        answer from raw text, every time.
+
+        **Scored over the spoken body, not the rendered file.** The record binds a document
+        by scoring it, and it is handed the transcript — so the candidates have to describe
+        the same words, or they describe a document nobody ingests. It cannot be the
+        rendered bytes: those carry the provenance header, and scoring our own header would
+        be scoring ourselves.
+
+        Never raises. Evidence is a convenience for whoever reads the file next; a
+        recording is not.
+        """
+        # Its own switch. Three features read the job list now — the title, the engine hint
+        # list, and this — and each writes different bytes, so each keeps its own way of
+        # being turned off. NAMING=0 in particular promises the files come back exactly as
+        # they were, and this writes into two of them.
+        if not bool(getattr(self.config, "site_evidence", True)):
+            return None
+        try:
+            book = self.site_book
+            if not book:
+                return sitebook.SiteEvidence(fault=book.fault)
+            quotes = [str(getattr(p.item, "quote", "") or "")
+                      for p in (getattr(extraction, "proposals", ()) or ())]
+            return sitebook.evidence_for(book, outputs.spoken_body(transcript), quotes)
+        except Exception:  # noqa: BLE001 - never the reason a recording fails
+            log.warning("site-evidence", "the job list could not be read for this recording; "
+                        "the files will not carry the candidates")
+            return None
 
     def _publish(
         self,
