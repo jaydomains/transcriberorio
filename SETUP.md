@@ -14,6 +14,7 @@ says "copy this", it means copy it into your password manager or a note on your 
 
 | # | Step | Time | Who |
 |---|---|---|---|
+| **0** | **Try it on one recording — needs steps 3 and 4 only, nothing else** | **15 min** | **you** |
 | 1 | Give the service permission to read your OneDrive | 20 min | **may need your IT admin** |
 | 2 | Decide your folders — one set per kind of recording | 10 min | you |
 | 3 | Get a transcription key | 10 min | you |
@@ -27,6 +28,79 @@ says "copy this", it means copy it into your password manager or a note on your 
 
 **Start with step 1 today.** It is the only one that might need somebody else, and everything else
 waits on it. Steps 2–6 you can do in any order while step 1 is being approved.
+
+**But do step 0 first — it takes fifteen minutes and it answers the only question that matters.**
+
+---
+
+## Step 0 — Try it on one of your own recordings, before setting anything up
+
+**Why:** everything below is about running unattended for years. None of it tells you whether the
+transcription is any good on how people actually talk on a Cape Town site — half a sentence in
+Afrikaans, a name nobody spells the same way twice, a compressor running. That is the thing to find
+out first, and it needs **two keys and nothing else**. No Microsoft, no mail server, no app
+registration, no waiting on IT.
+
+**What you need:** step 3 (a transcription key) and step 4 (an AI-pass key). Do those two now — they
+are ten and five minutes and you can do both yourself. Then come back here.
+
+### Run it
+
+Copy one recording out of your OneDrive `calls` folder onto the machine you're working on. Then, in
+a terminal, in the transcriber folder:
+
+```
+export OPENAI_API_KEY=...          # your transcription key, from step 3
+export ANALYSIS_API_KEY=...        # your AI-pass key, from step 4
+export PYTHONPATH=src
+
+python3 -m transcriber try "/path/to/Call recording Danie_250815_143012.m4a" --out ./try-output
+```
+
+**Type the two `export` lines, don't put the keys in the command itself.** A key typed as part of a
+command is kept in your shell history and shows up in the list of running processes — the `export`
+form keeps it to the one terminal window and it is gone when you close it.
+
+If your recordings are on OneDrive on the same machine, the folder is usually somewhere like
+`~/OneDrive - <your company>/calls` — you don't need to move anything, just point at the file.
+
+### What comes back
+
+- **The file** — how long it is, and whether the audio is intact. A recording cut short by a dying
+  battery is flagged here; the running service quarantines those, this command transcribes them
+  anyway so you can see what a broken one produces.
+- **The transcription** — how long it took, how many words, and the pace. Ordinary speech is 120–160
+  words a minute. Far below that means the engine dropped some.
+- **What it read** — the summary, the site it thinks the recording concerns, and the proposals it
+  would put to a person.
+- **What it cost** — the actual token spend for reading *this* recording, with the date the prices
+  were checked. This is the reading only; the transcription is billed by the minute of audio by
+  whichever engine you chose, and this command has no price list for that.
+- **The three files** it would have published, rendered by exactly the same code that publishes
+  them. `--out` writes them to a folder so you can open them properly.
+
+### What it does not do
+
+It publishes nothing, files nothing, emails nothing and records nothing. It does not touch OneDrive.
+It does not run the sensitivity gate, so nothing is held back here that the running service would
+hold back. And it cannot tell you whether the polling finds your recordings or whether the morning
+email arrives — those need the full setup, and they are also the parts least likely to surprise you.
+
+### Do this with three or four recordings, not one
+
+Pick a good one, a bad one, and one with a lot of Afrikaans in it. That is the honest test. If the
+words come back wrong on all three, stop — no amount of the setup below fixes a transcription
+engine that cannot hear your site. Try `--engine elevenlabs` instead and run the same three again.
+
+```
+python3 -m transcriber try --engine elevenlabs "/path/to/the same file.m4a"
+```
+
+Give it the names it will keep mishearing, and it mishears them less:
+
+```
+python3 -m transcriber try --vocabulary "Blsa,Kirstenhof,polycarb,Danie,Carel" "/path/to/file.m4a"
+```
 
 ---
 
