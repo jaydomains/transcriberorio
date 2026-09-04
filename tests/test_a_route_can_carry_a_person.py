@@ -148,6 +148,71 @@ class ARecordingTwoRoutesClaimedIsNotPublished(unittest.TestCase):
                                       route="carel")
                 self.assertEqual(led.disagreement_about("y"), "")
 
+    def test_a_person_sorting_it_out_and_requeueing_actually_recovers(self) -> None:
+        """The refusal tells the operator to sort the folders out and requeue. Events are
+        append-only and a disagreement is never deleted, so without scoping the question to
+        what has happened SINCE, that instruction re-quarantines on every attempt forever,
+        with no way out but hand-editing SQLite. A recovery path that does not recover is
+        worse than no refusal at all — found by review, not by me."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._ledger(tmp) as led:
+                item = DriveItem(item_id="x", name="c.m4a", size=10,
+                                 created_at="2026-09-03T09:00:00Z")
+                led.upsert_discovered(item, route="carel")
+                led.upsert_discovered(item, route="danie")
+                self.assertTrue(led.disagreement_about("x"))
+
+                led.requeue("x", reason="sorted the nested folders out")
+                self.assertEqual(led.disagreement_about("x"), "")
+
+    def test_reassigning_the_route_recovers_too(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._ledger(tmp) as led:
+                item = DriveItem(item_id="x", name="c.m4a", size=10,
+                                 created_at="2026-09-03T09:00:00Z")
+                led.upsert_discovered(item, route="carel")
+                led.upsert_discovered(item, route="danie")
+                led.reassign_route("x", "danie", reason="it is Danie's recording")
+                self.assertEqual(led.disagreement_about("x"), "")
+
+    def test_a_configuration_still_broken_disputes_again_and_stops_it_again(self) -> None:
+        """The half that makes the recovery safe. Requeueing is a person saying they have
+        dealt with it; if they have not, the next poll finds both routes claiming the
+        recording and records a FRESH disagreement, newer than their action."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._ledger(tmp) as led:
+                item = DriveItem(item_id="x", name="c.m4a", size=10,
+                                 created_at="2026-09-03T09:00:00Z")
+                led.upsert_discovered(item, route="carel")
+                led.upsert_discovered(item, route="danie")
+                led.requeue("x", reason="thought I had fixed it")
+                self.assertEqual(led.disagreement_about("x"), "")
+
+                led.upsert_discovered(item, route="danie")   # nothing was actually fixed
+                self.assertTrue(led.disagreement_about("x"))
+
+    def test_the_whole_history_is_still_reported_and_nothing_is_deleted(self) -> None:
+        """Scoping the question must not throw the record away. The morning email and the
+        status table still show every disagreement there has ever been."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._ledger(tmp) as led:
+                item = DriveItem(item_id="x", name="c.m4a", size=10,
+                                 created_at="2026-09-03T09:00:00Z")
+                led.upsert_discovered(item, route="carel")
+                led.upsert_discovered(item, route="danie")
+                led.requeue("x", reason="sorted it")
+                led.upsert_discovered(item, route="danie")
+
+                self.assertEqual(len(led.route_disagreements(limit=None)), 2)
+
     def test_the_pipeline_refuses_the_route_of_a_disputed_recording(self) -> None:
         from transcriber import pipeline as P
 

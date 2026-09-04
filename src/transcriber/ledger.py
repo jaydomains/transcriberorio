@@ -1521,11 +1521,28 @@ class Ledger:
 
         The answer is the newest disagreement's own words, because that is the sentence a
         person needs: which two routes, and which one it stayed on.
+
+        **Only disputes NEWER than the last thing a person did to this recording count.**
+        Events are append-only and a disagreement is never deleted, so without this the
+        answer would be "disputed" forever — and the refusal it feeds tells the operator to
+        sort the folders out and requeue, which would then re-quarantine on every attempt
+        with no way out but hand-editing SQLite. A recovery path that does not recover is
+        worse than no refusal at all.
+
+        ``requeued`` and ``route-changed`` are the two operator actions, and both already
+        demand a stated reason, so neither happens by accident. Doing either is a person
+        saying they have dealt with it; if they have not, the next poll finds both routes
+        claiming the recording again and records a fresh disagreement, which is newer than
+        their action and stops it again. Nothing is lost — the whole history stays in
+        ``events`` and :meth:`route_disagreements` still reports every one of them.
         """
         row = self._conn().execute(
             "SELECT detail FROM events WHERE item_id=? AND kind='route-disagreement'"
+            " AND id > COALESCE("
+            "   (SELECT MAX(id) FROM events WHERE item_id=?"
+            "     AND kind IN ('requeued','route-changed')), 0)"
             " ORDER BY id DESC LIMIT 1",
-            (item_id,),
+            (item_id, item_id),
         ).fetchone()
         return str((row["detail"] if row else "") or "")
 
