@@ -152,7 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except CommandProblem as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_FAILED
-    except (release_module.ReleaseError, WithheldError) as exc:
+    except (release_module.ReleaseError, WithheldError, review_server.ReviewError) as exc:
         # Every one of these carries a whole sentence about a held passage, written to be
         # read by the person who just typed the command. A traceback in its place would be
         # the service refusing to explain itself about the one thing it holds.
@@ -167,6 +167,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return EXIT_FAILED
+
+
+def _a_date(text: str) -> str:
+    """A YYYY-MM-DD date, refused in the parser rather than believed by the store.
+
+    ⛔ WHY THIS IS NOT COSMETIC. These strings end up in a plain SQL string
+    comparison against an ISO timestamp column, so a value that is not a date
+    still compares — it just compares wrongly, and silently. `--since notadate`
+    sorted after every stored stamp and reported nothing found; `--since
+    01-09-2026`, which is the ordinary way to write a date here, sorted BEFORE
+    all of them and quietly measured the whole history while printing the string
+    back as though it had been honoured. Widening a window nobody asked to widen
+    is the dangerous direction, so this is refused where it is typed.
+    """
+    if not text.strip():
+        # argparse runs `type` over a STRING DEFAULT as well as over what was
+        # typed, and "" is how these arguments say "no bound at all". Refusing it
+        # here would make a bare `gate` — the ordinary way to run it — exit 2.
+        return ""
+    try:
+        datetime.date.fromisoformat(text.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a date this understands. Write it the year-first way, "
+            f"like 2026-09-01."
+        ) from None
+    return text.strip()
 
 
 #: The one help string for ``--route``, so five subcommands cannot describe it five ways.
@@ -204,7 +231,8 @@ def _parser() -> argparse.ArgumentParser:
 
     digest = sub.add_parser("digest", help="send the morning digest now")
     digest.add_argument("--dry-run", action="store_true")
-    digest.add_argument("--day", default=None, help="the day to report on (YYYY-MM-DD)")
+    digest.add_argument("--day", default=None, type=_a_date,
+                        help="the day to report on (YYYY-MM-DD)")
     digest.set_defaults(handler=cmd_digest)
 
     archive = sub.add_parser("archive", help="move aged, finished, output-confirmed recordings")
@@ -263,10 +291,15 @@ def _parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="what is known, done, failed, and when it last worked")
     status.add_argument("--json", dest="as_json", action="store_true")
-    status.add_argument("--day", default=None, help="the day to count (YYYY-MM-DD, default today)")
+    status.add_argument("--day", default=None, type=_a_date,
+                        help="the day to count (YYYY-MM-DD, default today)")
     status.add_argument(
         "--item", default=None, metavar="ID",
         help="one recording: its state, its reasons and everything that has happened to it",
+    )
+    status.add_argument(
+        "--healthcheck", action="store_true",
+        help="one line and an exit code for a container health check: is the loop still turning?",
     )
     _add_route_option(status)
     status.set_defaults(handler=cmd_status)
@@ -377,8 +410,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     gate.add_argument("--status", action="store_true",
                       help="print the mode and the measurement (the default, and the only thing it does)")
-    gate.add_argument("--since", default="", help="only count from this timestamp onwards")
-    gate.add_argument("--until", default="", help="only count up to this timestamp")
+    gate.add_argument("--since", default="", type=_a_date,
+                      help="only count from this day onwards (YYYY-MM-DD)")
+    gate.add_argument("--until", default="", type=_a_date,
+                      help="only count up to this day (YYYY-MM-DD)")
     gate.add_argument("--days", type=int, default=None,
                       help="only count the last N days (a shorthand for --since)")
     gate.add_argument("--json", dest="as_json", action="store_true")
@@ -960,8 +995,19 @@ def cmd_review(args: argparse.Namespace) -> int:
             print("--link and --revoke do different things; ask for one of them.", file=sys.stderr)
             return EXIT_CONFIG
         if args.link:
-            issued = service.tokens.issue(args.link, hours=args.hours)
+            # ⛔ ASK BEFORE MINTING. Issuing kills every earlier link that person
+            # holds, so a mint that then fails to print leaves them with no way in
+            # and no way to know. The address is what makes a link printable, so it
+            # is checked here — before anything is issued and before anything is
+            # revoked — rather than inside the code that formats the URL.
             base = str(getattr(config, "gate_review_base_url", "") or "")
+            if not base:
+                raise CommandProblem(
+                    "GATE_REVIEW_BASE_URL is not set, so there is no address to send "
+                    "anybody to. Nothing was issued and the link they already have still "
+                    "works. Set it in the environment file, then ask for the link again."
+                )
+            issued = service.tokens.issue(args.link, hours=args.hours)
             from . import logging_setup
 
             logging_setup.add_secrets([issued.token])
@@ -1638,6 +1684,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         if not ledger_path:
             return EXIT_CONFIG
 
+    if getattr(args, "healthcheck", False):
+        return _healthcheck(config, problems, ledger_path)
+
     # Installed before the ledger is touched. Without it a logging call made during status
     # escapes through logging.lastResort with no scrubber attached, and the reasons printed
     # below go to stdout through the module's own filter instead of raw.
@@ -1688,6 +1737,57 @@ def cmd_status(args: argparse.Namespace) -> int:
     if problems:
         return EXIT_CONFIG
     return EXIT_FAILED if (counts.get("failures") or []) else EXIT_OK
+
+
+
+def _healthcheck(config: "Config | None", problems: str, ledger_path: str) -> int:
+    """Is the loop still turning? One line, and an exit code a container can read.
+
+    ⛔ THIS IS A DIFFERENT QUESTION FROM `status`, and conflating them made the
+    container health check wrong in both directions at once. `status` exits on
+    whether any recording is waiting for a person, so a service whose loop had
+    been dead for a month reported healthy (nothing had failed — nothing had
+    been tried), while a single quarantined recording reported unhealthy for as
+    long as nobody got to it. A recording a person has to look at is not a
+    container fault, and a loop that has stopped is, whatever the backlog says.
+
+    So this reads one fact: when the worker last finished a cycle. Anything
+    within four polls is fine — one missed poll is ordinary, four in a row is
+    not. It deliberately says nothing about quarantined recordings; the morning
+    email is where those are somebody's business.
+    """
+    if config is None:
+        print(f"unhealthy: the configuration is not usable, so nothing can be running.\n{problems}")
+        return EXIT_CONFIG
+
+    poll = int(getattr(config, "poll_interval_s", 120) or 120)
+    allowed = poll * 4
+    with Ledger(ledger_path, scrub=config.scrub) as ledger:
+        raw = str(ledger.cursor_get(LAST_CYCLE_OK) or "").strip()
+    if not raw:
+        print(
+            "unhealthy: no cycle has finished yet. If this has only just started, give it "
+            f"{poll}s and ask again."
+        )
+        return EXIT_FAILED
+
+    try:
+        stamp = datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+    except ValueError:
+        print(f"unhealthy: the last cycle is recorded as {raw!r}, which is not a time.")
+        return EXIT_FAILED
+
+    age = (datetime.datetime.now(datetime.timezone.utc) - stamp).total_seconds()
+    if age > allowed:
+        print(
+            f"unhealthy: the last cycle finished {int(age)}s ago, and a cycle is expected "
+            f"every {poll}s. The loop has stopped."
+        )
+        return EXIT_FAILED
+    print(f"healthy: last cycle {int(age)}s ago, polling every {poll}s.")
+    return EXIT_OK
 
 
 def _route_status(
