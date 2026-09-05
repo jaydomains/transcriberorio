@@ -727,10 +727,6 @@ class ReviewService:
                 )
         return True
 
-    def pending_count(self) -> int:
-        with self._lock:
-            return len(self._pending)
-
     def flush(self) -> int:
         """Write every waiting answer now. Called when the server stops.
 
@@ -1446,71 +1442,24 @@ def links_for_pending(config: Any, service: ReviewService, *, hours: int = DEFAU
     return out
 
 
-# --------------------------------------------------------------------------- the CLI
+# There is deliberately no second entry point here. `python3 -m transcriber review`
+# is the only supported way to serve this page, because it is the only one that
+# builds the releaser and passes `on_decision` — without which a reviewer's approval
+# is recorded and the approved words are never written back into the record.
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """``python3 -m transcriber.review_server serve|link|revoke``."""
-    import argparse
+if __name__ == "__main__":  # pragma: no cover - it only says where to go
+    # This module used to serve the page itself, built WITHOUT the callback that
+    # writes approved words back into the record — so approvals made through it
+    # were recorded and never delivered. Rather than exit silently for anyone
+    # with the old command in their notes, say what replaced it.
+    import sys as _sys
 
-    from .config import Config
-
-    parser = argparse.ArgumentParser(
-        prog="transcriber.review_server",
-        description="the page held passages are approved on",
+    print(
+        "This is not the way to serve the review page. Use:\n"
+        "    python3 -m transcriber review\n"
+        "which is the only entry point that also writes approved passages back "
+        "into the record.",
+        file=_sys.stderr,
     )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    run = sub.add_parser("serve", help="run the page")
-    run.add_argument("--bind", default=os.environ.get("REVIEW_BIND", "127.0.0.1"))
-    run.add_argument("--port", type=int, default=int(os.environ.get("REVIEW_PORT", "8443")))
-    run.add_argument("--cert", default=os.environ.get("REVIEW_CERTFILE", ""))
-    run.add_argument("--key", default=os.environ.get("REVIEW_KEYFILE", ""))
-    run.add_argument("--trust-forwarded", action="store_true",
-                     help="take the client address from X-Forwarded-For (only behind a proxy you run)")
-    run.add_argument("--allow-plaintext", action="store_true",
-                     help="serve without TLS on a non-loopback address; almost never right")
-
-    make = sub.add_parser("link", help="mint one review link for one person")
-    make.add_argument("reviewer")
-    make.add_argument("--hours", type=int, default=DEFAULT_TOKEN_HOURS)
-
-    kill = sub.add_parser("revoke", help="revoke every live link one person holds")
-    kill.add_argument("reviewer")
-
-    args = parser.parse_args(list(argv) if argv is not None else None)
-    config = Config.from_env()
-    service = service_from_config(config)
-
-    if args.command == "link":
-        issued = service.tokens.issue(args.reviewer, hours=args.hours)
-        url = issued.url(str(getattr(config, "gate_review_base_url", "") or ""))
-        try:
-            from . import logging_setup
-
-            logging_setup.add_secrets([issued.token])
-        except Exception:  # noqa: BLE001
-            pass
-        print(url)
-        print(f"good until {issued.expires_at}; every earlier link for that person is now dead")
-        return 0
-
-    if args.command == "revoke":
-        count = service.tokens.revoke_for(args.reviewer, why="revoked from the command line")
-        print(f"{count} live link(s) revoked. Nothing else changed, and nothing was released.")
-        return 0
-
-    serve(
-        service,
-        host=args.bind,
-        port=args.port,
-        certfile=args.cert,
-        keyfile=args.key,
-        allow_plaintext=args.allow_plaintext,
-        trust_forwarded=args.trust_forwarded,
-    )
-    return 0
-
-
-if __name__ == "__main__":  # pragma: no cover - the entry point
-    raise SystemExit(main())
+    raise SystemExit(2)

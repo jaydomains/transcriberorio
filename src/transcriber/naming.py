@@ -119,9 +119,15 @@ _CALL_PREFIX_RE = re.compile(
 _COPY_MARKER_RE = re.compile(r"^(?P<stem>.*?)\s*\((?P<n>\d{1,3})\)$")
 
 #: Illegal in a OneDrive / SharePoint file name. Control characters go with them, and so
-#: does ``@``: an address is never allowed to survive into a name, and treating the symbol
-#: as illegal is the belt to :func:`strip_emails`' braces.
-_ILLEGAL_RE = re.compile(r'[\\/:*?"<>|#%@\x00-\x1f]+')
+#: does ``@`` — in all three of its spellings. An address is never allowed to survive into a
+#: name, and treating the symbol as illegal is the belt to :func:`strip_emails`' braces; but
+#: the belt only held for the ASCII symbol. A recording named "Call carel＠example.co.za"
+#: (U+FF20, which is what a phone with a CJK keyboard writes, and U+FE6B, which some of them
+#: write instead) was accepted whole and used for all three output files. U+FF20 and U+FE6B
+#: are here for the same reason ``@`` is, and :func:`transcriber.outputs.check_name` refuses
+#: a name carrying any of them outright, because a filename is the one thing this service
+#: writes that cannot be corrected after the fact.
+_ILLEGAL_RE = re.compile(r'[\\/:*?"<>|#%@\uFF20\uFE6B\x00-\x1f]+')
 _STAMP_PREFIX_RE = re.compile(r"^_?\d{8}-\d{6}-")
 
 #: How many hex characters of the item id's digest go into every output name. Eight is

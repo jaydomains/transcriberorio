@@ -457,10 +457,6 @@ class Delivery:
     drive_item_id: str = ""
     at: str = ""
 
-    @property
-    def wrote_a_file(self) -> bool:
-        return self.state in ("written", "already-there")
-
     def as_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,

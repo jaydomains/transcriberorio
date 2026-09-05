@@ -621,11 +621,22 @@ class Ledger:
             )
 
         changed = int(existing["size"] or 0) != int(item.size or 0) or existing["etag"] != item.etag
-        if changed and existing["state"] in (State.DONE, State.SKIPPED_EMPTY):
-            # The bytes changed after we finished with it. Nobody is going to notice that
-            # from the state column, so it goes in the history where a person can find it.
+        if changed:
+            # Somebody replaced the recording. Nobody is going to notice that from the state
+            # column — the UPDATE above has just quietly taken the new size and etag — so it
+            # goes in the history where a person can find it. Two names, because they are
+            # two different situations and a person reading the history wants to tell them
+            # apart. Replaced after we finished: the transcript and summary already written
+            # describe bytes that are no longer in the drive, and nothing in the pipeline
+            # will revisit them. Replaced while it is still being worked on: this is the one
+            # somebody can still act on, and the row now carries the new recording's size
+            # and hash, so the download step will see that the file in the work directory is
+            # the old recording and fetch the new one before anything is published.
+            finished = existing["state"] in (State.DONE, State.SKIPPED_EMPTY)
             self._event(
-                conn, item.item_id, "changed-after-finish", now, existing["state"], existing["state"],
+                conn, item.item_id,
+                "changed-after-finish" if finished else "changed-while-working",
+                now, existing["state"], existing["state"],
                 f"size {existing['size']}->{item.size}, etag {existing['etag']}->{item.etag}",
             )
         return False

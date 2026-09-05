@@ -57,14 +57,22 @@ ENV LEDGER_PATH=/var/lib/transcriber/ledger.sqlite \
 VOLUME ["/var/lib/transcriber", "/var/cache/transcriber"]
 
 # Proves parsing, the state machine, quote verification and the markdown contract offline,
-# with no credential and no network. It runs at build time so a broken image never ships,
-# and it is the same command the health check uses at run time.
+# with no credential and no network. It runs at build time so a broken image never ships.
 RUN python3 -m transcriber selftest
 
 # A container that is "up" but not processing is exactly the failure this service exists to
 # remove, so the health check asks the ledger a real question rather than checking a port.
+#
+# `status --healthcheck` and not plain `status`: plain `status` is written for a person to
+# read and answers a different question in both directions. It exits 0 while reporting "last
+# successful cycle: 31.0 days ago" — a container dead for a month, reported healthy — and it
+# exits non-zero for as long as any recording is quarantined, which is on purpose, because
+# that list deliberately carries every one of them until somebody deals with it. A recording
+# nobody has got to yet is not a sick container, and restarting on it would be a restart loop
+# that fixes nothing. `--healthcheck` asks only whether the loop is still turning: the last
+# good cycle within about four poll intervals, quarantined recordings ignored.
 HEALTHCHECK --interval=5m --timeout=30s --start-period=1m --retries=3 \
-    CMD python3 -m transcriber status >/dev/null || exit 1
+    CMD python3 -m transcriber status --healthcheck >/dev/null || exit 1
 
 STOPSIGNAL SIGTERM
 

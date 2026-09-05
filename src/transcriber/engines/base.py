@@ -47,6 +47,7 @@ from typing import Any, BinaryIO, Callable, Iterator, Mapping, Protocol, Sequenc
 
 from ..models import Hints, Segment, Transcript, strip_emails
 from ..ratelimit import RateLimiter, configure_shared, shared_limiter
+from ..redirects import no_redirect_opener, redirect_host
 
 __all__ = [
     "EngineError",
@@ -373,9 +374,6 @@ class _ChainReader(io.RawIOBase):
             out += piece
         return bytes(out)
 
-    def readall(self) -> bytes:  # noqa: D102 - file-object API
-        return self.read(-1)
-
     def close(self) -> None:  # noqa: D102 - file-object API
         if self._current is not None:
             self._current.close()
@@ -536,7 +534,13 @@ class HttpClient:
         self._secrets = tuple(s for s in secrets if isinstance(s, str) and len(s) >= 4)
         #: Secrets belonging to one request rather than to the client. See :meth:`hiding`.
         self._transient: list[str] = []
-        self._opener = opener or urllib.request.build_opener()
+        # Never the plain default opener: every request this client makes carries a
+        # provider key in a header, and urllib copies request headers onto a redirect
+        # target. One 302 from anything answering on a provider's address would post the
+        # key — and, on the transcription calls, the audio — to whoever sent the redirect,
+        # with nothing in the log to say so. A 3xx therefore comes back as a refusal that
+        # says what happened, and is handled in :meth:`request`.
+        self._opener = opener or no_redirect_opener()
         self._sleep = sleep
         self._rng = rng or random.Random()
         #: The process-wide engine limiter unless a caller hands over its own. Defaulted
@@ -647,8 +651,34 @@ class HttpClient:
                         payload = exc.read()
                     except Exception:  # the body is a courtesy; its absence is not the failure
                         payload = b""
+                    finally:
+                        # An HTTPError *is* the response, socket and all, and closing it is
+                        # nobody else's job: every branch below either raises or backs off,
+                        # and none of them touches it again. Left to the garbage collector
+                        # this is invisible in a one-shot command and a slow leak in a
+                        # service that runs unattended for years — and the redirect refusal
+                        # just below is a path that can answer every request in a row.
+                        # An error built with no body has nothing to close and says so by
+                        # raising; a socket that will not close is not a request failure.
+                        with contextlib.suppress(Exception):
+                            exc.close()
                     last_status = exc.code
                     last_body = self.scrub(payload.decode("utf-8", "replace")[:600])
+                    if 300 <= exc.code < 400:
+                        location = exc.headers.get("Location") if exc.headers else ""
+                        raise EngineHTTPError(
+                            f"{redact_url(url)} answered with a redirect to "
+                            f"{redirect_host(location or '')}. This service does not follow "
+                            "a redirect on a request that carries a provider key, because "
+                            "following it would send the key to whatever host answered. "
+                            "Check that the address configured for this engine is the "
+                            "provider's own and that nothing on this network is standing in "
+                            "front of it.",
+                            status=exc.code,
+                            url=url,
+                            body=last_body,
+                            attempts=attempt,
+                        ) from None
                     if exc.code in (401, 403):
                         raise EngineAuthError(
                             f"{redact_url(url)} rejected the credential with {exc.code}. "

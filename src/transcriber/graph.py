@@ -18,6 +18,7 @@ call that fails quietly is the exact bug this service exists to remove.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -33,6 +34,8 @@ from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 from typing import Any, Callable, Iterator, Mapping, Sequence
+
+from .redirects import no_redirect_opener, redirect_host
 
 log = logging.getLogger("transcriber.graph")
 
@@ -80,6 +83,21 @@ class GraphAuthError(GraphError):
     def __init__(self, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+class GraphAuthUnreachable(GraphError):
+    """The token endpoint never answered, so nobody has judged our credentials at all.
+
+    Deliberately NOT a subclass of :class:`GraphAuthError`, because the two mean opposite
+    things to the person who has to act on them, and to the code that decides whether this
+    process should stay up. A rejected credential is a service fault: nothing will work
+    until somebody issues a new client secret or fixes the app registration, so failing
+    hard and loudly is right. An endpoint that could not be reached is a cycle error — the
+    network was not up yet, which is the ordinary shape of a boot after the power comes
+    back — and the next attempt clears it with nobody involved. Treating the second as the
+    first is how a service that only needed to wait thirty seconds instead exhausts its
+    restart limit and sits dead until a person notices.
+    """
 
 
 class GraphTransportError(GraphError):
@@ -135,10 +153,6 @@ class GraphHTTPError(GraphError):
     @property
     def is_not_found(self) -> bool:
         return self.status == 404
-
-    @property
-    def is_throttled(self) -> bool:
-        return self.status == 429
 
 
 class ResyncRequired(GraphError):
@@ -230,19 +244,6 @@ def _error_fields(body: bytes) -> tuple[str, str, str]:
 def _is_resync(status: int) -> bool:
     """On the delta endpoint a 410 means one thing only: the cursor is too old to use."""
     return status == 410
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Hand 3xx back to the caller instead of following it.
-
-    urllib copies request headers onto the redirect target, which would send our Graph
-    Authorization header to Azure blob storage — storage rejects a request carrying two
-    authentication mechanisms. Downloads therefore resolve the Location themselves and
-    fetch it with no Authorization header at all.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - urllib API
-        return None
 
 
 @dataclass(frozen=True)
@@ -449,6 +450,7 @@ class GraphClient:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         opener: urllib.request.OpenerDirector | None = None,
+        download_opener: urllib.request.OpenerDirector | None = None,
     ) -> None:
         missing = [
             name
@@ -483,8 +485,27 @@ class GraphClient:
         self._lock = threading.Lock()
         self._token: str = ""
         self._token_expires_at: float = 0.0
-        self._opener = opener or urllib.request.build_opener()
-        self._no_redirect_opener = urllib.request.build_opener(_NoRedirect())
+        # Two openers, and they are NOT interchangeable — this is the one asymmetry in the
+        # client, so it is spelled out rather than left to be rediscovered.
+        #
+        # ``_opener`` must REFUSE redirects, and that is the default rather than an option
+        # a call site has to remember: every request it makes to Graph carries the bearer
+        # token, and urllib copies request headers onto a redirect target.
+        #
+        # ``_unauthenticated_opener`` must FOLLOW them. It is used for exactly one thing —
+        # the download stream, which sends no Authorization header at all because the
+        # pre-authenticated URL is itself the credential — and storage genuinely does
+        # redirect, so an opener that refuses redirects here does not make the download
+        # safer, it makes it fail.
+        #
+        # A single injected ``opener`` still stands in for both, because the test stand-ins
+        # that inject one script every call the client makes and answer the download
+        # themselves. That is also the trap: hand this a real no-redirect opener and the
+        # download quietly loses the one redirect it depends on, with nothing said. A
+        # caller in that position passes ``download_opener`` as well, and gets the two
+        # halves it actually needs instead of one opener doing both jobs badly.
+        self._opener = opener or no_redirect_opener()
+        self._unauthenticated_opener = download_opener or opener or urllib.request.build_opener()
 
     # -- construction ------------------------------------------------------
 
@@ -570,7 +591,10 @@ class GraphClient:
                     status=exc.status,
                 ) from exc
             except GraphTransportError as exc:
-                raise GraphAuthError(f"could not reach the token endpoint: {exc}") from exc
+                # Not GraphAuthError: nothing has rejected anything. See the class docstring.
+                raise GraphAuthUnreachable(
+                    f"could not reach the token endpoint: {exc}"
+                ) from exc
             doc = resp.json()
             token = str(doc.get("access_token", ""))
             if not token:
@@ -617,19 +641,23 @@ class GraphClient:
         headers: Mapping[str, str] | None = None,
         auth: bool = True,
         timeout: float | None = None,
-        allow_redirects: bool = True,
+        want_redirect: bool = False,
         retry_statuses: frozenset[int] = RETRYABLE_STATUSES,
     ) -> Response:
-        """One Graph call with the whole retry policy applied. Raises, never returns junk."""
+        """One Graph call with the whole retry policy applied. Raises, never returns junk.
+
+        Nothing sent from here follows a redirect. ``want_redirect`` says the 3xx *is* the
+        answer the caller came for — it wants the Location back so it can fetch that itself,
+        without the token — and ``_resolve_download_url`` is the only caller that asks.
+        """
         shown = redact_url(url)
-        opener = self._opener if allow_redirects else self._no_redirect_opener
         attempt = 0
         refreshed_token = False
         while True:
             attempt += 1
             req = self._build_request(method, url, body=body, headers=headers, auth=auth)
             try:
-                with opener.open(req, timeout=timeout or self.timeout) as raw:
+                with self._opener.open(req, timeout=timeout or self.timeout) as raw:
                     payload = raw.read()
                     return Response(
                         status=raw.status,
@@ -643,9 +671,39 @@ class GraphClient:
                     payload = exc.read()
                 except Exception:  # the body is a nicety; the status is the fact
                     pass
+                finally:
+                    # The error carries the live socket, and nothing below reads from it
+                    # again — the headers survive the close, the body is already in hand.
+                    # Without this the connection waits on the garbage collector, which is
+                    # nothing in a single command and a slow leak in a service meant to run
+                    # for years; the redirect refusal a few lines down is exactly the path
+                    # that could answer every request. An error built with no body has
+                    # nothing to close and raises rather than closing, and that is not a
+                    # failure of the request.
+                    with contextlib.suppress(Exception):
+                        exc.close()
                 hdrs = {k.lower(): v for k, v in (exc.headers or {}).items()}
-                if not allow_redirects and 300 <= exc.code < 400:
-                    return Response(status=exc.code, headers=hdrs, body=payload, url=url)
+                if 300 <= exc.code < 400:
+                    if want_redirect:
+                        return Response(status=exc.code, headers=hdrs, body=payload, url=url)
+                    # The redirect was refused, not followed, and that is the whole point:
+                    # this request carries the Graph token in a header, and urllib would
+                    # have copied that header onto whatever host the Location named.
+                    raise GraphHTTPError(
+                        exc.code,
+                        method=method,
+                        url=shown,
+                        message=(
+                            "the address answered with a redirect to "
+                            + redirect_host(hdrs.get("location", ""))
+                            + ", and this service does not follow a redirect on a request "
+                            "that carries its Microsoft credentials — following it would "
+                            "hand those credentials to whatever host answered. Check that "
+                            "the Graph address in the configuration is the real one and "
+                            "that nothing on this network is standing in front of it."
+                        ),
+                        attempts=attempt,
+                    ) from exc
                 code, message, request_id = _error_fields(payload)
                 retry_after = _parse_retry_after(hdrs.get("retry-after"))
                 err = GraphHTTPError(
@@ -791,13 +849,6 @@ class GraphClient:
         """
         return ancestor_ids(self.get_item, folder_id, limit=limit)
 
-    def get_item_by_path(self, path: str) -> DriveItem:
-        """Item addressed by drive-relative path, e.g. ``CALLS/2026-08``."""
-        clean = "/".join(urllib.parse.quote(p, safe="") for p in path.strip("/").split("/") if p)
-        if not clean:
-            return DriveItem.from_api(self._get_json(f"{self._drive_base()}/root"))
-        return DriveItem.from_api(self._get_json(f"{self._drive_base()}/root:/{clean}"))
-
     def list_children(self, folder_id: str | None = None) -> list[DriveItem]:
         """Children of a folder, following every page.
 
@@ -898,8 +949,12 @@ class GraphClient:
                         req.add_header(key, value)
                     # No Authorization header: the download URL is itself pre-authenticated,
                     # and storage rejects a request carrying two authentication mechanisms.
+                    # That is also why this is the one request in this client allowed to
+                    # follow a redirect — storage does redirect, and there is no credential
+                    # in a header here for a redirect to carry anywhere.
                     try:
-                        with self._opener.open(req, timeout=self.download_timeout) as raw:
+                        opener = self._unauthenticated_opener
+                        with opener.open(req, timeout=self.download_timeout) as raw:
                             if written and raw.status == 200:
                                 # Server ignored the Range; start over rather than splice.
                                 sink.seek(0)
@@ -926,6 +981,13 @@ class GraphClient:
                             payload = exc.read()
                         except Exception:
                             pass
+                        finally:
+                            # Same reason as in ``_request``: the error owns the socket and
+                            # nothing here reads it again. This loop is the one that matters
+                            # most, because it goes round again on a stale URL or a 503 and
+                            # would drop a connection each time round.
+                            with contextlib.suppress(Exception):
+                                exc.close()
                         hdrs = {k.lower(): v for k, v in (exc.headers or {}).items()}
                         code, message, request_id = _error_fields(payload)
                         if written > before:
@@ -1015,7 +1077,7 @@ class GraphClient:
         if item.download_url:
             return item.download_url, (item.size or None)
         resp = self._request(
-            "GET", f"{self._item_base(item_id)}/content", allow_redirects=False
+            "GET", f"{self._item_base(item_id)}/content", want_redirect=True
         )
         location = resp.headers.get("location", "")
         if 300 <= resp.status < 400 and location:

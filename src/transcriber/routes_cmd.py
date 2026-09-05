@@ -215,6 +215,29 @@ def _drive_for(values: Mapping[str, str], *, offline: bool) -> _Drive:
 # reading and writing the file
 # ---------------------------------------------------------------------------------------
 
+def _load_for_reading(env_path: str, out: Any) -> tuple[dict[str, str], list[Route]] | None:
+    """The file if there is one, otherwise whatever settings this process was given."""
+    if os.path.exists(env_path):
+        return _load(env_path, out)
+    from .config import environment_the_service_reads
+
+    values = environment_the_service_reads()
+    if not values:
+        print(
+            f"there is no {env_path} to read, and this process was not given any settings "
+            "either. Run `python3 -m transcriber setup` to write one, or pass --env with "
+            "the path to it.",
+            file=out,
+        )
+        return None
+    print(
+        f"There is no {env_path}, so these are the routes THIS PROCESS was given. Pass "
+        "--env to read a file instead.\n",
+        file=out,
+    )
+    return values, list(routes_from_values(values))
+
+
 def _load(env_path: str, out: Any) -> tuple[dict[str, str], list[Route]] | None:
     if not os.path.exists(env_path):
         print(
@@ -862,7 +885,11 @@ def run(args: argparse.Namespace, stream: Any = None) -> int:
               + ", ".join(ACTIONS), file=stream)
         return EXIT_FAILED
 
-    loaded = _load(args.env, stream)
+    # `list` only reads, so on a deployed host with no .env it answers from the
+    # process environment rather than refusing. Everything else writes the file,
+    # and writing into a process environment changes nothing that outlives the
+    # command, so those keep refusing with the sentence that says what to do.
+    loaded = _load_for_reading(args.env, stream) if action == "list" else _load(args.env, stream)
     if loaded is None:
         return EXIT_FAILED
     values, routes = loaded

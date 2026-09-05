@@ -1360,6 +1360,71 @@ def subject_for(counts: DigestCounts, open_failures: int, queued: int = 0) -> st
     return f"Recordings: {counts.done} done, " + ", ".join(tail)
 
 
+# ------------------------------------------------------------------ the hand-over onwards
+
+#: The half of the journey this service cannot see, and the slot a receipt would fill.
+#:
+#: "Done" is settled here by this service's own eyes: the transcript was written to OneDrive
+#: and read back from OneDrive to check the bytes arrived whole. Carrying the file on into
+#: the record is a separate flow that runs outside this service and holds its own access,
+#: which expires like every other credential here. When it does, the record stops receiving
+#: transcripts while every number in this email stays perfect — because from here everything
+#: genuinely did work. That sentence has been in the deployment notes since the flow existed,
+#: where it is read once; the line under the counts puts it in front of the person reading
+#: this every morning.
+#:
+#: The honest fix is a receipt: something outside this service saying the record actually
+#: holds the file. Nothing emits one yet, and where the signal should come from is a decision
+#: for Jay rather than for this module, so the slot below reads an optional file and stays
+#: silent when there is none. The cheapest source is ``ops/build-site-book.py`` — it already
+#: reads the record's nightly build every morning, so alongside the site list it already
+#: writes it could write out the transcript filenames the record currently holds and the
+#: newest stamp among them. Until something does, this returns "" and the email says nothing
+#: it cannot stand behind.
+RECEIPT_FILE_SETTING = "record_receipts_file"
+
+
+def newest_confirmed_arrival(config: Any, now: float | None = None) -> str:
+    """One line about the newest transcript the record confirms it holds, or ``''``.
+
+    Empty whenever no receipt source is configured, which today is always. **Never raises**
+    and never guesses: a receipt file that is missing, unreadable or says nothing about any
+    transcript reports itself as such, because a silent slot and a slot whose source broke a
+    fortnight ago must not look the same — that is the identical mistake as reporting a
+    perfect morning on a hand-over nobody checked.
+    """
+    path = str(getattr(config, RECEIPT_FILE_SETTING, "") or "").strip()
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except FileNotFoundError:
+        return (
+            f"the record has not reported back: {os.path.basename(path)} is not there yet, "
+            f"so none of the counts above are confirmed as having reached it"
+        )
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        # Only the reason, never the path. An OSError stringifies as
+        # "[Errno 21] Is a directory: '/srv/…'", and this sentence goes into an
+        # email — the branch above is careful for the same reason.
+        return (
+            f"the record's receipt could not be read "
+            f"({type(exc).__name__}: {os.path.basename(path)}), so nothing is confirmed"
+        )
+    stamp = parse_stamp(str(raw.get("newest_at") or "")) if isinstance(raw, dict) else None
+    if stamp is None:
+        return (
+            f"the record's receipt names no transcript at all, so nothing has been confirmed "
+            f"as arriving there"
+        )
+    moment = time.time() if now is None else float(now)
+    return (
+        f"the record confirms it holds a transcript from "
+        f"{human_duration(moment - stamp)} ago — the newest one it has"
+    )
+
+
 # --------------------------------------------------------------------------- routes
 
 
@@ -1699,6 +1764,9 @@ def build(
     disagreements = route_disagreements(ledger, target)
     naming = naming_report(config, ledger, day=target)
     spend = spend_report(config, ledger, day=target)
+    # Empty unless a receipt source is configured, which today it never is. See
+    # newest_confirmed_arrival for what the slot is for and where it would be filled from.
+    receipt = newest_confirmed_arrival(config, clock)
     if sweep_report is None:
         sweep_report = _stored_report(ledger, "sweep")
     if archive_report is None:
@@ -1724,6 +1792,7 @@ def build(
         service_error=service_error,
         attention=attention,
         naming=naming,
+        receipt=receipt,
         expiries=credential_warnings(config, clock),
     )
 
@@ -2028,6 +2097,7 @@ def _render(
     attention: Mapping[str, Any] | None = None,
     expiries: Sequence[tuple[int, str]] = (),
     spend: "SpendReport | None" = None,
+    receipt: str = "",
 ) -> str:
     lines: list[str] = [subject, ""]
 
@@ -2133,6 +2203,28 @@ def _render(
         f"  finished yesterday (whenever they arrived): {counts.done_on_day}",
         "",
     ]
+
+    # What "done" is actually evidence of, said where the counts are read rather than only
+    # in the deployment notes. Everything above is settled by this service watching itself:
+    # it wrote the file to OneDrive and read it back. The hand-over into the record is a
+    # separate flow with its own expiring access, and when that lapses the record quietly
+    # stops receiving transcripts while this email goes on reporting perfect mornings. One
+    # sentence is the whole of the fix available from inside this file; the real one is a
+    # receipt, and the slot for it is the line underneath.
+    for chunk in _wrap(
+        '"Transcribed and filed" means the transcript was written to OneDrive and read back '
+        "from OneDrive to check it arrived whole. Carrying it on from there into the record "
+        "is a separate flow outside this service, and nothing here can see whether it got "
+        "there — so if that flow's access has expired, this email will still report a "
+        "perfect morning. A transcript missing from the record is that flow, not these "
+        "counts."
+    ):
+        lines.append(f"  {chunk}")
+    lines.append("")
+    if receipt:
+        for chunk in _wrap(receipt[0].upper() + receipt[1:] + "."):
+            lines.append(f"  {chunk}")
+        lines.append("")
 
     # Directly under the counts, because it is the same cohort measured in money. Nothing
     # in this section stops anything - it is a meter, and it was asked for as one.

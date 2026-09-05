@@ -64,21 +64,71 @@ __all__ = [
 # Being wider than the record is safe in a way that being narrower is not: everything we
 # remove, it never sees, and the only thing that could go wrong the other way is an address
 # reaching the record because our pattern was the stricter of the two.
-EMAIL_RE = re.compile(r"\b[\w.%+\-]+@[\w.\-]+\.[^\W\d_]{2,}\b")
+#
+# Wider again in a second way, and this one was paid for: the separator. Seven ordinary
+# spellings of the same address went into a published file untouched — "carel(at)…",
+# "carel[at]…", "carel @ …", "carel at …", "carel＠…" typed on a phone whose keyboard is set
+# to a CJK layout, "carel%40…" pasted out of a URL and "carel&#64;…" pasted out of a web
+# page. Every one of them is an address a person can read and a machine can put back
+# together, and only the literal "@" was being removed. The separator is now every spelling
+# that still delivers mail; the dictated forms — the ones built out of the WORDS "at" and
+# "dot" — are :data:`DICTATED_EMAIL_RE` below.
+#
+# The spellings are alternatives INSIDE the pattern rather than a normalising pass over the
+# text first, because :func:`strip_emails` substitutes into the caller's own string. Match
+# a normalised copy and the offsets no longer line up with the string that gets written, so
+# the placeholder goes in the wrong place or nowhere at all. What normalisation is for is
+# the backstop, which only has to answer yes or no — see ``outputs.check_contract``.
+_AT_SPELLINGS = r"(?:[@\uFF20\uFE6B]|%40|&#0*64;|&#x0*40;|&commat;)"
+
+EMAIL_RE = re.compile(
+    r"\b[\w.%+\-]+"
+    r"\s*[<\[({]?\s*" + _AT_SPELLINGS + r"\s*[>\])}]?\s*"
+    r"[\w.\-]+\.[^\W\d_]{2,}\b",
+    re.IGNORECASE,
+)
 EMAIL_PLACEHOLDER = "[address removed]"
+
+#: The ``at`` said out loud, in every wrapping a person or a phone puts round it. The word
+#: on its own, the word in brackets, and the symbol itself — the symbol is here as well as
+#: in :data:`EMAIL_RE` because a mixed spelling ("carel@example dot co dot za") is half one
+#: pattern and half the other, and neither one alone can see it.
+_DICTATED_AT = r"(?:[<\[({]\s*at\s*[>\])}]|\bat\b|[@\uFF20\uFE6B])"
+
+#: The ``dot``, and — this is what a real address said half out loud actually looks like —
+#: the punctuation mark it stands in for. Nobody dictates an address consistently: "carel at
+#: example.co.za" and "carel at example.co dot za" are both ordinary, and both used to come
+#: back untouched because the pattern demanded the WORD at every position. The word may
+#: carry spaces and brackets around it; the punctuation mark may not, and that restriction
+#: is load-bearing. "Sit at reception. Ok" is a sentence, and a full stop followed by a
+#: space and a capitalised word is the end of one, not a top-level domain.
+_DICTATED_DOT = r"(?:\s*[<\[({]?\s*\bdot\b\s*[>\])}]?\s*|\.)"
 
 #: The same rule, spelled the way somebody says it out loud: "carel at example dot co dot
 #: za". :data:`EMAIL_RE` cannot see it — it needs an ``@`` — so a model that copies a
 #: dictated address into a summary would put a reconstructable address into the record with
-#: nothing to catch it. Deliberately tight: it needs a word before the ``at``, at least one
-#: ``dot``, and an alphabetic ending, so "at 3 dot 5 metres" and "look at the roof" do not
-#: match. It is applied to what this service *writes*, never to the verbatim transcript,
-#: where the words are the evidence.
+#: nothing to catch it. Still tight where tightness costs nothing: it needs a word of two or
+#: more characters before the ``at``, a host of two or more after it, and an alphabetic
+#: ending, so "at 3 dot 5 metres" and "look at the roof" do not match, and neither does
+#: "meet me at the roof dot com" — the host and the ending have to be adjacent.
+#:
+#: What it deliberately does now match is punctuation between the name and the ``at``:
+#: "Carel, at example dot co dot za" was published byte-identical, because a single comma
+#: was enough to defeat it. A comma is what a person types when they are reading an address
+#: off a screen.
+#:
+#: The known cost of accepting a real full stop where a ``dot`` is expected is that a plain
+#: website mention — "the spec is at kbc.co.za" — is now removed too, and says so. There is
+#: no reading of "carel at example.co.za" that distinguishes it from that one without
+#: knowing which words are names, and this service does not get to guess. Removing a
+#: website address visibly costs a reader one line and a question; publishing a person's
+#: email address cannot be undone at all. It is applied to what this service *writes*, never
+#: to the verbatim transcript, where the words are the evidence.
 DICTATED_EMAIL_RE = re.compile(
-    r"\b[A-Za-z0-9._%+\-]{2,}\s*(?:\(at\)|\[at\]|\bat\b)"
-    r"(?:\s*[A-Za-z0-9\-]{2,})"
-    r"(?:\s*(?:\(dot\)|\[dot\]|\bdot\b)\s*[A-Za-z0-9\-]{2,})*"
-    r"\s*(?:\(dot\)|\[dot\]|\bdot\b)\s*[A-Za-z]{2,}\b",
+    r"\b[A-Za-z0-9._%+\-]{2,}[\s,;:]*" + _DICTATED_AT +
+    r"\s*[A-Za-z0-9\-]{2,}"
+    r"(?:" + _DICTATED_DOT + r"[A-Za-z0-9\-]{2,})*"
+    + _DICTATED_DOT + r"[A-Za-z]{2,}\b",
     re.IGNORECASE,
 )
 
@@ -390,10 +440,6 @@ class DriveItem:
     @property
     def extension(self) -> str:
         return os.path.splitext(self.name)[1].lower()
-
-    @property
-    def looks_like_audio(self) -> bool:
-        return self.extension in AUDIO_EXTENSIONS
 
     @property
     def has_hash(self) -> bool:

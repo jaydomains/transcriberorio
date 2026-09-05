@@ -134,10 +134,15 @@ them:
 3. Click **Add**.
 4. **Copy the "Value" column immediately.** It is shown once and never again. If you miss it, delete
    the secret and make another — no harm done.
+5. **Write down the expiry date the portal shows next to it**, as `YYYY-MM-DD`. It goes into
+   `GRAPH_SECRET_EXPIRES_ON` in step 9, and it is the only way the service knows the date is coming.
 
 > ⚠️ **Put a reminder in your calendar for 23 months from now to renew this.** An expired secret is
 > the single most common way a system like this dies quietly. The transcriber will also warn you in
-> the morning email as the date approaches, but a calendar entry costs nothing.
+> the morning email as the date approaches — from 45 days out, and in the subject line from 14 —
+> **but only if you gave it the date in step 5.** Without it the service runs perfectly for two
+> years and then stops dead one morning with no warning at all. A calendar entry costs nothing
+> either; do both.
 
 ### 1c. Give it permission — and this is the bit needing an admin
 
@@ -318,6 +323,12 @@ it goes to whoever you name.
    their address. That single setting is what makes a copy the one that reports. Move it to
    a different copy and the job moves with it; put it on two and you get two group emails,
    which is the visible mistake rather than the silent one.
+4. Optionally, `GROUP_SILENT_AFTER_HOURS` — how long a copy may go without dropping a status
+   file before the group email calls it silent rather than quiet. It defaults to 36 hours,
+   which is a missed morning plus a bit of slack, so a machine rebooting overnight does not
+   read as a machine that has died.
+
+All five are in `.env.example`, under **the group view**.
 
 ### What is in those files, and what is not
 
@@ -596,10 +607,13 @@ Proves the code is sane. Needs no keys, no network, touches nothing. If this fai
 matters.
 
 ```
-python3 -m transcriber once --dry-run
+python3 -m transcriber sweep --dry-run
 ```
-Connects to OneDrive, finds what's there, and **writes nothing**. This is where we confirm the
-permissions from step 1 actually work.
+Connects to OneDrive, walks every route's folder and lists what's there. It **changes nothing
+in OneDrive and queues nothing** — it only reports what it can see, which is exactly the
+question we are asking: do the permissions from step 1 actually work. (`sweep` rather than
+`once`, because `once` has no dry run: it is the command that actually processes recordings,
+and there is no half-way version of that.)
 
 ```
 python3 -m transcriber once --limit 3

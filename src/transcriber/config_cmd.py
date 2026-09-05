@@ -605,6 +605,37 @@ def _print_list(env_path: str, env: Mapping[str, str], out: Any) -> None:
 # the commands
 # ---------------------------------------------------------------------------------------
 
+def _load_for_reading(env_path: str, out: Any) -> dict[str, str] | None:
+    """The file if there is one, otherwise the process environment.
+
+    ⛔ READING ONLY. `config set` still refuses when there is no file, because
+    writing into a process environment changes nothing that survives the command.
+    A deployed host has no `.env` — systemd hands the settings over through
+    `EnvironmentFile=` — so refusing here made the two commands that answer "what
+    is this set up to do" the only ones that did not work where the answer matters.
+    """
+    if os.path.exists(env_path):
+        return load_env_file(env_path)
+    from .config import environment_the_service_reads
+
+    live = environment_the_service_reads()
+    if not live:
+        print(
+            f"there is no {env_path} to read, and this process was not given any settings "
+            "either. Run `python3 -m transcriber setup` to write one, or pass --env with "
+            "the path to it.",
+            file=out,
+        )
+        return None
+    print(
+        f"There is no {env_path}, so this is what THIS PROCESS was given — which on a "
+        "deployed host is the environment file systemd hands over, and may differ from "
+        "what the service itself is running with. Pass --env to read a file instead.\n",
+        file=out,
+    )
+    return live
+
+
 def _load(env_path: str, out: Any) -> dict[str, str] | None:
     if not os.path.exists(env_path):
         print(
@@ -618,7 +649,7 @@ def _load(env_path: str, out: Any) -> dict[str, str] | None:
 
 def cmd_list(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
-    env = _load(args.env, out)
+    env = _load_for_reading(args.env, out)
     if env is None:
         return EXIT_FAILED
     _print_list(args.env, env, out)
@@ -633,7 +664,7 @@ def cmd_list(args: argparse.Namespace, out: Any = None) -> int:
 
 def cmd_get(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
-    env = _load(args.env, out)
+    env = _load_for_reading(args.env, out)
     if env is None:
         return EXIT_FAILED
     name = (args.key or "").strip().upper()

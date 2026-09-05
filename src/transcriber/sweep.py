@@ -444,13 +444,6 @@ class SweepRun:
         own = sum(1 for f in self.findings if f.needs_a_person)
         return own + sum(r.needs_a_person for r in self.reports)
 
-    @property
-    def all_findings(self) -> list[SweepFinding]:
-        out = list(self.findings)
-        for report in self.reports:
-            out.extend(report.findings)
-        return out
-
     def add(
         self,
         kind: str,
