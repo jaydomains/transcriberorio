@@ -184,6 +184,7 @@ _SPEC: tuple[_Var, ...] = (
     _Var("gate_review_base_url", "GATE_REVIEW_BASE_URL", "str", "", "https address of the page where held passages are approved, linked from the morning email; required before the gate can be switched on"),
     _Var("analysis_key_expires_on", "ANALYSIS_KEY_EXPIRES_ON", "str", "", "ISO date the analysis API key expires, if it has one (optional)"),
     # --- naming a recording that arrived without one ----------------------------------
+    _Var("closea_drop", "CLOSEA_DROP", "str", "", "directory on this machine where one JSON envelope per finished recording is written for closea to ingest. Empty means nothing is handed over and the three OneDrive files are the only output, which is what a deployment without closea wants. Written only after all three files are confirmed"),
     _Var("site_evidence", "SITE_EVIDENCE", "bool", True, "write the job-list candidates and their scores into the summary and actions files, so whatever reads them next is not left hunting through raw text for which job a site walk was about. Evidence only — it files nothing, and never appears in the transcript"),
     _Var("engine_site_names", "ENGINE_SITE_NAMES", "bool", True, "tell the transcription engine the job names from the site list, so it writes 'Lonehill' instead of 'on loan' — a name it never transcribed cannot be matched afterwards by anything"),
     _Var("naming", "NAMING", "bool", True, "work out what to call a recording that arrived under the voice recorder's own default name, from the site spoken in it, and say so in the morning email"),
@@ -357,6 +358,7 @@ class Config:
     # naming a recording that arrived without one
     #: Whether to work out a name at all. On by default because it only ever *reports*
     #: until :attr:`naming_apply` is set as well.
+    closea_drop: str = ""
     site_evidence: bool = True
     engine_site_names: bool = True
     naming: bool = True

@@ -77,6 +77,7 @@ from typing import Any, Mapping, Sequence
 
 from . import audio as audio_probe
 from . import autoname, completeness, naming, outputs, plausibility, redact, sensitivity
+from . import estate
 from . import sitebook
 from .engines import (
     EngineAudioTooLarge,
@@ -856,6 +857,9 @@ class Pipeline:
                                notes=publish_notes,
                                held=gate.held,
                                display_name=decision.name if decision.applied else "")
+        self._hand_to_the_estate(row, parsed, gate, info, route,
+                                 notes=publish_notes,
+                                 display_name=decision.name if decision.applied else "")
         self.ledger.advance(
             row.item_id,
             State.DONE,
@@ -1452,6 +1456,53 @@ class Pipeline:
             orphan_folder_id=str(getattr(self.config, "orphan_folder_id", "") or ""),
             work_dir=self._item_dir(row.item_id),
         )
+
+    def _hand_to_the_estate(
+        self,
+        row: Row,
+        parsed: naming.ParsedName,
+        gate: Any,
+        info: AudioInfo,
+        route: Route,
+        *,
+        notes: tuple[str, ...] = (),
+        display_name: str = "",
+    ) -> None:
+        """One envelope into closea's drop folder, AFTER all three files are confirmed.
+
+        ⛔ AFTER, AND THE ORDER IS THE WHOLE POINT. The envelope tells the estate what a
+        recording says; the transcript is the evidence for it. Handing over the reading
+        while the evidence failed to upload would put a claim into the estate with nothing
+        behind it, and the estate has no way to know that. `_publish` returns only once all
+        three files are up and read back, so this line is only ever reached when the
+        evidence exists.
+
+        ⛔ AND IT NEVER COSTS A RECORDING. A drop folder that is missing, full, read-only or
+        on a disk that has gone away is a hand-over that did not happen — the three files
+        are already published and confirmed, the ledger still advances to DONE, and the
+        failure is named in the log. A recording lost because the estate's folder was
+        unwritable would be this service failing at the one job it has.
+
+        Off unless configured: no CLOSEA_DROP means no envelope and no folder created.
+        """
+        target = str(getattr(self.config, "closea_drop", "") or "").strip()
+        if not target:
+            return
+        try:
+            ctx = self._context(row, parsed, gate.transcript, gate.extraction, info,
+                                notes=tuple(notes), held=tuple(gate.held),
+                                display_name=display_name)
+            written = estate.write(target, ctx, row.item_id)
+        except Exception as exc:  # noqa: BLE001 - the recording is already safe
+            log.warning(
+                "estate-handover",
+                "the recording is published and confirmed, but the envelope for the estate "
+                "could not be written; it will be written again on a re-run",
+                item=row.item_id, route=route.name, drop=target, error=str(exc),
+            )
+            return
+        log.info("estate-handover", "one envelope for the estate",
+                 item=row.item_id, route=route.name, file=os.path.basename(written))
 
     def _refuse_name_collision(self, row: Row, ctx: outputs.OutputContext) -> None:
         """Never write over another recording's output. Quarantine loudly instead.
