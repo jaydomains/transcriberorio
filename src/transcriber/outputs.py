@@ -70,6 +70,7 @@ from typing import Any, Iterable, Sequence
 
 from .models import (
     DICTATED_EMAIL_RE,
+    EMAIL_PLACEHOLDER,
     EMAIL_RE,
     AudioInfo,
     Segment,
@@ -137,6 +138,51 @@ _REDACTION_SLOT = "\x00redaction-note\x00"
 #: of an address that neither our guard nor the record's own address check recognises. It is
 #: refused by name here, and :func:`_safe_web_url` removes it before anything is rendered.
 _UPN_PATH_RE = OWNER_PATH_RE
+
+#: The line :func:`spoken_body` writes for each segment: ``[HH:MM:SS] Speaker: words``.
+#: Removed before the backstop reads a file, and for one reason: an address does not know
+#: where the segments were cut. Segments break on a speaker change or a pause over 0.9 s, so
+#: a pause in the middle of an address dictated slowly puts "carel@" at the end of one line
+#: and "example.co.za" at the start of the next, with a timestamp and a name in between. No
+#: pattern can read across that, which is why :func:`spoken_body` masks it before the line
+#: prefixes go on. This is the check that the masking actually happened.
+_SEGMENT_PREFIX_RE = re.compile(r"(?m)^\[[0-9:]{4,9}\]\s*(?:[^\s:][^:\n]{0,60}:\s*)?")
+
+#: The two encodings of ``@`` a web form leaves behind, and the ``at``/``dot`` a person
+#: says. Used only by :func:`_normalise_for_address_scan`.
+_PERCENT_OR_ENTITY_AT_RE = re.compile(r"%40|&#0*64;|&#x0*40;|&commat;", re.I)
+_BRACKETED_AT_RE = re.compile(r"\s*[<\[({]\s*at\s*[>\])}]\s*", re.I)
+_SPACED_AT_RE = re.compile(r"\s*[@\uFF20\uFE6B]\s*")
+_SPOKEN_DOT_RE = re.compile(r"(?<=[A-Za-z0-9])\s*[<\[({]?\s*dot\s*[>\])}]?\s*(?=[A-Za-z0-9])", re.I)
+
+#: What an address looks like once every spelling of it has become the same spelling. This
+#: is the only address check in this module that does not call the masker's own detectors,
+#: and that is the whole point of it: :func:`check_contract` used to ask
+#: :func:`transcriber.models.contains_email` the same question :func:`_scrub` had just asked,
+#: so a spelling the masker could not see was a spelling the backstop could not see either,
+#: and the two failed together by construction. Seven ordinary spellings went through both.
+#:
+#: The independence is in WHAT IT READS — a normalised copy — rather than in being a wider
+#: pattern. Deliberately: a backstop wider than the masker refuses a publish the masker can
+#: never satisfy, and this module's refusals are not retried, so the recording quarantines
+#: forever with none of its three files written. Wider than the masker is not "safer" here;
+#: it is the other way of losing the recording.
+_NORMALISED_ADDRESS_RE = re.compile(r"[\w.%+\-]*\w[\w.%+\-]*@(?:[\w\-]+\.)+[^\W\d_]{2,}")
+
+
+def _normalise_for_address_scan(text: str) -> str:
+    """Every spelling of an address, reduced to the one spelling, for a yes/no read.
+
+    Not usable for masking — it moves every offset in the string, so nothing found here can
+    be put back in the right place. It exists to answer one question after the masking is
+    done: is there still an address in this file, however it is written?
+    """
+    flat = re.sub(r"\s+", " ", text or "")
+    flat = _PERCENT_OR_ENTITY_AT_RE.sub("@", flat)
+    flat = _BRACKETED_AT_RE.sub("@", flat)
+    flat = _SPACED_AT_RE.sub("@", flat)
+    return _SPOKEN_DOT_RE.sub(".", flat)
+
 
 #: The pipeline writing ``decided_by`` on a line of its own is forbidden. A person *saying*
 #: the words on a recording is not: the transcript is the evidence, and the guard aimed at
@@ -374,8 +420,75 @@ def spoken_body(transcript: Transcript) -> str:
     """
     segments = list(transcript.segments or ())
     if segments:
-        return "\n".join(_segment_line(s) for s in segments)
+        texts = _mask_across_segments([str(s.text or "") for s in segments])
+        return "\n".join(_segment_line(s, text) for s, text in zip(segments, texts))
     return (transcript.text or "").strip()
+
+
+def _mask_across_segments(texts: Sequence[str]) -> list[str]:
+    """Remove an address that the cut between two segments split in half.
+
+    :func:`_scrub` reads the finished file, and by then every segment is its own line with a
+    timestamp and a speaker in front of it. No pattern reads across that, so an address the
+    engine happened to cut in two — "send it to carel@" ... "example.co.za when you can" —
+    went into the published file in both halves, one under the other, and the contract check
+    that exists to catch exactly this saw nothing. The cut lands there whenever the speaker
+    pauses in the middle of dictating an address, which is when people pause.
+
+    So the address is looked for in the segments joined as one run of text, where it is
+    whole, and the cuts are then mapped back onto the individual segments: the first segment
+    the address touches keeps the marker, the rest of it goes. The words either side are
+    untouched, and the reader sees a marker in the place the address was said rather than a
+    hole.
+    """
+    joined = "\n".join(texts)
+    if not (contains_email(joined) or contains_dictated_email(joined)):
+        return list(texts)
+
+    spans = [m.span() for m in EMAIL_RE.finditer(joined)]
+    spans += [m.span() for m in DICTATED_EMAIL_RE.finditer(joined)]
+    # Only the ones the cut split. Anything inside a single segment is already the case
+    # :func:`_scrub` handles on the finished file, and it handles it better: it says in the
+    # file that an address was removed, which this cannot do from here.
+    spans = sorted({(a, b) for a, b in spans if "\n" in joined[a:b]})
+    if not spans:
+        return list(texts)
+
+    # Two detectors reading the same words can return two spans that overlap without being
+    # the same span, and replacing one of them first would move the other one's offsets off
+    # its own words. Merged into one run before anything is cut, so every replacement below
+    # is over a piece of text nothing else touches.
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    spans = merged
+
+    out = list(texts)
+    offset = 0
+    bounds: list[tuple[int, int]] = []
+    for text in texts:
+        bounds.append((offset, offset + len(text)))
+        offset += len(text) + 1  # the "\n" the join put between them
+
+    # Right to left through the address and right to left through the segments, so that a
+    # replacement already made cannot move the offsets of one still to come.
+    for start, end in reversed(spans):
+        for index in range(len(out) - 1, -1, -1):
+            low, high = bounds[index]
+            cut_from, cut_to = max(start, low), min(end, high)
+            if cut_from >= cut_to:
+                continue
+            # ``start >= low`` is true of exactly one segment: the one the address begins
+            # in. That is where the marker goes; the continuation of it simply ends.
+            out[index] = (
+                out[index][: cut_from - low]
+                + (EMAIL_PLACEHOLDER if start >= low else "")
+                + out[index][cut_to - low:]
+            )
+    return out
 
 
 def render_transcript(ctx: OutputContext) -> str:
@@ -884,8 +997,9 @@ def _safe_web_url(url: str) -> str:
     return strip_owner_paths(str(url or "").strip())
 
 
-def _segment_line(segment: Segment) -> str:
-    text = _inline(segment.text)
+def _segment_line(segment: Segment, text: str | None = None) -> str:
+    """One published line. ``text`` overrides the segment's own words when they were masked."""
+    text = _inline(segment.text if text is None else text)
     speaker = _inline(segment.speaker or "")
     stamp = _clock(segment.start)
     if speaker:
@@ -1128,6 +1242,13 @@ def parse_like_downstream(text: str) -> tuple[dict[str, str], str]:
     return head, body
 
 
+def _address_scan_variants(text: str) -> tuple[str, ...]:
+    """The copies of a file the backstop reads: flattened, and with the line prefixes off."""
+    flat = _normalise_for_address_scan(text)
+    unwrapped = _normalise_for_address_scan(_SEGMENT_PREFIX_RE.sub("", text))
+    return (flat,) if unwrapped == flat else (flat, unwrapped)
+
+
 def check_name(name: str) -> list[str]:
     """The same mechanical guard as :func:`check_contract`, applied to the *filename*.
 
@@ -1140,10 +1261,26 @@ def check_name(name: str) -> list[str]:
     if not base.strip():
         problems.append("an output file has no name")
         return problems
-    if contains_email(base) or "@" in base:
+    # The symbol in all three of its spellings, not just the ASCII one. A phone with a CJK
+    # keyboard writes U+FF20 and sometimes U+FE6B, and ``"@" in base`` is blind to both: a
+    # recording named "Call carel＠example.co.za" put that address into three filenames, into
+    # the ledger, into OneDrive and into a commit in the record, and every one of those is a
+    # place it can no longer be taken out of.
+    if contains_email(base) or any(ch in base for ch in "@\uFF20\uFE6B"):
         problems.append(f"the filename {base!r} contains an email address")
     if contains_dictated_email(base):
         problems.append(f"the filename {base!r} contains a spoken-out-loud email address")
+    # And the same normalised read the file contents get. This one refuses rather than
+    # redacts on purpose: :func:`transcriber.naming.safe_stem` has already had its go, and
+    # its own docstring says why the name is the surface that gets the loud answer — it is
+    # the one that cannot be corrected afterwards. Refusing costs a recording a retry after
+    # somebody renames it. Publishing costs an address that stays published.
+    elif _NORMALISED_ADDRESS_RE.search(_normalise_for_address_scan(base)):
+        problems.append(
+            f"the filename {base!r} contains an email address written in a way the "
+            f"redaction did not remove; a filename cannot be corrected once it is in "
+            f"OneDrive and in the record"
+        )
     if _UPN_PATH_RE.search(base):
         problems.append(f"the filename {base!r} carries an account owner's path segment")
     if not base.lower().endswith(".md"):
@@ -1237,6 +1374,31 @@ def check_contract(
             f"the file contains {len(found)} spoken-out-loud email address(es) "
             "('name at host dot co dot za'); this service never writes one in any spelling"
         )
+
+    # The backstop's own reading, and the only address check here that does not ask the
+    # masker's own detectors the question the masker has already asked itself. Both of the
+    # copies it reads are ones the masker cannot: the file with its line breaks flattened,
+    # so an address split across a line is whole again, and the same file with the segment
+    # prefixes taken off, so an address split across a segment cut is whole again too. The
+    # spellings are normalised first — spacing, brackets, the lookalike characters, %40 and
+    # &#64;, and "dot" said out loud — so this pattern does not have to know any of them.
+    for scanned in _address_scan_variants(text):
+        found = _NORMALISED_ADDRESS_RE.findall(scanned)
+        if found:
+            problems.append(
+                f"the file contains {len(found)} email address(es) written in a way the "
+                f"redaction did not remove — reading the file with its spacing, brackets "
+                f"and lookalike characters normalised recovers them; this service never "
+                f"writes one in any spelling"
+            )
+            break
+        if contains_dictated_email(scanned):
+            problems.append(
+                "the file contains a spoken-out-loud email address that is split across a "
+                "line or a segment break, so it reads as an address only once the file is "
+                "joined up; this service never writes one in any spelling"
+            )
+            break
 
     if not text.startswith("Subject:"):
         problems.append("the file does not begin with the Subject: header")
