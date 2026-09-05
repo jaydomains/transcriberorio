@@ -385,6 +385,7 @@ class Deployment:
         *,
         naming_on: bool = True,
         engine_site_names: bool = True,
+        site_evidence: bool = True,
         apply: bool = False,
         sites_file: str | None = SITE_BOOK,
         min_seconds: int = 120,
@@ -404,6 +405,7 @@ class Deployment:
             gate_mode="off",
             naming=naming_on,
             engine_site_names=engine_site_names,
+            site_evidence=site_evidence,
             naming_apply=apply,
             naming_sites_file="" if sites_file is None else sites_file,
             naming_min_seconds=min_seconds,
@@ -867,7 +869,8 @@ class WithNamingOffNothingInTheNamingPathIsConsulted(unittest.TestCase):
         # has its own off-switch. This class is about NAMING's, so the other is switched off
         # too in order to reach the pristine baseline. That the hint switch ALSO restores
         # the baseline on its own is asserted in TheEngineHintSwitchIsAlsoAnOffSwitch.
-        self.off = Deployment(naming_on=False, engine_site_names=False, apply=True)
+        self.off = Deployment(naming_on=False, engine_site_names=False,
+                              site_evidence=False, apply=True)
         self.addCleanup(self.off.close)
         self.off.arrive()
         # Both doors into the naming code are wired to explode. If NAMING=0 touches either,
