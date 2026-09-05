@@ -12,6 +12,15 @@ from any string about to be logged or emailed. The address-shaped settings (the 
 principal name, the SMTP envelope) are redacted on the same footing, because the house rule
 is that this service never prints an email address anywhere, for any reason.
 
+**A name nobody reads is reported, not ignored.** ``GATE_MODEE=on`` used to load clean and
+leave the gate in shadow: the operator believed passages were being withheld and nothing
+was. So every variable in the environment that no part of this service reads is looked at
+after the parse, and one close to a real name — a letter dropped, a letter doubled — is a
+problem with the real name printed beside it, because it can only be a typo. Only
+near-misses: the process environment carries systemd's own variables and the shell's, and a
+service that refuses to start because ``JOURNAL_STREAM`` is not one of its settings would be
+worse than the bug this catches.
+
 **Routes are the unit of configuration.** A route is one watched folder and where its
 results go, and the service runs N of them. ``ROUTES`` names them; each one's folders come
 from its own variables. A ``.env`` written before routes existed has none of that, so its
@@ -30,7 +39,8 @@ Environment variables, all read by :meth:`Config.from_env`::
     ANALYSIS_API_KEY ANALYSIS_BASE_URL ANALYSIS_MODEL_CHEAP ANALYSIS_MODEL_STRONG
     GATE_MODE GATE_HELD_STORE GATE_REVIEW_BASE_URL + per route ROUTE_<NAME>_REVIEWER
     SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASSWORD SMTP_FROM SMTP_TO SMTP_STARTTLS
-    HEARTBEAT_URL LEDGER_PATH WORK_DIR WORK_DIR_MAX_BYTES WORK_DIR_KEEP_FINISHED_HOURS
+    HEARTBEAT_URL ALLOW_PLAINTEXT_ENDPOINTS
+    LEDGER_PATH WORK_DIR WORK_DIR_MAX_BYTES WORK_DIR_KEEP_FINISHED_HOURS
     ORPHAN_FOLDER_ID
     GRAPH_SECRET_EXPIRES_ON ENGINE_KEY_EXPIRES_ON ANALYSIS_KEY_EXPIRES_ON
     ENGINE_MAX_CONCURRENT ENGINE_MAX_PER_MINUTE
@@ -41,6 +51,7 @@ Environment variables, all read by :meth:`Config.from_env`::
 
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import stat
@@ -56,11 +67,12 @@ from .diskbudget import (
     format_bytes,
     parse_bytes,
 )
-from .models import DEFAULT_ROUTE, Route, is_route_name, route_env_var
+from .models import DEFAULT_ROUTE, Route, is_route_name, route_env_stem, route_env_var
 
 log = logging.getLogger("transcriber.config")
 
 __all__ = [
+    "environment_the_service_reads",
     "Config",
     "ConfigError",
     "GATE_MODES",
@@ -228,6 +240,68 @@ _SPEC: tuple[_Var, ...] = (
     _Var("max_retries", "MAX_RETRIES", "int", 5, "retries after 429/5xx before giving up loudly"),
     _Var("log_level", "LOG_LEVEL", "str", "INFO", "DEBUG | INFO | WARNING | ERROR"),
 )
+
+#: Variables this service reads that are not in ``_SPEC`` — they belong to another module,
+#: or they are read once here and never kept on the Config. Listed so that the unknown-name
+#: check below does not report a setting somebody was told to set in the documentation. A
+#: name added to one of those modules belongs here too, or the next ``.env`` that uses it
+#: gets a notice saying it does nothing.
+_ALSO_READ = frozenset(
+    {
+        "ROUTES",                   # parsed here into the routes themselves
+        "ANALYSIS_PROVIDER",        # extract.AnalysisSettings.from_config
+        "ALLOW_PLAINTEXT_ENDPOINTS",  # the opt-in beside the https:// check in from_env
+        "LOG_FORMAT",               # logging_setup
+        "REVIEW_BIND",              # review_server, and the `review` subcommand
+        "REVIEW_PORT",
+        "REVIEW_CERTFILE",
+        "REVIEW_KEYFILE",
+        "REVIEW_UNDO_SECONDS",
+    }
+)
+
+#: Every environment variable name the service actually reads, apart from the per-route
+#: ones, which depend on the route names and are worked out when they are needed.
+_KNOWN_ENV_NAMES = (
+    frozenset(var.env for var in _SPEC) | frozenset(ENGINE_KEY_VARS.values()) | _ALSO_READ
+)
+
+#: The first word of each of those names. A leftover variable is only ever compared against
+#: the real names when it starts with one of these, because that is what tells this
+#: service's settings apart from the machine's: ``SMTP_STARTLS`` is ours and misspelt,
+#: ``LANGUAGE`` is the operating system's locale and is none of our business — and it is
+#: one letter away from ``LANGUAGES``, which is exactly how a well-meant check ends up
+#: stopping a service from starting on an ordinary host.
+_KNOWN_ENV_FAMILIES = frozenset(name.split("_", 1)[0] for name in _KNOWN_ENV_NAMES)
+
+
+def environment_the_service_reads(source: "Mapping[str, str] | None" = None) -> dict[str, str]:
+    """The settings out of a whole process environment, and nothing else.
+
+    A deployed host hands its settings to the service through systemd's
+    ``EnvironmentFile=``, so there is no ``.env`` in the working directory for
+    ``config list`` or ``routes list`` to read — the two commands an operator
+    reaches for to ask what this thing is set up to do. They can answer from the
+    process environment instead, but only after the host's own variables (PATH,
+    HOME, systemd's INVOCATION_ID, whatever the shell exported) are dropped:
+    printing those back would bury the answer and would put unrelated values on
+    a screen somebody is about to photograph for a support thread.
+    """
+    import os as _os
+
+    everything = _os.environ if source is None else source
+    kept: dict[str, str] = {}
+    for key, value in everything.items():
+        if key in _KNOWN_ENV_NAMES:
+            kept[key] = value
+        elif key.startswith("ROUTE_") and key.rsplit("_", 1)[-1] in ROUTE_SUFFIXES:
+            kept[key] = value
+    return kept
+
+#: How alike two names have to be before one is called a misspelling of the other. High on
+#: purpose: every misspelling actually seen in the field — a letter dropped, a letter
+#: doubled, two letters swapped — scores above 0.94, and nothing else should reach this.
+_NEAR_MISS = 0.86
 
 
 @dataclass
@@ -471,7 +545,7 @@ class Config:
         values: dict[str, Any] = {}
 
         for var in _SPEC:
-            raw = source.get(var.env)
+            raw = _unquoted(source.get(var.env))
             if raw is None or str(raw).strip() == "":
                 if var.default is _REQUIRED:
                     problems.append(f"{var.env} is not set — {var.description}")
@@ -499,7 +573,7 @@ class Config:
         engine_keys: dict[str, str] = {}
         key_var = ENGINE_KEY_VARS.get(engine)
         if key_var:
-            engine_key = (source.get(key_var) or "").strip()
+            engine_key = _text(source, key_var)
             if not engine_key:
                 problems.append(f"{key_var} is not set — the API key for the {engine} transcription engine")
             values["engine_key"] = engine_key
@@ -520,10 +594,10 @@ class Config:
         # analysis pass is genuinely going to call OpenAI, worked out the way extract.py
         # works it out: the explicit setting first, then the host in the base URL.
         if "analysis_api_key" not in values:
-            declared = (source.get("ANALYSIS_PROVIDER") or "").strip().lower()
+            declared = _text(source, "ANALYSIS_PROVIDER").lower()
             url = str(
                 values.get("analysis_base_url")
-                or source.get("ANALYSIS_BASE_URL")
+                or _text(source, "ANALYSIS_BASE_URL")
                 or "https://api.anthropic.com"
             ).lower()
             if declared:
@@ -534,7 +608,7 @@ class Config:
                 provider = "openai"
             else:
                 provider = ""
-            fallback = (source.get("OPENAI_API_KEY") or "").strip()
+            fallback = _text(source, "OPENAI_API_KEY")
             if fallback and provider == "openai":
                 values["analysis_api_key"] = fallback
                 problems = [p for p in problems if not p.startswith("ANALYSIS_API_KEY")]
@@ -608,7 +682,7 @@ class Config:
             if not route.enabled or not override or override not in ENGINE_KEY_VARS:
                 continue
             route_key_var = ENGINE_KEY_VARS[override]
-            route_key = (source.get(route_key_var) or "").strip()
+            route_key = _text(source, route_key_var)
             if route_key:
                 engine_keys[override] = route_key
             else:
@@ -616,7 +690,7 @@ class Config:
                     f"{route_key_var} is not set — {_route_phrase(route)} is set to "
                     f"transcribe with {override}, which needs its own API key"
                 )
-            if override == "azure" and not str(source.get("AZURE_SPEECH_REGION") or "").strip():
+            if override == "azure" and not _text(source, "AZURE_SPEECH_REGION"):
                 problems.append(
                     f"AZURE_SPEECH_REGION is not set — {_route_phrase(route)} is set "
                     "to transcribe with azure, which needs the region as well as the key"
@@ -629,7 +703,7 @@ class Config:
         notices: list[str] = []
         if declared:
             stale = sorted(
-                var for var in LEGACY_FOLDER_VARS if str(source.get(var) or "").strip()
+                var for var in LEGACY_FOLDER_VARS if _text(source, var)
             )
             if stale:
                 notices.append(
@@ -661,6 +735,50 @@ class Config:
                 "back until somebody approves them. Without the review page there is "
                 "nowhere to approve anything and nothing would ever be released. Set the "
                 "address, or run with GATE_MODE=shadow until the page exists."
+            )
+        # The same rule as GATE_REVIEW_BASE_URL just above, in the same words, for the other
+        # three addresses this service sends something of its own to. The reason is the same
+        # as well: an http:// endpoint puts whatever travels over it in clear at every hop
+        # between this machine and that host, and a key read off the wire is a key somebody
+        # else is now using. It is also where an on-path attacker puts the redirect that
+        # sends the next request — key and all — to a host nobody chose.
+        #
+        # A developer pointing at a mock on their own machine is a real case and refusing it
+        # outright would be the code being clever about somebody's laptop. So there is one
+        # way to say so deliberately, and no way to end up in plaintext by accident: with
+        # ALLOW_PLAINTEXT_ENDPOINTS set it starts, and the notice says out loud what is
+        # travelling in the open.
+        plaintext_allowed = _flag(source, "ALLOW_PLAINTEXT_ENDPOINTS")
+        for name, carries in (
+            ("engine_base_url",
+             "the transcription engine's API key travels over it, and the audio of every "
+             "recording with it"),
+            ("analysis_base_url",
+             "the analysis API key travels over it, and the whole transcript with it — "
+             "unredacted, before anything has been held back"),
+            ("heartbeat_url",
+             "it names this installation to the monitor that watches it, and anyone who can "
+             "read the address can send the same ping and keep the alarm quiet"),
+        ):
+            address = str(values.get(name) or "").strip()
+            if not address or address.startswith("https://"):
+                continue
+            # The heartbeat URL is a secret field — it carries an account identifier in its
+            # path — so it is named and never printed, the way it is everywhere else.
+            shown = _env_of(name) if name == "heartbeat_url" else f"{_env_of(name)}={address!r}"
+            if plaintext_allowed and address.startswith("http://"):
+                notices.append(
+                    f"{_env_of(name)} is a plain http:// address and "
+                    "ALLOW_PLAINTEXT_ENDPOINTS is set, so it is allowed. What travels over "
+                    f"it travels in the open: {carries}. That is only ever right for "
+                    "something running on this machine."
+                )
+                continue
+            problems.append(
+                f"{shown} must start with https:// — {carries}. If it is a mock or a proxy "
+                "on this machine and plain http really is what you want, set "
+                "ALLOW_PLAINTEXT_ENDPOINTS=true: it will then start, and say what is "
+                "travelling in the open rather than saying nothing."
             )
         held_store = _held_store_path(
             str(values.get("gate_held_store") or ""),
@@ -700,7 +818,7 @@ class Config:
         reviewers: dict[str, str] = {}
         for route in routes:
             reviewer_var = route_env_var(route.name, "REVIEWER")
-            address = str(source.get(reviewer_var) or "").strip()
+            address = _text(source, reviewer_var)
             if not address:
                 continue
             if not _looks_like_address(address):
@@ -810,24 +928,35 @@ class Config:
                     "apply."
                 )
 
-        configured_reviewer_vars = {route_env_var(r.name, "REVIEWER") for r in routes}
-        stray_reviewers = sorted(
-            key for key in source
-            if key.startswith("ROUTE_") and key.endswith("_REVIEWER")
-            and key not in configured_reviewer_vars and str(source.get(key) or "").strip()
-        )
-        if stray_reviewers:
-            notices.append(
-                "These name a reviewer for a route that is not configured, so they assign "
-                "nobody: " + ", ".join(stray_reviewers) + ". Held passages from a route with "
-                "no reviewer go to the service owner."
-            )
+        # Every name in the environment that nothing above read. A misspelt setting used to
+        # load perfectly and do the opposite of what the file said — GATE_MODEE=on left the
+        # gate in shadow, withholding nothing while the operator believed passages were
+        # being held — and `config set` refuses an unknown name, but SETUP.md and
+        # ops/DEPLOY.md both say to copy .env.example and edit it by hand, which never goes
+        # near `config set`. So the same check is done here, over the whole environment.
+        route_problems, route_notices = _route_variable_reports(source, routes, declared)
+        problems.extend(route_problems)
+        notices.extend(route_notices)
+        problems.extend(_misspelt_variable_problems(source, routes))
 
-        values["notices"] = tuple(notices)
-
-        for name in ("graph_secret_expires_on", "engine_key_expires_on", "analysis_key_expires_on"):
+        # The expiry dates. A date that is set is checked for shape here and counted down in
+        # the morning email; a date that is NOT set was indistinguishable from a countdown
+        # that has not started yet, and silence is exactly the wrong answer — an expired
+        # Entra client secret is the single most likely way this service dies, after a year
+        # of working perfectly, on a morning nobody was warned about. So an in-use
+        # credential with no date says so, every day, the way a missing site list does.
+        # Only the credentials actually in use: a key that was never configured has nothing
+        # to expire.
+        undated: list[str] = []
+        for name, credential in (
+            ("graph_secret_expires_on", "graph_client_secret"),
+            ("engine_key_expires_on", "engine_key"),
+            ("analysis_key_expires_on", "analysis_api_key"),
+        ):
             raw = str(values.get(name) or "").strip()
             if not raw:
+                if str(values.get(credential) or "").strip():
+                    undated.append(_env_of(name))
                 continue
             try:
                 when = _date.fromisoformat(raw[:10])
@@ -842,6 +971,18 @@ class Config:
                     "will process until it is renewed",
                     _env_of(name), when.isoformat(),
                 )
+
+        if undated:
+            notices.append(
+                "No expiry date is set for: " + ", ".join(undated) + ". Nothing is wrong "
+                "today, and nothing counts down either: the morning email can only warn "
+                "before a credential stops working if it knows the date. The one that "
+                "matters most is the OneDrive app secret, which expires on a date chosen "
+                "when it was created and takes the whole service down that morning with no "
+                "notice of any kind. Put each date in, as YYYY-MM-DD."
+            )
+
+        values["notices"] = tuple(notices)
 
         if problems:
             raise ConfigError(problems)
@@ -930,16 +1071,16 @@ def _routes_from_env(
     ``default``. The second is not a deprecated path to be tolerated — it is the shape of
     every installation in the field, and it must keep working untouched.
     """
-    raw = str(source.get("ROUTES") or "").strip()
+    raw = _text(source, "ROUTES")
     if not raw:
         return (
             (
                 Route(
                     name=DEFAULT_ROUTE,
                     label="Recordings",
-                    source_folder_id=str(source.get("SOURCE_FOLDER_ID") or "").strip(),
-                    output_folder_id=str(source.get("OUTPUT_FOLDER_ID") or "").strip(),
-                    archive_folder_id=str(source.get("ARCHIVE_FOLDER_ID") or "").strip(),
+                    source_folder_id=_text(source, "SOURCE_FOLDER_ID"),
+                    output_folder_id=_text(source, "OUTPUT_FOLDER_ID"),
+                    archive_folder_id=_text(source, "ARCHIVE_FOLDER_ID"),
                     engine="",
                     enabled=True,
                 ),
@@ -970,7 +1111,7 @@ def _routes_from_env(
         seen.add(name)
 
         def var(suffix: str) -> str:
-            return str(source.get(route_env_var(name, suffix)) or "").strip()
+            return _text(source, route_env_var(name, suffix))
 
         engine = var("ENGINE").lower()
         if engine and engine not in ENGINES:
@@ -1016,6 +1157,171 @@ def _suggest_route_name(name: str) -> str:
     while "--" in cleaned:
         cleaned = cleaned.replace("--", "-")
     return cleaned or "calls"
+
+
+def _longest_stem(key: str, stems: Mapping[str, str]) -> str | None:
+    """Which route's variables this key belongs to, or None — longest name first.
+
+    Longest first because ``site`` and ``site-meetings`` can both be configured, and
+    ``ROUTE_SITE_MEETINGS_SOURCE`` belongs to the second even though it starts with the
+    first one's stem.
+    """
+    found: str | None = None
+    for stem in stems:
+        if key.startswith(f"ROUTE_{stem}_") and (found is None or len(stem) > len(found)):
+            found = stem
+    return found
+
+
+def _route_variable_reports(
+    source: Mapping[str, str], routes: Sequence[Route], declared: bool
+) -> tuple[list[str], list[str]]:
+    """Every ``ROUTE_*`` variable in the environment that no route will ever read.
+
+    A route's settings are *pulled*: each route asks for the seven names it expects, and
+    nothing ever looked at what else was in the file. So ``ROUTE_CALLS_ENABLD=false`` left
+    the route watching, ``ROUTE_CALLS_ARCHIV`` gave it no archive folder at all, and
+    ``ROUTE_SITE_ENABLE=false`` left the route enabled — each of them a line saying the
+    opposite of what the service does, with nothing said anywhere.
+
+    A key naming a route that IS configured can only be a typo in the suffix: there are
+    seven suffixes and there will never be others, so that one is refused rather than
+    mentioned. A key naming a route that is NOT configured is usually a leftover from a
+    route that was renamed or removed, which does nothing either way — a notice. Unless the
+    name it carries is a near-miss of a route that IS configured, which is a typo again.
+    """
+    stems: dict[str, str] = {route_env_stem(route.name): route.name for route in routes}
+    # A name listed in ROUTES that was refused above — not a usable route name, or listed
+    # twice — has already been reported by name. Its variables are not reported again on
+    # top of that, which would be two complaints about one mistake.
+    for part in _text(source, "ROUTES").replace("\n", ",").split(","):
+        listed = part.strip()
+        if listed:
+            stems.setdefault(route_env_stem(listed), listed)
+
+    configured = [route.name for route in routes]
+    problems: list[str] = []
+    notices: list[str] = []
+    stray_reviewers: list[str] = []
+    unread: list[str] = []
+    ignored_without_routes: list[str] = []
+
+    for key in sorted(k for k in source if k.startswith("ROUTE_")):
+        if not _text(source, key):
+            continue                      # an empty variable configures nothing either way
+        stem = _longest_stem(key, stems)
+        if stem is not None:
+            suffix = key[len("ROUTE_") + len(stem) + 1:]
+            if suffix in ROUTE_SUFFIXES:
+                if declared or suffix == "REVIEWER":
+                    continue              # read, exactly as the file expects
+                ignored_without_routes.append(key)
+                continue
+            meant = difflib.get_close_matches(suffix, ROUTE_SUFFIXES, n=1, cutoff=0.5)
+            problems.append(
+                f"{key} is not one of a route's settings, so nothing reads it and what it "
+                f"says is not what {stems[stem]!r} does. A route has seven settings: "
+                + ", ".join(ROUTE_SUFFIXES) + "."
+                + (f" Did you mean ROUTE_{stem}_{meant[0]}?" if meant else "")
+            )
+            continue
+
+        # The key names some other route. Work out which name it is carrying, so the
+        # sentence can show it rather than describe it.
+        suffix = next((s for s in ROUTE_SUFFIXES if key.endswith("_" + s)), "")
+        middle = key[len("ROUTE_"):len(key) - len(suffix) - 1] if suffix else ""
+        # ``ROUTE__SOURCE`` names no route at all, and _suggest_route_name answers an empty
+        # string with an example name — which would have this sentence inventing a route.
+        named = _suggest_route_name(middle) if any(c.isalnum() for c in middle) else ""
+        near = (
+            difflib.get_close_matches(named, configured, n=1, cutoff=_NEAR_MISS)
+            if named else []
+        )
+        if near:
+            problems.append(
+                f"{key} names a route called {named!r}, and there is no such route — the "
+                f"one this service runs is called {near[0]!r}. Nothing reads {key}, so "
+                f"what it says is not what {near[0]!r} does. Did you mean "
+                f"{route_env_var(near[0], suffix)}?"
+            )
+        elif suffix == "REVIEWER":
+            stray_reviewers.append(key)
+        else:
+            unread.append(key)
+
+    if stray_reviewers:
+        notices.append(
+            "These name a reviewer for a route that is not configured, so they assign "
+            "nobody: " + ", ".join(stray_reviewers) + ". Held passages from a route with "
+            "no reviewer go to the service owner."
+        )
+    if ignored_without_routes:
+        notices.append(
+            "This file has no ROUTES line, so the service watches the single folder in "
+            "SOURCE_FOLDER_ID and writes to OUTPUT_FOLDER_ID — and these are not read at "
+            "all: " + ", ".join(ignored_without_routes) + ". List the route in ROUTES to "
+            "use them, or delete them so the file says what the service does."
+        )
+    if unread:
+        notices.append(
+            "No route reads these, so they do nothing: " + ", ".join(unread) + ". They "
+            "name a route that is not configured, or a setting a route does not have — "
+            "which is what a renamed or deleted route leaves behind. Delete them so the "
+            "file says what the service does."
+        )
+    return problems, notices
+
+
+def _misspelt_variable_problems(
+    source: Mapping[str, str], routes: Sequence[Route]
+) -> list[str]:
+    """Names nothing here reads, when they look like names it does.
+
+    The whole environment, not the ``.env``: under systemd the file is loaded with
+    ``EnvironmentFile=``, so what arrives is the file's names *and* systemd's own —
+    ``INVOCATION_ID``, ``JOURNAL_STREAM``, ``STATE_DIRECTORY`` — and the shell's on top of
+    that. Refusing to start on anything unrecognised would therefore refuse to start on an
+    ordinary host, which would be a worse fault than the one being fixed. So a leftover name
+    is only ever compared against the real ones when it begins with a word one of them
+    begins with, and only a near-miss is reported at all: ``SMTP_STARTLS`` can only be
+    ``SMTP_STARTTLS`` misspelt, while ``LANGUAGE`` is the machine's locale and is none of
+    our business even though it is one letter from ``LANGUAGES``. Anything else unknown is
+    passed over in silence — ``HTTP_PROXY`` and ``LOG_DIR`` are somebody else's settings on
+    plenty of ordinary hosts, and a warning about them every morning teaches a person to
+    stop reading the warnings.
+
+    A near-miss is refused rather than mentioned, whether or not the real setting is also
+    set. Both ways round it is a line that lies: with the real one unset the service is
+    quietly running the default, and with the real one set it is doing what that one says
+    while the file offers two answers and the reader believes the wrong one.
+    """
+    known = set(_KNOWN_ENV_NAMES)
+    for route in routes:
+        for suffix in ROUTE_SUFFIXES:
+            known.add(route_env_var(route.name, suffix))
+    candidates = sorted(known)
+
+    problems: list[str] = []
+    for key in sorted(source):
+        if key in known or key.startswith("ROUTE_") or not _text(source, key):
+            continue
+        if key.split("_", 1)[0] not in _KNOWN_ENV_FAMILIES:
+            continue
+        close = difflib.get_close_matches(key, candidates, n=1, cutoff=_NEAR_MISS)
+        if not close:
+            continue
+        meant = close[0]
+        problems.append(
+            f"{key} is not a setting this service reads, so nothing uses it — and {meant}, "
+            f"which is what it looks like a misspelling of, "
+            + (
+                f"is set to something else, so that is what the service is doing"
+                if _text(source, meant)
+                else "is not set, so that setting is running at its default"
+            )
+            + f". Correct the spelling to {meant}, or delete the line."
+        )
+    return problems
 
 
 def _join_phrases(phrases: list[str]) -> str:
@@ -1309,6 +1615,40 @@ def _env_of(name: str) -> str:
         if var.name == name:
             return var.env
     return name.upper()
+
+
+def _unquoted(raw: Any) -> Any:
+    """One raw value with a matched pair of surrounding quotes taken off.
+
+    Three things deliver these settings and they did not agree about quotes. systemd's
+    ``EnvironmentFile=`` strips a surrounding pair, the wizard's own reader strips a pair,
+    and ``docker --env-file`` does not — so ``ROUTE_DEFAULT_ARCHIVE=""``, which is how the
+    wizard writes "this route is never archived", arrived by the third route as the
+    two-character string ``""`` and was taken for a driveItem id. Everything downstream then
+    believes there is an archive folder, and every monthly move fails against a folder that
+    was never there. Stripping the pair here is what makes the three paths agree, and
+    agreeing is the whole point: which of them was used is not something a person should
+    have to know.
+
+    A value that genuinely begins and ends with a quote character loses them. That is the
+    price of the three agreeing, and no setting this service reads is meant to have any.
+    """
+    if not isinstance(raw, str):
+        return raw
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1].strip()
+    return text
+
+
+def _text(source: Mapping[str, str], name: str) -> str:
+    """One environment variable, unquoted and stripped, never None."""
+    return str(_unquoted(source.get(name)) or "").strip()
+
+
+def _flag(source: Mapping[str, str], name: str) -> bool:
+    """An opt-in variable, read the way ``_coerce`` reads any other boolean setting."""
+    return _text(source, name).lower() in ("1", "true", "yes", "on")
 
 
 def _coerce_default(var: _Var, raw: Any) -> Any:
