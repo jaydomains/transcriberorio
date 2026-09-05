@@ -98,6 +98,7 @@ from .graph import (
     GraphAuthError,
     GraphClient,
     GraphConfigError,
+    GraphError,
     GraphHTTPError,
     IncompleteDownload,
     RetryPolicy,
@@ -121,6 +122,17 @@ from .outputs import HeldTextWouldLeak, OutputContractError, UploadIncompleteErr
 from .ratelimit import RateLimitShutdown
 from .sensitivity import GateSettings
 from .withheld import HeldSpan, WithheldStore, held_spans_from
+
+try:  # pragma: no cover - the fallback only runs against an older graph module
+    from .graph import GraphAuthUnreachable
+except ImportError:  # pragma: no cover
+    # Imported separately, and tolerantly, so that a deployment whose graph module predates
+    # this distinction still starts: without the class there is nothing that can raise it,
+    # and the stand-in below simply never matches. It deliberately hangs off GraphError and
+    # not off GraphAuthError, because everything hanging off GraphAuthError stops the
+    # service, and being unable to reach the sign-in endpoint must not.
+    class GraphAuthUnreachable(GraphError):
+        """The sign-in endpoint could not be reached at all. Placeholder; see graph.py."""
 
 __all__ = [
     "Pipeline",
@@ -892,14 +904,25 @@ class Pipeline:
         expected_hashes = getattr(item, "hashes", None) or item
 
         if row.content_hash and os.path.exists(path):
-            reused = _sha256_file(path)
-            if reused == row.content_hash:
-                log.info("download-reused", f"{os.path.basename(path)} is already here and matches "
-                                            f"the hash recorded for it", bytes=os.path.getsize(path))
+            # Checked against the item Graph described a moment ago, never against the hash
+            # this row remembers writing. Those are two different questions, and only one of
+            # them is worth asking: if somebody re-uploads a different recording over the top
+            # of this one, the old bytes on disk still match the old hash on the row, so the
+            # row's memory of itself says "reuse it" and yesterday's audio is published under
+            # today's recording's name and marked done. What Graph says the recording is now
+            # is the only account of it that can catch that.
+            ok, reason = completeness.verify_download(
+                path, expected_hashes, expected_size=expected_size or None
+            )
+            if ok:
+                log.info("download-reused", f"{os.path.basename(path)} is already here and is "
+                                            f"the recording Graph is describing now",
+                         bytes=os.path.getsize(path))
                 _remember_local(path, row.item_id)
                 return path
-            log.warning("download-stale", "the file in the work directory is not the one the "
-                                          "ledger recorded; downloading it again")
+            log.warning("download-stale", f"the file in the work directory is not the recording "
+                                          f"Graph is describing now, so it is being downloaded "
+                                          f"again ({reason})")
 
         result = self.graph.download(
             row.item_id, path, download_url=str(getattr(item, "download_url", "") or ""),
@@ -1720,6 +1743,11 @@ _NOT_THE_RECORDINGS_FAULT = (RateLimitShutdown,)
 
 #: Faults in the service: a credential, a configuration, or the durable state. These stop the
 #: worker rather than consuming the backlog.
+#:
+#: ``GraphAuthError`` here means Microsoft looked at our credential and said no, which no
+#: amount of waiting fixes. It does NOT cover being unable to reach the sign-in endpoint in
+#: the first place — that is ``GraphAuthUnreachable``, handled as a retryable cycle error in
+#: :func:`_classify`.
 _FATAL = (
     GraphAuthError,
     GraphConfigError,
@@ -1735,6 +1763,20 @@ def _classify(exc: BaseException) -> tuple[bool, str]:
     """(retryable, reason in plain words). Raises :class:`PipelineFatal` for a service fault."""
     if isinstance(exc, PipelineFatal):
         raise exc
+    if isinstance(exc, GraphAuthUnreachable):
+        # Checked before the fatal list, and stated out loud, because the two sign-in
+        # failures look alike and end very differently. A credential Microsoft rejected
+        # needs a person: it will be rejected again in a minute and in an hour, so the
+        # worker stops and says so. An endpoint we could not reach needs another minute:
+        # the machine has just booted, or the network dropped, and the next poll will very
+        # likely get a token. Stopping for that one parks the service in `failed` after a
+        # handful of quick restarts and it stays down until somebody looks — which is
+        # exactly what the unit file's own note about a DNS blip at boot says must not
+        # happen.
+        return True, (
+            f"could not reach Microsoft's sign-in endpoint to get a token: {_plain(exc)}. "
+            f"This is being tried again — no credential was refused"
+        )
     if isinstance(exc, _FATAL):
         raise PipelineFatal(f"{type(exc).__name__}: {exc}") from exc
     if isinstance(exc, (KeyboardInterrupt, SystemExit)):
