@@ -226,10 +226,6 @@ class Decision:
     needed_bytes: int = 0
 
     @property
-    def free_bytes(self) -> int:
-        return max(0, self.max_bytes - self.used_bytes)
-
-    @property
     def permanent(self) -> bool:
         """True when finishing the work in progress cannot help — a person has to act."""
         return self.kind == TOO_LARGE

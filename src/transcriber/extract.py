@@ -1203,9 +1203,6 @@ class Extraction:
                 grouped[category] = found
         return grouped
 
-    def of_kind(self, kind: str) -> tuple[ExtractedItem, ...]:
-        return tuple(p.item for p in self.proposals if p.item.kind == kind)
-
     @property
     def needs_a_person(self) -> bool:
         """True when something happened that a person must look at, beyond the proposals."""

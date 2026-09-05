@@ -503,10 +503,6 @@ class ItemOutcome:
     reason: str = ""
     refs: tuple[str, ...] = ()
 
-    @property
-    def publishable(self) -> bool:
-        return self.action != "held"
-
 
 @dataclass
 class Redaction:

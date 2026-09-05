@@ -314,10 +314,6 @@ class GroupReport:
                      if not p.written_at or p.hours_old > self.silent_after_hours)
 
     @property
-    def needing_a_person(self) -> tuple[PeerStatus, ...]:
-        return tuple(p for p in self.peers if p.needs_a_person and p not in self.silent)
-
-    @property
     def total_arrived(self) -> int:
         return sum(p.arrived for p in self.peers)
 

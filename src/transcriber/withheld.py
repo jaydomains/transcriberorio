@@ -649,10 +649,6 @@ class HeldRecord:
             self.category, "something held for review"
         )
 
-    @property
-    def held_day(self) -> str:
-        return day_of(self.held_at)
-
     def age_days(self, now: str | None = None) -> int:
         """Whole days since it was held, for the escalating morning email."""
         return _days_between(self.held_at, now or utc_now_iso())
