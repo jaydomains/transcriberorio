@@ -35,6 +35,7 @@ from pathlib import Path
 
 from tests import support
 from transcriber import estate, naming, outputs
+from transcriber.ledger import State
 from transcriber.models import Segment, Transcript
 
 #: Where a closea checkout would be, in the order this looks.
@@ -282,6 +283,79 @@ class TheirOwnReaderFilesWhatWeWrite(unittest.TestCase):
                               for p in Path(tmp, "estate").rglob("*.md"))
             self.assertIn("A walk of the HQ roof.", filed)
             self.assertNotIn("the scaffold on the east face is signposted", filed)
+
+
+class TheProductionPathActuallyWritesOne(unittest.TestCase):
+    """The real pipeline, over a real recording, writing a real envelope.
+
+    ⛔ EVERY TEST ABOVE BUILDS ITS OWN `OutputContext` AND CALLS `estate` DIRECTLY, WHICH
+    PROVES THE SHAPE AND NOT THE WIRING. `Pipeline._hand_to_the_estate` catches every
+    exception on purpose — a drop folder must never cost a recording — and that is exactly
+    what makes an unproven path dangerous here: let the context `_context` really builds
+    drift from the attributes `estate.item_for` really reads, and the envelope stops being
+    written, silently, with the row still finishing DONE. That is the both-sides-silent
+    failure this whole change exists to remove, reintroduced one level up.
+
+    So this drives the shipped `process_one` and looks in the folder afterwards.
+    """
+
+    def setUp(self) -> None:
+        from tests.test_naming_never_loses_a_recording import Deployment
+
+        self.tmp = tempfile.mkdtemp(prefix="estate-handover-")
+        self.drop = os.path.join(self.tmp, "drop")
+        self.dep = Deployment(directory=self.tmp)
+        object.__setattr__(self.dep.config, "closea_drop", self.drop)
+        self.dep.arrive()
+
+    def tearDown(self) -> None:
+        self.dep.close()
+
+    def _envelopes(self) -> list[Path]:
+        return sorted(Path(self.drop).glob("*.json")) if os.path.isdir(self.drop) else []
+
+    def test_one_finished_recording_leaves_one_envelope(self) -> None:
+        self.dep.walk()
+        found = self._envelopes()
+        self.assertEqual(len(found), 1, f"the shipped path wrote {len(found)} envelopes")
+        payload = json.loads(found[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema"], estate.SCHEMA)
+        self.assertEqual(sorted(payload[estate.ITEM_KEY]), sorted(estate.ITEM_FIELDS))
+        self.assertTrue(payload[estate.ITEM_KEY]["body"].strip())
+
+    def test_the_envelope_names_the_recording_the_way_the_files_do(self) -> None:
+        """The estate and OneDrive must call one recording the same thing, or nobody can
+        put the two together by looking."""
+        self.dep.walk()
+        item = json.loads(self._envelopes()[0].read_text(encoding="utf-8"))[estate.ITEM_KEY]
+        self.assertTrue(item["title"].strip())
+        self.assertTrue(item["origin"].strip())
+        self.assertEqual(self.dep.row().transcript_name, item["origin"])
+
+    def test_nothing_is_written_when_no_drop_is_configured(self) -> None:
+        """Off unless configured, and off means no folder is created either."""
+        object.__setattr__(self.dep.config, "closea_drop", "")
+        self.dep.walk()
+        self.assertFalse(os.path.exists(self.drop))
+
+    def test_a_drop_that_cannot_be_written_still_finishes_the_recording(self) -> None:
+        """The three files are already published and read back by the time this runs. A
+        folder on a disk that has gone away is a hand-over that did not happen — never a
+        recording that did not."""
+        from transcriber import estate as estate_module
+
+        def explode(*_a: object, **_k: object) -> str:
+            raise OSError("the disk went away")
+
+        original = estate_module.write
+        estate_module.write = explode
+        try:
+            self.dep.walk()
+        finally:
+            estate_module.write = original
+        self.assertEqual(self._envelopes(), [])
+        self.assertEqual(str(self.dep.row().state), str(State.DONE))
+        self.assertTrue(self.dep.row().transcript_name, "the three files still landed")
 
 
 if __name__ == "__main__":
