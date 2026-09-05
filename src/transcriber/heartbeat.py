@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .models import strip_emails
+from .redirects import no_redirect_opener, redirect_host
 
 log = logging.getLogger("transcriber.heartbeat")
 
@@ -54,6 +55,12 @@ MAX_NOTE_BYTES = 10_000
 #: Statuses worth trying again. Everything else is a statement about our request — a wrong
 #: monitor id repeated five times is still a wrong monitor id.
 RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+#: Built once, and deliberately not the plain default opener. A ping is a claim that this
+#: service is alive, and it is only true if it reached the monitor: following a redirect
+#: would let some other host answer "200" on the monitor's behalf, and the check would go
+#: on quietly counting down to an alert while the log said the ping was acknowledged.
+_OPENER = no_redirect_opener()
 
 
 @dataclass(frozen=True)
@@ -95,7 +102,7 @@ class Heartbeat:
         attempts: int = 3,
         backoff_s: float = 2.0,
         scrub: Callable[[str], str] | None = None,
-        opener: Callable[..., Any] = urllib.request.urlopen,
+        opener: Callable[..., Any] = _OPENER.open,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -229,6 +236,15 @@ class Heartbeat:
             except urllib.error.HTTPError as exc:
                 status = int(exc.code)
                 detail = f"HTTP {status} from the monitor"
+                if 300 <= status < 400:
+                    # Said plainly, because the fix is a person's: the URL is pointing at
+                    # something that is not the monitor, and the ping was not delivered.
+                    detail = (
+                        "the ping URL redirected to "
+                        + redirect_host(exc.headers.get("Location", "") if exc.headers else "")
+                        + " instead of answering; the monitor was not reached. Check that "
+                        "HEARTBEAT_URL is the ping URL the monitor gave you."
+                    )
                 if status not in RETRYABLE_STATUSES:
                     # A 404 here means the monitor id is wrong: the check has never been
                     # pinged, so it is either already alerting or was never created. Either
