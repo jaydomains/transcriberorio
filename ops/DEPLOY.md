@@ -44,10 +44,15 @@ Copy `.env.example` to `.env` and work through it. Every variable is explained i
 
 - **`LEDGER_PATH`** has no default on purpose — two ledgers is the same as none. Put it
   somewhere backed up.
-- **`WORK_DIR`** must not be in a shared `/tmp`. It holds the raw audio of confidential
-  conversations while a recording is in flight, and the transcript of any recording that
-  failed. The service creates it `0700`, but a world-writable parent is still the wrong
-  neighbourhood. Use `/var/cache/transcriber`.
+- **`WORK_DIR`** must be on a real disk that survives a restart. Use
+  `/var/cache/transcriber`, which is what both the unit file and the container image set, so
+  you should not have to touch this at all. Not `/tmp`: the unit runs with `PrivateTmp=yes`,
+  which gives the service its own `/tmp` and empties it on every restart, and on many
+  distributions the host's `/tmp` is a memory-backed filesystem, so the 4 GiB scratch budget
+  would be charged to RAM. The cost of getting it wrong is not confidentiality — the private
+  `/tmp` is if anything better on that count — it is that every restart re-downloads whatever
+  was in flight, and the audio of a **failed** recording, kept for two days precisely so a
+  person can listen to what went wrong, is gone before anybody can.
 - **`GRAPH_SECRET_EXPIRES_ON`** is optional and you want it. It is the difference between a
   countdown in the morning email and the service stopping dead in two years' time with no
   warning at all.
@@ -61,10 +66,14 @@ measurement in the morning email — see **Holding back the things that should n
 down yet** in `README.md`.
 
 ```
-GATE_MODE=shadow                  # off | shadow | on. Ship shadow. Nothing is withheld.
-GATE_HELD_STORE=                  # empty = beside LEDGER_PATH. MUST NOT be inside WORK_DIR.
-GATE_REVIEW_BASE_URL=             # https:// address of the approval page. Needed only for `on`.
-ROUTE_<NAME>_REVIEWER=            # per route: who approves what is held from that folder.
+# off | shadow | on. Ship shadow. Nothing is withheld.
+GATE_MODE=shadow
+# empty = beside LEDGER_PATH. MUST NOT be inside WORK_DIR.
+GATE_HELD_STORE=
+# https:// address of the approval page. Needed only for `on`.
+GATE_REVIEW_BASE_URL=
+# per route: who approves what is held from that folder.
+ROUTE_<NAME>_REVIEWER=
 ```
 
 Three of these will refuse to start rather than fail quietly later:
@@ -81,15 +90,26 @@ Three of these will refuse to start rather than fail quietly later:
 **Back up `GATE_HELD_STORE` with the ledger.** Once the gate is armed, a held passage exists
 in exactly two places: that database and the original recording. See **Backing up**.
 
-Three variables were added after `.env.example` was first written and may not be in your
-copy — all optional, all defaulting to empty:
+These four are in `.env.example` now, but were added after it was first written, so an older
+copy will not have them. All optional, all defaulting to empty — and the second one is the
+one to go back for:
 
 ```
-ORPHAN_FOLDER_ID=                 # where a half-written output set is moved aside
-GRAPH_SECRET_EXPIRES_ON=          # YYYY-MM-DD, the date on GRAPH_CLIENT_SECRET
-ENGINE_KEY_EXPIRES_ON=            # YYYY-MM-DD, if the transcription key expires
-ANALYSIS_KEY_EXPIRES_ON=          # YYYY-MM-DD, if the analysis key expires
+ORPHAN_FOLDER_ID=
+GRAPH_SECRET_EXPIRES_ON=
+ENGINE_KEY_EXPIRES_ON=
+ANALYSIS_KEY_EXPIRES_ON=
 ```
+
+In order: where a half-written output set is moved aside; `YYYY-MM-DD`, the date on
+`GRAPH_CLIENT_SECRET`; the same for the transcription key, if it expires; the same for the
+analysis key.
+
+Note the shape of that block, because it is load-bearing. **Every explanation goes on its own
+line above its variable, never after the value.** `EnvironmentFile=` and `--env-file` both keep
+everything after the `=` verbatim, so `POLL_INTERVAL_S=120  # seconds` sets the interval to the
+whole of `120  # seconds` and the service refuses to start naming it. `transcriber setup`
+writes the file in that shape already.
 
 The file holds every credential the service has. `chmod 640`, owned by root, group-readable
 by the service account. Never commit it.
@@ -113,10 +133,19 @@ the build, not the configuration.
 ## 5. One real pass, watched
 
 ```
-transcriber status     # should print an empty ledger and no cursors set
-transcriber once       # one poll, one pass
-transcriber status     # should now show the recordings it found
+sudo -u transcriber PYTHONPATH=/opt/transcriber/src python3 -m transcriber status
+sudo -u transcriber PYTHONPATH=/opt/transcriber/src python3 -m transcriber once
+sudo -u transcriber PYTHONPATH=/opt/transcriber/src python3 -m transcriber status
 ```
+
+The first should print an empty ledger and no cursors set, the second does one poll and one
+pass, and the third should now show the recordings it found.
+
+That is a mouthful because the documented install is a file copy and never runs `pip`, so the
+short `transcriber` command a console script would have written does not exist on the machine.
+The unit file's header has a two-line wrapper for `/usr/local/bin/transcriber` that sets
+`PYTHONPATH` and hands off to the same thing; install it and every command in every document
+here becomes `transcriber status` again, exactly as written.
 
 If `once` finds nothing, look at what it printed. `polled 1 page(s), 14 item(s), 0 new,
 14 skipped as our own output` means the output folder is pointed at the recordings folder,
@@ -147,12 +176,55 @@ and the permissions on the environment file.
 docker build -f ops/Dockerfile -t transcriber .
 docker run -d --name transcriber --restart unless-stopped \
   --env-file .env \
+  --log-opt max-size=10m --log-opt max-file=5 \
   -v transcriber-ledger:/var/lib/transcriber \
   -v transcriber-work:/var/cache/transcriber \
   transcriber
 ```
 
 The ledger volume is not optional. It is the only proof a recording ever existed.
+
+The two `--log-opt` flags are there because docker's default log driver keeps every line
+forever, and this service logs on every poll of every route, all day, for years. The systemd
+path needs nothing equivalent: it hands its output to the journal, which is already rotated
+and size-capped by the machine.
+
+### When you arm the gate: the review page
+
+Only once `GATE_MODE=on`. In `shadow` nothing is ever held, so there is nothing to approve and
+nothing to serve, and this whole section can wait until the day you arm it.
+
+The approval page is a second long-running process, and it has its own unit beside the first:
+
+```
+sudo cp ops/transcriber-review.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now transcriber-review
+journalctl -u transcriber-review -f
+```
+
+Same account, same environment file, same directories — if the worker is running, all of that
+exists already.
+
+It binds `127.0.0.1:8443` and deliberately nothing wider. A reviewer taps a link from a phone
+on site, so the page has to be reachable from outside, and the way to do that is to put
+something in front of it that terminates TLS with a certificate somebody renews — nginx,
+Caddy, Cloudflare Tunnel, whatever the machine already has. Two things to get right:
+
+- **`GATE_REVIEW_BASE_URL` is the address the phone uses**, not the bind. It is what the links
+  in the 06:00 email are built from, so `https://transcriber.example.co` and not
+  `https://127.0.0.1:8443`. It must be `https://`. The service refuses `GATE_MODE=on` without
+  it, which is the right moment to find out, but nothing can check that the address answers.
+- **Pass the real client address through.** The page throttles repeated bad links by client
+  address, and behind a proxy every request otherwise appears to come from the proxy — so one
+  person fumbling a link locks out everybody. Send `X-Forwarded-For` from the proxy and start
+  the page with `--trust-forwarded`. Without that flag the header is ignored, which is the
+  right default for anything reachable directly: a header anyone can set is not an address.
+
+Serving TLS from the page itself instead is supported — `--cert` and `--key`, or
+`REVIEW_CERTFILE` and `REVIEW_KEYFILE` in the environment file — and is the right answer when
+there is no proxy to put in front. Either way it is TLS: what travels over that connection is
+the passages somebody asked not to be written down.
 
 ---
 
@@ -173,7 +245,7 @@ The ledger volume is not optional. It is the only proof a recording ever existed
 
   ```
   30 4 * * *  cd /srv/kbc-site-memory && make build && \
-              /srv/transcriber/ops/build-site-book.py . /var/lib/transcriber/sites.json
+              /opt/transcriber/ops/build-site-book.py . /var/lib/transcriber/sites.json
   ```
 
   The `make build` half is the record's own existing nightly job, not something added here;
@@ -228,3 +300,33 @@ while the service is running.
 
 The recordings and the transcripts are in OneDrive and in the record's git history. These
 two databases are the only things that live solely here.
+
+### How big the ledger gets
+
+Both tables in the ledger only ever grow, so it is worth knowing the shape of it before you
+choose where the backups land.
+
+`items` holds one row per recording — its name, what state it reached, when it was seen and
+finished, its hashes, the names of the outputs it produced, and the last error if it hit
+one. Call it a kilobyte or two each. `events` holds one row per step that recording took:
+the time, the move from one state to the next, and a short note, with anything longer than
+about two thousand characters cut off. That is roughly a dozen rows per recording, more if
+it had to be retried.
+
+For an ordinary year — a handful of recordings a day — that is a few thousand rows in
+`items` and tens of thousands in `events`: single-digit megabytes. SQLite does not notice a
+database that size, and neither will the backup. A busy year is a small multiple of that,
+not a different order of magnitude.
+
+**Nothing prunes either table, and nothing runs `VACUUM`. That is a decision, not an
+oversight.** The record of what happened to every recording is what the file is *for*: it is
+what answers "was that call from eighteen months ago ever transcribed, or was it quarantined
+and nobody looked?" — and a row deleted to save a few megabytes is exactly the row you would
+want on the day you finally ask. The service deletes nothing on a schedule anywhere else
+either, and the ledger is not where that discipline should first be broken.
+
+If a deployment ever does outgrow this — a shared machine with a small disk, years in — the
+answer is a pruning run someone decides on, looks at, and performs, keeping `items` and
+trimming only old `events`. That is the owner's decision to take. It is deliberately not a
+command this service ships with, because a destructive command that exists is a destructive
+command that eventually runs unattended.

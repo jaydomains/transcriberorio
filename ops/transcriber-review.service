@@ -1,0 +1,131 @@
+# transcriber-review — the page held passages are approved on.
+#
+# This is a SECOND unit, beside ops/transcriber.service, and it is only needed once you arm
+# the sensitivity gate. In `shadow` nothing is ever held, so there is nothing to approve and
+# nothing to serve; leaving this unit stopped costs nothing. Arming the gate without it is
+# the failure worth naming: the service refuses to start on GATE_MODE=on with no
+# GATE_REVIEW_BASE_URL, so you find out at the right moment — but the address in that
+# variable has to answer, and this is what answers it.
+#
+# The set-up is the same install as the main unit: same account, same directories, same
+# environment file. If the main unit is already running, all of this exists already and the
+# whole installation is:
+#
+#   sudo cp ops/transcriber-review.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now transcriber-review
+#   journalctl -u transcriber-review -f
+#
+# It binds 127.0.0.1:8443 and nothing else, which is deliberate: a reviewer taps a link from
+# a phone on site, so the page has to be reachable from outside — and it should be reachable
+# through something that terminates TLS with a certificate somebody renews, not by widening
+# this bind. ops/DEPLOY.md §6 has the reverse-proxy half.
+#
+# GATE_REVIEW_BASE_URL must be the address the *reviewer's phone* uses, not this bind: the
+# links in the 06:00 email are built from it, and a link to 127.0.0.1 opens the phone.
+
+[Unit]
+Description=transcriber — the page held passages are approved on
+Documentation=file:/opt/transcriber/README.md
+# Wants=, not Requires=: a DNS blip at boot must not stop the page starting.
+Wants=network-online.target
+After=network-online.target
+
+# Do not restart forever in a tight loop if something is badly wrong: five failures inside
+# ten minutes stops the unit, which shows up as `failed` in `systemctl status` and is a
+# state a person — or a monitor — can actually see.
+#
+# These belong in [Unit]. They were in [Service] in the main unit, where systemd 255 answers
+# "Unknown key name 'StartLimitIntervalSec' in section 'Service', ignoring." — so the
+# interval silently fell back to the 10s default while the burst was still read. With
+# RestartSec=30s the restarts are 30 seconds apart, so five could never land inside 10
+# seconds and the limit could never trip: a page that could not start — a bad certificate
+# path, a missing environment file — looped every 30 seconds forever, showing
+# `activating (auto-restart)` rather than `failed`, which is the state nothing is watching
+# for.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=transcriber
+Group=transcriber
+
+WorkingDirectory=/opt/transcriber
+Environment=PYTHONPATH=/opt/transcriber/src
+Environment=PYTHONUNBUFFERED=1
+
+# The same two paths the main unit sets, for the same reason and in the same place — before
+# EnvironmentFile=, so the operator's .env still wins. Both units must agree on LEDGER_PATH:
+# the held store lives beside the ledger unless GATE_HELD_STORE says otherwise, and a page
+# reading a different store from the one the worker writes shows an empty queue while
+# passages sit waiting in the other file.
+Environment=WORK_DIR=/var/cache/transcriber
+Environment=LEDGER_PATH=/var/lib/transcriber/ledger.sqlite
+
+EnvironmentFile=/etc/transcriber/transcriber.env
+
+# 127.0.0.1 on purpose. Put TLS in front of it rather than widening this — see the header.
+# --cert and --key (or REVIEW_CERTFILE / REVIEW_KEYFILE in the environment file) serve TLS
+# here directly instead, which is the right answer when there is no proxy to put in front.
+ExecStart=/usr/bin/python3 -m transcriber review --bind 127.0.0.1 --port 8443
+
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Restart on any exit, including a clean one. A page that is not answering is a reviewer who
+# cannot approve anything, and a held passage waits for a person and for nothing else — it is
+# never released or discarded on a timer, so an outage here delays the record rather than
+# losing anything. RestartSec spaces the retries out so a permanently broken configuration is
+# a line a minute rather than a busy loop.
+Restart=always
+RestartSec=30s
+# The rate limit that stops a tight restart loop lives in [Unit] above; systemd moved those
+# two keys out of [Service] in version 229 and ignores them here.
+
+# --- what it may touch ---------------------------------------------------------------
+# The held store, which lives beside the ledger, is the only copy of those words outside the
+# recording — and this is the process that releases them, so it writes as well as reads. The
+# cache directory is here only because it shares one configuration with the worker, which
+# insists on a usable work directory; this process never downloads anything into it.
+StateDirectory=transcriber
+StateDirectoryMode=0700
+CacheDirectory=transcriber
+CacheDirectoryMode=0700
+ReadWritePaths=/var/lib/transcriber /var/cache/transcriber
+
+# --- hardening -----------------------------------------------------------------------
+# It answers HTTP on one loopback port and writes one directory. It has no business doing
+# anything else, and this is the process that holds the passages somebody asked not to be
+# written down — so it is fenced in at least as hard as the worker.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# 0077 so anything it creates is readable only by itself, whatever the ambient umask is.
+UMask=0077
+
+# --- logging -------------------------------------------------------------------------
+# stdout to the journal. There is deliberately no file handler and no rotation in the
+# service itself: whatever runs it decides where the log goes.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=transcriber-review
+
+[Install]
+WantedBy=multi-user.target

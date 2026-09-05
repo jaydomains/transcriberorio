@@ -53,14 +53,25 @@ conclusion survived and the evidence for it did not.
 
 **The morning email, at 06:00, every single day.** Including the days when everything was
 fine. A report that only turns up when something breaks is indistinguishable from a service
-that has died, so this one always arrives and the subject line carries the whole story:
+that has died, so this one always arrives and the subject line tells you whether anything
+needs you:
 
 ```
-Recordings: all 23 done                       nothing to do
+Recordings: all 23 done                       nothing to do here
 Recordings: 20 done, 3 FAILED                 three need you, they are listed first
 ⚠ Recordings: nothing arrived yesterday       either you recorded nothing, or something broke
 ⚠ the OneDrive app secret expires in 9 day(s) — Recordings: all 6 done
 ```
+
+**What "done" means, exactly: transcribed, and the three files are in OneDrive.** That is
+where this service's job ends and it is the whole of what it can see. Getting those files
+from OneDrive into the record is a separate flow that runs outside this service — the Power
+Automate step described in `ops/DEPLOY.md` — and **nothing here checks that it worked**. So
+if that flow's GitHub token expires, or somebody switches it off, the record quietly stops
+receiving transcripts while this email keeps saying `all 23 done` every morning, because from
+here everything genuinely did work. That is the one gap in the picture the email gives you,
+and the way to notice it is to look at the record itself now and then rather than at the
+subject line.
 
 **If the email does not arrive at all, that is the alarm.** It means the service is not
 running. There is also an external monitor (see `HEARTBEAT_URL`) which is told every morning
@@ -375,7 +386,7 @@ categories look right, and the model read effectively all of the recordings, set
 | `transcriber held release <ref> --as <you>` | Approve it. The words go back where they were said. |
 | `transcriber held refuse <ref> --as <you>` | Refuse it. The note stays, saying so. |
 | `transcriber review --link <person>` | Mints a review link by hand, if somebody's email went astray. |
-| `transcriber review serve` | Runs the review page itself. |
+| `transcriber review` | Runs the review page itself. |
 
 ---
 
@@ -720,7 +731,7 @@ python3 -m transcriber run
 | `transcriber config` | Reads and changes one setting at a time — `config set ANALYSIS_MODEL_STRONG claude-opus-5` — checking it before it writes. |
 | `transcriber gate` | What the sensitivity gate is doing, and the measurement it is building. `--status` for the summary. |
 | `transcriber held` | The queue of passages waiting for approval: `list`, `show`, `release`, `refuse`. See **Holding back** above. |
-| `transcriber review` | Runs the review page (`serve`), or mints one person a link by hand (`--link <person>`). |
+| `transcriber review` | Runs the review page, or mints one person a link by hand (`--link <person>`). |
 
 `once`, `sweep`, `archive`, `backfill` and `status` all take `--route <short name>` to act
 on one route only. Left off, they act on every route that is switched on.

@@ -147,7 +147,10 @@ change feed walks a folder's whole subtree.
 3. Update `GRAPH_CLIENT_SECRET` **and** `GRAPH_SECRET_EXPIRES_ON` in the service
    environment.
 4. Restart the service (`systemctl restart transcriber`, or redeploy the container).
-5. `transcriber status` — the last successful poll should update within two minutes.
+5. `sudo -u transcriber PYTHONPATH=/opt/transcriber/src python3 -m transcriber status` —
+   the last successful poll should update within two minutes. (The documented install is a
+   file copy and never runs `pip`, so the short `transcriber` command only exists if you
+   installed the wrapper described in the unit file's header.)
 6. Delete the old secret in the portal.
 
 Nothing is lost while the secret is expired: recordings pile up in OneDrive, the ledger's

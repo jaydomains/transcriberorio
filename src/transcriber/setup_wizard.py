@@ -41,6 +41,7 @@ from typing import Any, Callable, Mapping, Sequence
 from . import config as config_mod
 from .config import nested_folder_problems
 from .models import DEFAULT_ROUTE, Route, is_route_name, route_env_var
+from .redirects import host_of, no_redirect_opener, redirect_host
 
 __all__ = [
     "run_setup",
@@ -134,7 +135,14 @@ def load_env_file(path: str) -> dict[str, str]:
 
 
 def _quote(value: str) -> str:
-    if value == "" or re.search(r"[\s#\"'$`\\]", value):
+    # An empty value is written bare — KEY= with nothing after it — rather than as KEY="".
+    # Two literal quote characters are a value to any reader that does not strip a matched
+    # pair, and an empty ROUTE_<NAME>_ARCHIVE written that way became a two-character
+    # OneDrive folder id: a delivery aimed at somewhere nobody chose. Bare says empty to
+    # every reader there is, including the shell.
+    if value == "":
+        return ""
+    if re.search(r"[\s#\"'$`\\]", value):
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return value
 
@@ -1588,10 +1596,37 @@ def _heartbeat(ctx: _Ctx) -> None:
 
 
 def _probe_heartbeat(url: str) -> str:
+    """Ping the monitor once, and only say it was pinged if the monitor is what answered.
+
+    A redirect is refused rather than followed. The default opener follows a 302 and hands
+    back the 200 that some entirely different host answered with, and the wizard would then
+    tell him the check is up while the real check sits there counting down to its first
+    alert — the one reassurance in this whole setup that has to be true.
+    """
+    opener = no_redirect_opener(
+        urllib.request.HTTPSHandler(context=ssl.create_default_context())
+    )
     req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=20, context=ssl.create_default_context()) as resp:
-        resp.read()
-        return f"pinged, {resp.status} — the check should now show as up"
+    try:
+        with opener.open(req, timeout=20) as resp:
+            resp.read()
+            answered = host_of(resp.geturl() or url)
+            asked = host_of(url)
+            if answered and asked and answered != asked:
+                raise RuntimeError(
+                    f"the ping was answered by {answered}, not by {asked}, so nothing here "
+                    "shows the monitor itself heard it. Check the ping URL."
+                )
+            return f"pinged, {resp.status} — the check should now show as up"
+    except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise RuntimeError(
+                "the ping URL redirected to "
+                + redirect_host(exc.headers.get("Location", "") if exc.headers else "")
+                + " instead of answering, so the monitor was never reached. Check that this "
+                "is the ping URL the monitor gave you."
+            ) from None
+        raise
 
 
 def _naming(ctx: _Ctx) -> None:

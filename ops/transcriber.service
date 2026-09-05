@@ -2,7 +2,7 @@
 #
 #   sudo useradd --system --home-dir /var/lib/transcriber --shell /usr/sbin/nologin transcriber
 #   sudo mkdir -p /opt/transcriber /var/lib/transcriber /var/cache/transcriber /etc/transcriber
-#   sudo cp -r src ARCHITECTURE.md README.md /opt/transcriber/
+#   sudo cp -r src ops ARCHITECTURE.md README.md /opt/transcriber/
 #   sudo cp .env /etc/transcriber/transcriber.env
 #   sudo chown -R transcriber:transcriber /var/lib/transcriber /var/cache/transcriber
 #   sudo chmod 700 /var/lib/transcriber /var/cache/transcriber
@@ -10,6 +10,18 @@
 #   sudo chmod 640 /etc/transcriber/transcriber.env      # it holds every credential
 #   sudo cp ops/transcriber.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now transcriber
+#
+# Nothing above pip-installs anything, on purpose — every import is from Python's own
+# standard library, so the install is a file copy. That leaves one small hole: the `transcriber`
+# command the documentation keeps using does not exist on the machine, because a console script
+# is something pip would have written. Two lines close it, and then every command in every
+# document is copy-pasteable exactly as written:
+#
+#   sudo tee /usr/local/bin/transcriber >/dev/null <<'SH'
+#   #!/bin/sh
+#   exec env PYTHONPATH=/opt/transcriber/src python3 -m transcriber "$@"
+#   SH
+#   sudo chmod 755 /usr/local/bin/transcriber
 #
 # Then, and this is the step worth not skipping:
 #   sudo -u transcriber PYTHONPATH=/opt/transcriber/src python3 -m transcriber selftest
@@ -47,6 +59,21 @@ Group=transcriber
 WorkingDirectory=/opt/transcriber
 Environment=PYTHONPATH=/opt/transcriber/src
 Environment=PYTHONUNBUFFERED=1
+
+# The two paths this unit actually provisions below, set here so that a deploy is correct
+# without the operator having read ops/DEPLOY.md closely. They are before EnvironmentFile= on
+# purpose: systemd applies these in file order, so anything the operator sets in the .env still
+# wins — these are the defaults, not an override.
+#
+# WORK_DIR matters more than it looks. PrivateTmp=yes gives this service its own private /tmp,
+# which is emptied every time the unit restarts; on many distributions the host's /tmp is a
+# memory-backed filesystem as well. Pointing the scratch there would mean every restart
+# re-downloads whatever was in flight, and the audio of a FAILED recording — deliberately kept
+# for two days so that a person can listen to what went wrong — would be gone before anybody
+# could. The container image sets the same two paths.
+Environment=WORK_DIR=/var/cache/transcriber
+Environment=LEDGER_PATH=/var/lib/transcriber/ledger.sqlite
+
 EnvironmentFile=/etc/transcriber/transcriber.env
 
 ExecStart=/usr/bin/python3 -m transcriber run
